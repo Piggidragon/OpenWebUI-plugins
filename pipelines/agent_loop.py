@@ -1,30 +1,31 @@
 """
 title: Agent Loop
 author: Piggidragon
-version: 2.0.0
+version: 2.1.0
 description: >
   Minimal OpenWebUI-native Agent Loop with Plan/Execute/Review phases.
 
   Architecture:
   - SINGLE model loop (no sub-agents, no parallel LLM calls)
   - Plan phase: analyse context, read files, create task list, ask user for confirmation
-  - Execute phase: work through tasks one by one, auto-review each task
+  - Execute phase: work through tasks one at a time, mark complete/fail explicitly
   - Review phase: verify all tasks complete, either finish or replan
+  - Replan phase: hard reset with a completely new plan based on what remains, then restart Execute
   - All tools/skills/filters come from OpenWebUI (no custom tool executor)
   - LLM calls via OWUI's generate_chat_completion (streaming SSE)
   - Tool resolution via OWUI (get_tools, get_builtin_tools, get_terminal_tools)
   - Tool execution via OWUI-resolved callables + process_tool_result
   - Renders tool executions as <details type="tool_calls"> to avoid OWUI retry loop
-  - terminate and replan as internal tools for loop control
-  - ask_user is NOT included (use your own ask_user tool)
+  - Internal control tools: terminate, replan, complete_task, fail_task
+  - Uses ask_user_questions (Claude-like) for plan confirmation
 
-  Compared to agent-pipeline-deprecated.py:
-  - No OllamaClient, ToolExecutor, WebRAG, JupyterExecutor, OpenWebUIClient
-  - No context compression (your filter handles that)
-  - No ask_user (use your own tool)
-  - No MCP resolution (OWUI handles MCP natively now)
-  - Uses OWUI's native tool/skill/filter infrastructure instead of custom implementations
-  - 3 phases instead of flat loop
+  v2.1.0 changes:
+  - Replan is now a hard reset: new plan, cleared state, direct restart to Execute
+  - Added complete_task(index) / fail_task(index, reason) for explicit task tracking
+  - Removed fragile keyword-based _mark_completed_tasks
+  - Fixed consecutive_json_errors counter (was always reset immediately)
+  - Task state injected into every phase system prompt
+  - Adaptive history truncation to stay within context window
 requirements: open-webui>=0.9.1
 """
 
@@ -62,15 +63,16 @@ What to do:
 2. Read relevant files, search the web, query knowledge — use any tools to gather context.
 3. Create a numbered task list that covers the entire goal.
 4. Each task should be a clear, actionable step.
-5. After creating the plan, call ask_user to present the plan and ask for confirmation.
+5. After creating the plan, call ask_user_questions to present the plan and ask for confirmation.
 
 Rules:
 - Be thorough — read files before planning changes.
 - Break complex tasks into small, verifiable steps.
 - If the request is simple (1-2 tasks), still list them explicitly.
 - Call exactly ONE tool per step.
-- When done planning, call ask_user with the plan for confirmation.
+- When done planning, call ask_user_questions with the plan for confirmation.
 - NEVER call terminate in PLAN mode — the user must confirm first.
+- NEVER call replan in PLAN mode.
 """
 
 EXECUTE_PROMPT = """\
@@ -80,23 +82,21 @@ PHASE: EXECUTE
 
 Available tools: {tool_names}
 
-Current task list:
-{task_list}
-
-Completed: {completed_count} | Remaining: {remaining_count}
+{task_state}
 
 What to do:
 1. Pick the next incomplete task from the list.
 2. Execute it using the appropriate tool(s).
-3. After executing, briefly assess whether the task succeeded.
-4. Move on to the next task.
+3. After the task is truly done, call complete_task(index) to mark it finished.
+4. If a task fails and cannot be recovered, call fail_task(index, reason) to mark it.
+5. Move on to the next task.
 
 Rules:
 - Call exactly ONE tool per step.
-- If a task fails, try an alternative approach before moving on.
-- NEVER repeat identical failed tool calls.
+- NEVER repeat identical failed tool calls (duplicate detection is active).
 - When all tasks are done, call terminate with a summary.
-- If you realise the plan was wrong, call replan with what needs to change.
+- If you realise the plan was completely wrong, call replan with what needs to change.
+- You MUST call complete_task(index) or fail_task(index, reason) after working on a task.
 """
 
 REVIEW_PROMPT = """\
@@ -105,10 +105,8 @@ You are in REVIEW mode. Verify that all original requirements are met.
 PHASE: REVIEW
 
 Original goal: {goal}
-Original plan:
-{task_list}
 
-Completed tasks: {completed_list}
+{task_state}
 
 What to do:
 1. Check each original requirement against what was actually done.
@@ -126,22 +124,23 @@ You are in RE-PLAN mode. The previous plan needs adjustments.
 PHASE: RE-PLAN
 
 Original goal: {goal}
+
+{task_state}
+
 What went wrong or is missing: {replan_reason}
-
-Previous plan:
-{task_list}
-
-Completed tasks: {completed_list}
 
 What to do:
 1. Assess what worked and what didn't.
-2. Update the task list — add missing tasks, fix broken ones.
-3. After creating the updated plan, call ask_user to present the changes for confirmation.
+2. Create a completely NEW task list that covers ONLY what is still needed.
+3. Do NOT include already completed tasks.
+4. Focus on fixing the failures and filling the gaps.
+5. Then call replan() with the new plan and the reason.
 
 Rules:
 - Don't repeat tasks that already succeeded.
 - Focus only on what's broken or missing.
-- Call ask_user with the updated plan for confirmation.
+- Call replan() to restart execution with the new plan.
+- Do NOT call ask_user_questions — the user already confirmed at the start.
 """
 
 
@@ -247,7 +246,7 @@ def smart_truncate(text, max_chars):
 
 
 def strip_thinking(text):
-    """Remove <think>...</think> blocks from model output."""
+    """Remove <thinking>...<thinking> blocks from model output."""
     text = re.sub(
         r"<(?:think|thinking|reason|reasoning|thought)>.*?</(?:think|thinking|reason|reasoning|thought)>",
         "", text, flags=re.DOTALL | re.IGNORECASE
@@ -268,6 +267,10 @@ class AgentLoopEngine:
     PHASE_EXECUTE = "execute"
     PHASE_REVIEW = "review"
     PHASE_REPLAN = "replan"
+
+    # Context window management
+    MAX_HISTORY_MESSAGES = 50  # Keep system + user goal + ~24 assistant/tool pairs
+    TRUNCATE_TOOL_RESULTS_AT = 30  # When history > this, aggressively truncate tool results
 
     def __init__(self, request, user, body, event_emitter, event_call, metadata, valves):
         self.request = request
@@ -291,6 +294,7 @@ class AgentLoopEngine:
         self.phase = self.PHASE_PLAN
         self.task_list = []
         self.completed_tasks = []
+        self.failed_tasks = []  # list of {"task": str, "reason": str}
         self._replan_reason = ""
         self.consecutive_json_errors = 0
         self.loop_count = 0
@@ -359,7 +363,7 @@ class AgentLoopEngine:
             except Exception as e:
                 logger.error(f"get_terminal_tools failed: {e}")
 
-        # 4. Internal tools
+        # 4. Internal control tools
         self.tools_dict["terminate"] = {
             "spec": {
                 "name": "terminate",
@@ -379,17 +383,48 @@ class AgentLoopEngine:
         self.tools_dict["replan"] = {
             "spec": {
                 "name": "replan",
-                "description": "Signal that the current plan needs adjustments. Describe what went wrong and what needs to change.",
+                "description": "Signal that the current plan needs a complete restart. Provide the new plan and reason.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "reason": {"type": "string", "description": "What went wrong or what is missing"},
-                        "updated_tasks": {"type": "string", "description": "Updated task list as numbered steps"},
+                        "updated_tasks": {"type": "string", "description": "Updated task list as numbered steps (only what is still needed)"},
                     },
                     "required": ["reason"],
                 },
             },
             "callable": self._tool_replan,
+            "type": "function",
+        }
+        self.tools_dict["complete_task"] = {
+            "spec": {
+                "name": "complete_task",
+                "description": "Mark a specific task as completed. Call this AFTER the task is truly done.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "index": {"type": "integer", "description": "0-based index of the task to mark complete"},
+                    },
+                    "required": ["index"],
+                },
+            },
+            "callable": self._tool_complete_task,
+            "type": "function",
+        }
+        self.tools_dict["fail_task"] = {
+            "spec": {
+                "name": "fail_task",
+                "description": "Mark a specific task as failed with a reason. Call this when a task cannot be recovered.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "index": {"type": "integer", "description": "0-based index of the task that failed"},
+                        "reason": {"type": "string", "description": "Why the task failed"},
+                    },
+                    "required": ["index", "reason"],
+                },
+            },
+            "callable": self._tool_fail_task,
             "type": "function",
         }
 
@@ -419,6 +454,48 @@ class AgentLoopEngine:
 
     async def _tool_replan(self, **kwargs):
         return json.dumps({"replan": True, "reason": kwargs.get("reason", ""), "updated_tasks": kwargs.get("updated_tasks", "")})
+
+    async def _tool_complete_task(self, **kwargs):
+        idx = kwargs.get("index", -1)
+        if 0 <= idx < len(self.task_list):
+            task = self.task_list[idx]
+            if task not in self.completed_tasks:
+                self.completed_tasks.append(task)
+            return json.dumps({"completed": True, "task": task, "index": idx})
+        return json.dumps({"completed": False, "error": f"Invalid task index {idx}"})
+
+    async def _tool_fail_task(self, **kwargs):
+        idx = kwargs.get("index", -1)
+        reason = kwargs.get("reason", "Unknown failure")
+        if 0 <= idx < len(self.task_list):
+            task = self.task_list[idx]
+            entry = {"task": task, "reason": reason}
+            # Avoid duplicates
+            if not any(f["task"] == task for f in self.failed_tasks):
+                self.failed_tasks.append(entry)
+            return json.dumps({"failed": True, "task": task, "index": idx, "reason": reason})
+        return json.dumps({"failed": False, "error": f"Invalid task index {idx}"})
+
+    # ── Task State String ──
+
+    def _build_task_state(self):
+        """Build a compact task-state block for injection into prompts."""
+        lines = []
+        lines.append("Current Tasks:")
+        for i, task in enumerate(self.task_list):
+            if task in self.completed_tasks:
+                status = "[✓]"
+            elif any(f["task"] == task for f in self.failed_tasks):
+                status = "[✗]"
+            else:
+                status = "[ ]"
+            lines.append(f"  {i}. {status} {task}")
+        lines.append(f"\nCompleted: {len(self.completed_tasks)}/{len(self.task_list)}")
+        if self.failed_tasks:
+            lines.append("Failed:")
+            for f in self.failed_tasks:
+                lines.append(f"  - {f['task']}: {f['reason']}")
+        return "\n".join(lines)
 
     # ── Execute Tool ──
 
@@ -499,37 +576,22 @@ class AgentLoopEngine:
     def _build_system_prompt(self):
         """Build system prompt based on current phase."""
         tool_names = ", ".join(sorted(self.tools_dict.keys()))
+        task_state = self._build_task_state()
 
         if self.phase == self.PHASE_PLAN:
             return PLAN_PROMPT.format(tool_names=tool_names)
 
         elif self.phase == self.PHASE_EXECUTE:
-            task_str = "\n".join(
-                f"  {'✅' if t in self.completed_tasks else '⬜'} {t}"
-                for t in self.task_list
-            ) if self.task_list else "No tasks defined yet."
-            return EXECUTE_PROMPT.format(
-                tool_names=tool_names,
-                task_list=task_str,
-                completed_count=len(self.completed_tasks),
-                remaining_count=len(self.task_list) - len(self.completed_tasks),
-            )
+            return EXECUTE_PROMPT.format(tool_names=tool_names, task_state=task_state)
 
         elif self.phase == self.PHASE_REVIEW:
-            completed_str = "\n".join(f"  ✅ {t}" for t in self.completed_tasks) if self.completed_tasks else "None"
-            return REVIEW_PROMPT.format(
-                goal=self.goal,
-                task_list="\n".join(f"  {t}" for t in self.task_list),
-                completed_list=completed_str,
-            )
+            return REVIEW_PROMPT.format(goal=self.goal, task_state=task_state)
 
         elif self.phase == self.PHASE_REPLAN:
-            completed_str = "\n".join(f"  ✅ {t}" for t in self.completed_tasks) if self.completed_tasks else "None"
             return REPLAN_PROMPT.format(
                 goal=self.goal,
                 replan_reason=self._replan_reason or "Previous plan was incomplete",
-                task_list="\n".join(f"  {t}" for t in self.task_list),
-                completed_list=completed_str,
+                task_state=task_state,
             )
 
         return PLAN_PROMPT.format(tool_names=tool_names)
@@ -542,6 +604,28 @@ class AgentLoopEngine:
         self._replan_reason = replan_reason
         if self.history:
             self.history[0]["content"] = self._build_system_prompt()
+
+    # ── Context Window Management ──
+
+    def _manage_context_window(self, messages):
+        """Truncate history to stay within context window. Keep system + user goal + recent pairs."""
+        if len(messages) <= self.MAX_HISTORY_MESSAGES:
+            return messages
+
+        # Always keep system prompt (index 0) and original user goal (index 1)
+        # Remove oldest assistant/tool pairs after index 1, keep the most recent ones
+        to_remove = len(messages) - self.MAX_HISTORY_MESSAGES
+        # We remove from index 2 onwards (after system + user goal)
+        # But we keep the tail (recent interactions)
+        head = messages[:2]
+        tail = messages[2 + to_remove:]
+        return head + tail
+
+    def _get_truncation_limit(self):
+        """Return aggressive truncation limit when history is long."""
+        if len(self.history) > self.TRUNCATE_TOOL_RESULTS_AT:
+            return self.valves.MAX_TOOL_RESULT_CHARS // 3
+        return self.valves.MAX_TOOL_RESULT_CHARS
 
     # ── Main Loop ──
 
@@ -556,6 +640,9 @@ class AgentLoopEngine:
         self._replan_reason = ""
         self.task_list = []
         self.completed_tasks = []
+        self.failed_tasks = []
+        self.consecutive_json_errors = 0
+        self.loop_count = 0
 
         system_prompt = self._build_system_prompt()
         self.history = [
@@ -586,6 +673,9 @@ class AgentLoopEngine:
             name = phase_name.get(self.phase, "Loop")
 
             await self.emit_status(f"{icon} {name} — step {self.loop_count}/{self.valves.MAX_ITERATIONS}")
+
+            # Manage context window before calling LLM
+            self.history = self._manage_context_window(self.history)
 
             # Prepare messages — keep only system[0] + non-system rest
             call_messages = [self.history[0]] + [m for m in self.history[1:] if m.get("role") != "system"]
@@ -668,6 +758,7 @@ class AgentLoopEngine:
                     args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
                     if not isinstance(args, dict):
                         args = {}
+                    self.consecutive_json_errors = 0
                 except json.JSONDecodeError:
                     self.consecutive_json_errors += 1
                     if self.consecutive_json_errors >= 3:
@@ -675,8 +766,14 @@ class AgentLoopEngine:
                         await self.emit_status("JSON error", done=True)
                         return "".join(output_parts)
                     args = {}
-
-                self.consecutive_json_errors = 0
+                    # Add error to history and continue
+                    self.history.append({
+                        "role": "tool",
+                        "content": "Error: Invalid JSON in tool arguments.",
+                        "tool_call_id": call_id,
+                        "name": tool_name,
+                    })
+                    continue
 
                 # ── Handle terminate ──
                 if tool_name == "terminate":
@@ -695,24 +792,78 @@ class AgentLoopEngine:
                     updated = args.get("updated_tasks", "")
 
                     # Parse updated tasks if provided
+                    new_tasks = []
                     if updated:
                         new_tasks = [t.strip() for t in updated.split("\n") if t.strip()]
-                        if new_tasks:
-                            self.task_list = self.completed_tasks + new_tasks
 
-                    self._transition_to(self.PHASE_REPLAN, replan_reason=reason)
+                    # HARD RESET: new plan only, clear state, restart Execute
+                    if new_tasks:
+                        self.task_list = new_tasks
+                    # If no tasks provided, keep only non-completed non-failed tasks
+                    else:
+                        failed_task_names = {f["task"] for f in self.failed_tasks}
+                        self.task_list = [
+                            t for t in self.task_list
+                            if t not in self.completed_tasks and t not in failed_task_names
+                        ]
+                        if not self.task_list:
+                            # Nothing left to do — this shouldn't happen, but handle it
+                            output_parts.append(f"\n⚠️ Replan requested but no remaining tasks. Terminating.")
+                            await self.emit_status("No tasks remaining", done=True)
+                            return "".join(output_parts)
+
+                    self.completed_tasks = []
+                    self.failed_tasks = []
+                    self._replan_reason = reason
+                    self.consecutive_json_errors = 0
+                    self.loop_count = 0  # Reset iteration counter for fresh start
+                    recent_calls = []
+
+                    # Rebuild history with new system prompt + original user goal
+                    system_prompt = self._build_system_prompt()
+                    self.history = [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": self.goal},
+                    ]
+
                     output_parts.append(f"\n🔄 **Re-planning:** {reason}\n")
-                    tool_result = json.dumps({"replan": True, "reason": reason})
+                    await self.emit_status(f"🔄 Re-planning: {reason}")
+                    # Skip adding tool result to history — we already rebuilt it
+                    continue
+
+                # ── Handle complete_task ──
+                if tool_name == "complete_task":
+                    result_json = await self._tool_complete_task(**args)
+                    result_data = json.loads(result_json)
+                    status_icon = "✅" if result_data.get("completed") else "⚠️"
+                    output_parts.append(f"\n{status_icon} Task {args.get('index', '?')} marked complete.\n")
                     self.history.append({
                         "role": "tool",
-                        "content": tool_result,
+                        "content": result_json,
+                        "tool_call_id": call_id,
+                        "name": tool_name,
+                    })
+                    # Auto-transition to REVIEW when all tasks done
+                    if self.completed_tasks and len(self.completed_tasks) >= len(self.task_list):
+                        self._transition_to(self.PHASE_REVIEW)
+                    continue
+
+                # ── Handle fail_task ──
+                if tool_name == "fail_task":
+                    result_json = await self._tool_fail_task(**args)
+                    result_data = json.loads(result_json)
+                    status_icon = "❌" if result_data.get("failed") else "⚠️"
+                    output_parts.append(f"\n{status_icon} Task {args.get('index', '?')} marked failed: {args.get('reason', '')}\n")
+                    self.history.append({
+                        "role": "tool",
+                        "content": result_json,
                         "tool_call_id": call_id,
                         "name": tool_name,
                     })
                     continue
 
-                # ── Phase transition on ask_user ──
-                if self.phase == self.PHASE_PLAN and tool_name == "ask_user":
+                # ── Phase transition on ask_user_questions ──
+                if self.phase == self.PHASE_PLAN and tool_name == "ask_user_questions":
                     if not self.task_list and content:
                         self.task_list = self._extract_task_list(content)
                     self._transition_to(self.PHASE_EXECUTE)
@@ -725,11 +876,8 @@ class AgentLoopEngine:
                     recent_calls.append(sig)
                     await self.emit_status(f"Running: {tool_name}…")
                     result_str, result_files = await self._execute_tool(tool_name, args, call_id)
-                    tool_result = smart_truncate(result_str, self.valves.MAX_TOOL_RESULT_CHARS)
-
-                # Mark tasks as completed in EXECUTE phase
-                if self.phase == self.PHASE_EXECUTE and content:
-                    self._mark_completed_tasks(content)
+                    truncation_limit = self._get_truncation_limit()
+                    tool_result = smart_truncate(result_str, truncation_limit)
 
                 # Render tool execution as <details type="tool_calls">
                 args_preview = smart_truncate(json.dumps(args, ensure_ascii=False), 200)
@@ -772,14 +920,6 @@ class AgentLoopEngine:
             elif re.match(r"^[-*]\s+", line):
                 tasks.append(re.sub(r"^[-*]\s+", "", line).strip())
         return tasks if tasks else ["Complete the user's request"]
-
-    def _mark_completed_tasks(self, content):
-        """Best-effort: mark tasks as completed based on conversation content."""
-        for task in self.task_list:
-            if task not in self.completed_tasks:
-                task_words = task.lower().split()[:3]
-                if any(w in content.lower() for w in task_words):
-                    self.completed_tasks.append(task)
 
 
 # ──────────────────────────────────────────────────────────────────
