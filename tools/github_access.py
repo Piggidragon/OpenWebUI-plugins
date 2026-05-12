@@ -14,7 +14,7 @@ UserValves (set under Account → Valves):
   • ENABLE_WORKFLOWS       – Toggle GitHub Actions workflow read / trigger
 
 Code-writing workflow (enforced):
-  create_branch → create_or_update_file → create_pull_request
+  github_create_branch → github_create_or_update_file → github_create_pull_request
   (No direct main writes, no merge function.)
 """
 
@@ -72,7 +72,7 @@ class Tools:
         t = uv.GITHUB_TOKEN
         if not t:
             raise ValueError(
-                "❌ No GitHub token set. Go to Account → Valves "
+                "No GitHub token set. Go to Account -> Valves "
                 "and enter your PAT in GITHUB_TOKEN."
             )
         return {
@@ -83,13 +83,13 @@ class Tools:
 
     def _guard(self, flag: bool, name: str) -> None:
         if not flag:
-            raise ValueError(f"⛔ {name} is disabled in your User Valves.")
+            raise ValueError(f"{name} is disabled in your User Valves.")
 
     # ═══════════════════════════════════════════════════════════════
     #  CONTENT – Reading
     # ═══════════════════════════════════════════════════════════════
 
-    async def list_my_repos(self, __user__: Optional[dict] = None) -> str:
+    async def github_list_my_repos(self, __user__: Optional[dict] = None) -> str:
         """
         List your own GitHub repositories (most recently updated first).
         """
@@ -108,7 +108,7 @@ class Tools:
                 f"\n\n… and {len(repos) - 25} more" if len(repos) > 25 else ""
             )
 
-    async def list_user_repos(
+    async def github_list_user_repos(
             self, username: str, __user__: Optional[dict] = None
     ) -> str:
         """
@@ -130,7 +130,7 @@ class Tools:
                 else f"User '{username}' has no public repos."
             )
 
-    async def get_repo(self, repo: str, __user__: Optional[dict] = None) -> str:
+    async def github_get_repo(self, repo: str, __user__: Optional[dict] = None) -> str:
         """
         Get metadata about a single repository.
 
@@ -163,7 +163,7 @@ class Tools:
                 ensure_ascii=False,
             )
 
-    async def get_file(
+    async def github_get_file(
             self, repo: str, path: str, ref: str = "main", __user__: Optional[dict] = None
     ) -> str:
         """
@@ -179,7 +179,7 @@ class Tools:
         async with httpx.AsyncClient() as c:
             r = await c.get(url, headers=self._auth(uv))
             if r.status_code == 404:
-                return f"❌ Not found: {repo}/{path}"
+                return f"Not found: {repo}/{path}"
             r.raise_for_status()
             data = r.json()
             if isinstance(data, list):
@@ -195,7 +195,7 @@ class Tools:
                 f"**{repo}/{path}** ({data['size']} bytes)\n```{lang}\n{content}\n```"
             )
 
-    async def search_code(
+    async def github_search_code(
             self, repo: str, query: str, __user__: Optional[dict] = None
     ) -> str:
         """
@@ -222,7 +222,7 @@ class Tools:
     #  CONTENT – Writing (Branch → File → PR workflow ONLY)
     # ═══════════════════════════════════════════════════════════════
 
-    async def create_branch(
+    async def github_create_branch(
             self,
             repo: str,
             branch: str,
@@ -248,11 +248,11 @@ class Tools:
             payload = {"ref": f"refs/heads/{branch}", "sha": sha}
             r2 = await c.post(create_url, headers=self._auth(uv), json=payload)
             if r2.status_code == 422:
-                return f"❌ Branch '{branch}' already exists in {repo}."
+                return f"Branch '{branch}' already exists in {repo}."
             r2.raise_for_status()
-            return f"✅ Branch **{branch}** created in {repo} (from {from_branch})."
+            return f"Branch **{branch}** created in {repo} (from {from_branch})."
 
-    async def create_or_update_file(
+    async def github_create_or_update_file(
             self,
             repo: str,
             path: str,
@@ -297,12 +297,12 @@ class Tools:
             r.raise_for_status()
             d = r.json()
             return (
-                f"✅ **{d['content']['name']}** committed to `{branch}`\n"
+                f"**{d['content']['name']}** committed to `{branch}`\n"
                 f"Commit: {d['commit']['sha'][:7]} — {d['commit']['message']}\n"
                 f"URL: {d['content']['html_url']}"
             )
 
-    async def delete_file(
+    async def github_delete_file(
             self,
             repo: str,
             path: str,
@@ -323,7 +323,7 @@ class Tools:
 
         sha = await self._file_sha(repo, path, branch, uv)
         if not sha:
-            return f"❌ File '{path}' not found on branch '{branch}' in {repo}."
+            return f"File '{path}' not found on branch '{branch}' in {repo}."
 
         if not message:
             message = f"Delete {path}"
@@ -334,7 +334,7 @@ class Tools:
         async with httpx.AsyncClient() as c:
             r = await c.delete(url, headers=self._auth(uv), json=payload)
             r.raise_for_status()
-            return f"✅ **{path}** deleted from `{branch}`."
+            return f"**{path}** deleted from `{branch}`."
 
     # ── internal helpers ────────────────────────────────────────
 
@@ -360,7 +360,7 @@ class Tools:
     #  BRANCHES – Reading
     # ═══════════════════════════════════════════════════════════════
 
-    async def list_branches(self, repo: str, __user__: Optional[dict] = None) -> str:
+    async def github_list_branches(self, repo: str, __user__: Optional[dict] = None) -> str:
         """
         List all branches in a repository.
 
@@ -382,7 +382,7 @@ class Tools:
     #  COMMITS – Reading
     # ═══════════════════════════════════════════════════════════════
 
-    async def list_commits(
+    async def github_list_commits(
             self,
             repo: str,
             branch: str = "main",
@@ -417,7 +417,7 @@ class Tools:
                 out.append(f"`{sha}` **{msg}** — {author}")
             return f"**{repo}** ({branch}) last {len(out)} commits:\n" + "\n".join(out)
 
-    async def get_commit(
+    async def github_get_commit(
             self, repo: str, sha: str, __user__: Optional[dict] = None
     ) -> str:
         """
@@ -446,7 +446,7 @@ class Tools:
                     + ("Changed files:\n" + "\n".join(files_out) if files_out else "")
             )
 
-    async def compare_branches(
+    async def github_compare_branches(
             self, repo: str, base: str, head: str, __user__: Optional[dict] = None
     ) -> str:
         """
@@ -496,7 +496,7 @@ class Tools:
     #  ISSUES
     # ═══════════════════════════════════════════════════════════════
 
-    async def list_issues(
+    async def github_list_issues(
             self,
             repo: str,
             state: str = "open",
@@ -528,7 +528,7 @@ class Tools:
             ]
             return "\n".join(out)
 
-    async def search_issues(
+    async def github_search_issues(
             self,
             repo: str,
             query: str,
@@ -560,7 +560,7 @@ class Tools:
             ]
             return f"Found **{data['total_count']}** issues:\n" + "\n".join(out)
 
-    async def get_issue(
+    async def github_get_issue(
             self, repo: str, issue_number: int, __user__: Optional[dict] = None
     ) -> str:
         """
@@ -587,7 +587,7 @@ class Tools:
                 f"{i['body'] or '_(no description)_'}"
             )
 
-    async def create_issue(
+    async def github_create_issue(
             self,
             repo: str,
             title: str,
@@ -619,9 +619,9 @@ class Tools:
             r = await c.post(url, headers=self._auth(uv), json=payload)
             r.raise_for_status()
             i = r.json()
-            return f"✅ Issue **#{i['number']}** created: {i['title']}\n{i['html_url']}"
+            return f"Issue **#{i['number']}** created: {i['title']}\n{i['html_url']}"
 
-    async def update_issue(
+    async def github_update_issue(
             self,
             repo: str,
             issue_number: int,
@@ -660,14 +660,14 @@ class Tools:
                 a.strip() for a in assignees.split(",") if a.strip()
             ]
         if not payload:
-            return "❌ No fields to update."
+            return "No fields to update."
         async with httpx.AsyncClient() as c:
             r = await c.patch(url, headers=self._auth(uv), json=payload)
             r.raise_for_status()
             i = r.json()
-            return f"✅ Issue **#{i['number']}** updated.\n{i['html_url']}"
+            return f"Issue **#{i['number']}** updated.\n{i['html_url']}"
 
-    async def close_issue(
+    async def github_close_issue(
             self, repo: str, issue_number: int, __user__: Optional[dict] = None
     ) -> str:
         """
@@ -676,11 +676,11 @@ class Tools:
         :param repo: Repository 'owner/name'
         :param issue_number: Issue number to close
         """
-        return await self.update_issue(
+        return await self.github_update_issue(
             repo, issue_number, state="closed", __user__=__user__
         )
 
-    async def reopen_issue(
+    async def github_reopen_issue(
             self, repo: str, issue_number: int, __user__: Optional[dict] = None
     ) -> str:
         """
@@ -689,11 +689,11 @@ class Tools:
         :param repo: Repository 'owner/name'
         :param issue_number: Issue number to reopen
         """
-        return await self.update_issue(
+        return await self.github_update_issue(
             repo, issue_number, state="open", __user__=__user__
         )
 
-    async def add_issue_comment(
+    async def github_add_issue_comment(
             self, repo: str, issue_number: int, body: str, __user__: Optional[dict] = None
     ) -> str:
         """
@@ -710,9 +710,9 @@ class Tools:
             r = await c.post(url, headers=self._auth(uv), json={"body": body})
             r.raise_for_status()
             d = r.json()
-            return f"✅ Comment added to **#{issue_number}**\n{d['html_url']}"
+            return f"Comment added to **#{issue_number}**\n{d['html_url']}"
 
-    async def list_issue_comments(
+    async def github_list_issue_comments(
             self, repo: str, issue_number: int, __user__: Optional[dict] = None
     ) -> str:
         """
@@ -741,7 +741,7 @@ class Tools:
     #  PULL REQUESTS
     # ═══════════════════════════════════════════════════════════════
 
-    async def list_pull_requests(
+    async def github_list_pull_requests(
             self, repo: str, state: str = "open", __user__: Optional[dict] = None
     ) -> str:
         """
@@ -766,7 +766,7 @@ class Tools:
             ]
             return "\n".join(out)
 
-    async def get_pull_request(
+    async def github_get_pull_request(
             self, repo: str, pr_number: int, __user__: Optional[dict] = None
     ) -> str:
         """
@@ -796,7 +796,7 @@ class Tools:
                 f"{p['body'] or '_(no description)_'}"
             )
 
-    async def get_pr_files(
+    async def github_get_pr_files(
             self, repo: str, pr_number: int, __user__: Optional[dict] = None
     ) -> str:
         """
@@ -820,7 +820,7 @@ class Tools:
             ]
             return f"**#{pr_number}** changed files ({len(files)}):\n" + "\n".join(out)
 
-    async def create_pull_request(
+    async def github_create_pull_request(
             self,
             repo: str,
             title: str,
@@ -855,11 +855,11 @@ class Tools:
             r.raise_for_status()
             p = r.json()
             return (
-                f"✅ PR **#{p['number']}** created: {p['title']}\n"
+                f"PR **#{p['number']}** created: {p['title']}\n"
                 f"{p['html_url']}  {'(draft)' if draft else '(ready for review)'}"
             )
 
-    async def request_reviewers(
+    async def github_request_reviewers(
             self,
             repo: str,
             pr_number: int,
@@ -895,9 +895,9 @@ class Tools:
                     ", ".join(r["login"] for r in p.get("requested_reviewers", []))
                     or "none"
             )
-            return f"✅ Reviewers requested for **#{pr_number}**: {requested}\n{p['html_url']}"
+            return f"Reviewers requested for **#{pr_number}**: {requested}\n{p['html_url']}"
 
-    async def add_pr_comment(
+    async def github_add_pr_comment(
             self, repo: str, pr_number: int, body: str, __user__: Optional[dict] = None
     ) -> str:
         """
@@ -914,9 +914,9 @@ class Tools:
             r = await c.post(url, headers=self._auth(uv), json={"body": body})
             r.raise_for_status()
             d = r.json()
-            return f"✅ Comment added to PR **#{pr_number}**\n{d['html_url']}"
+            return f"Comment added to PR **#{pr_number}**\n{d['html_url']}"
 
-    async def list_pr_comments(
+    async def github_list_pr_comments(
             self, repo: str, pr_number: int, __user__: Optional[dict] = None
     ) -> str:
         """
@@ -945,7 +945,7 @@ class Tools:
     #  WORKFLOWS (GitHub Actions)
     # ═══════════════════════════════════════════════════════════════
 
-    async def list_workflows(self, repo: str, __user__: Optional[dict] = None) -> str:
+    async def github_list_workflows(self, repo: str, __user__: Optional[dict] = None) -> str:
         """
         List all GitHub Actions workflows in a repository.
 
@@ -967,7 +967,7 @@ class Tools:
             ]
             return "\n".join(out)
 
-    async def get_workflow(
+    async def github_get_workflow(
             self, repo: str, workflow_id: str, __user__: Optional[dict] = None
     ) -> str:
         """
@@ -997,7 +997,7 @@ class Tools:
                 ensure_ascii=False,
             )
 
-    async def list_workflow_runs(
+    async def github_list_workflow_runs(
             self,
             repo: str,
             workflow_id: str = "",
@@ -1050,7 +1050,7 @@ class Tools:
                 )
             return f"**{repo}** workflow runs:\n" + "\n".join(out)
 
-    async def get_workflow_run(
+    async def github_get_workflow_run(
             self, repo: str, run_id: str, __user__: Optional[dict] = None
     ) -> str:
         """
@@ -1078,11 +1078,11 @@ class Tools:
                 f"**URL:** {run['html_url']}"
             )
 
-    async def get_workflow_run_logs(
+    async def github_get_workflow_run_logs(
             self, repo: str, run_id: str, __user__: Optional[dict] = None
     ) -> str:
         """
-        Get logs of a workflow run (as zip download URL – best viewed in browser).
+        Get logs of a workflow run (as zip download URL).
 
         :param repo: Repository 'owner/name'
         :param run_id: Run ID
@@ -1095,10 +1095,10 @@ class Tools:
             r.raise_for_status()
             location = r.headers.get("Location", "")
             if not location:
-                return "❌ No logs available."
-            return f"📥 Logs download URL: {location}\n_(Opens in browser – a zip of all job logs)_"
+                return "No logs available."
+            return f"Logs download URL: {location}\n_(Opens in browser – a zip of all job logs)_"
 
-    async def trigger_workflow_dispatch(
+    async def github_trigger_workflow_dispatch(
             self,
             repo: str,
             workflow_id: str,
@@ -1120,16 +1120,16 @@ class Tools:
         try:
             parsed_inputs = json.loads(inputs)
         except json.JSONDecodeError:
-            return '❌ Invalid JSON for inputs. Use format: \'{"key":"value"}\''
+            return 'Invalid JSON for inputs. Use format: \'{"key":"value"}\''
         payload = {"ref": ref, "inputs": parsed_inputs}
         async with httpx.AsyncClient() as c:
             r = await c.post(url, headers=self._auth(uv), json=payload)
             if r.status_code == 204:
-                return f"🚀 Workflow **{workflow_id}** triggered on `{ref}`."
+                return f"Workflow **{workflow_id}** triggered on `{ref}`."
             r.raise_for_status()
-            return f"✅ Triggered (unexpected status {r.status_code})."
+            return f"Triggered (unexpected status {r.status_code})."
 
-    async def cancel_workflow_run(
+    async def github_cancel_workflow_run(
             self, repo: str, run_id: str, __user__: Optional[dict] = None
     ) -> str:
         """
@@ -1144,11 +1144,11 @@ class Tools:
         async with httpx.AsyncClient() as c:
             r = await c.post(url, headers=self._auth(uv))
             if r.status_code == 202:
-                return f"🛑 Workflow run **#{run_id}** cancelled."
+                return f"Workflow run **#{run_id}** cancelled."
             r.raise_for_status()
-            return f"✅ Cancelled (status {r.status_code})."
+            return f"Cancelled (status {r.status_code})."
 
-    async def rerun_workflow(
+    async def github_rerun_workflow(
             self, repo: str, run_id: str, __user__: Optional[dict] = None
     ) -> str:
         """
@@ -1163,6 +1163,6 @@ class Tools:
         async with httpx.AsyncClient() as c:
             r = await c.post(url, headers=self._auth(uv))
             if r.status_code == 201:
-                return f"🔄 Workflow run **#{run_id}** rerunning."
+                return f"Workflow run **#{run_id}** rerunning."
             r.raise_for_status()
-            return f"✅ Rerunning (status {r.status_code})."
+            return f"Rerunning (status {r.status_code})."
