@@ -42,7 +42,7 @@ Full read/write access to GitHub repositories, issues, pull requests and workflo
 
 **Workflow rule:**
 ```
-create_branch → create_or_update_file → create_pull_request
+github_create_branch → github_create_or_update_file → github_create_pull_request
 ```
 No direct writes to `main`. No merge function.
 
@@ -61,17 +61,19 @@ Searches the entire GitHub universe — public repositories, code, issues, pull 
 **Functions:**
 | Function | Description |
 |----------|-------------|
-| `search_github(query, search_type)` | Main search across all types |
-| `search_github_repos(query)` | Find repositories |
-| `search_github_code(query)` | Search source code |
-| `search_github_issues(query)` | Search issues and pull requests |
-| `search_github_commits(query)` | Search commit messages |
-| `search_github_users(query)` | Find users and organizations |
+| `github_search(query, search_type)` | Main search across all types |
+| `github_search_repos(query)` | Find repositories |
+| `github_search_code(query)` | Search source code |
+| `github_search_issues(query)` | Search issues and pull requests |
+| `github_search_commits(query)` | Search commit messages |
+| `github_search_users(query)` | Find users and organizations |
 
 **User Valves:**
 | Valve | Default | Description |
 |-------|---------|-------------|
 | `GITHUB_TOKEN` | (empty) | Optional PAT for 30 req/min and private repos. Leave empty for anonymous public searches (10 req/min). |
+
+See the [GitHub Search PR](https://github.com/Piggidragon/OpenWebUI-plugins/pull/1) for details.
 
 ---
 
@@ -98,7 +100,7 @@ For the best experience, add this to your model's system prompt:
 
 ```
 When interacting with GitHub, use the "github-workflow" skill.
-Never write directly to main. Always follow: create branch → write code → create pull request.
+Never write directly to main. Always follow: github_create_branch → github_create_or_update_file → github_create_pull_request.
 ```
 
 ---
