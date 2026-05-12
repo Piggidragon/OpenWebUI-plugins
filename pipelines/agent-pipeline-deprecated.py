@@ -23,13 +23,12 @@ requirements: httpx, beautifulsoup4, websockets
 """
 
 import asyncio
+import httpx
 import json
 import os
 import re
-from typing import AsyncGenerator, Optional, Any
-
-import httpx
 from pydantic import BaseModel, Field, field_validator
+from typing import AsyncGenerator, Optional, Any
 
 # ─────────────────────────────────────────────────────────────────────────────
 #  PROMPTS

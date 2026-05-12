@@ -18,11 +18,11 @@ Code-writing workflow (enforced):
   (No direct main writes, no merge function.)
 """
 
+import base64
+import httpx
+import json
 from pydantic import BaseModel, Field
 from typing import Optional
-import httpx
-import base64
-import json
 
 
 class Tools:
@@ -109,7 +109,7 @@ class Tools:
             )
 
     async def list_user_repos(
-        self, username: str, __user__: Optional[dict] = None
+            self, username: str, __user__: Optional[dict] = None
     ) -> str:
         """
         List public repositories of any GitHub user.
@@ -164,7 +164,7 @@ class Tools:
             )
 
     async def get_file(
-        self, repo: str, path: str, ref: str = "main", __user__: Optional[dict] = None
+            self, repo: str, path: str, ref: str = "main", __user__: Optional[dict] = None
     ) -> str:
         """
         Read a file or directory from a GitHub repository.
@@ -196,7 +196,7 @@ class Tools:
             )
 
     async def search_code(
-        self, repo: str, query: str, __user__: Optional[dict] = None
+            self, repo: str, query: str, __user__: Optional[dict] = None
     ) -> str:
         """
         Search code in a GitHub repository.
@@ -223,11 +223,11 @@ class Tools:
     # ═══════════════════════════════════════════════════════════════
 
     async def create_branch(
-        self,
-        repo: str,
-        branch: str,
-        from_branch: str = "main",
-        __user__: Optional[dict] = None,
+            self,
+            repo: str,
+            branch: str,
+            from_branch: str = "main",
+            __user__: Optional[dict] = None,
     ) -> str:
         """
         Create a new branch from an existing branch (default: main).
@@ -253,13 +253,13 @@ class Tools:
             return f"✅ Branch **{branch}** created in {repo} (from {from_branch})."
 
     async def create_or_update_file(
-        self,
-        repo: str,
-        path: str,
-        content: str,
-        branch: str,
-        message: str = "",
-        __user__: Optional[dict] = None,
+            self,
+            repo: str,
+            path: str,
+            content: str,
+            branch: str,
+            message: str = "",
+            __user__: Optional[dict] = None,
     ) -> str:
         """
         Create or update a file on a branch (NOT on main — use via PR workflow).
@@ -303,12 +303,12 @@ class Tools:
             )
 
     async def delete_file(
-        self,
-        repo: str,
-        path: str,
-        branch: str,
-        message: str = "",
-        __user__: Optional[dict] = None,
+            self,
+            repo: str,
+            path: str,
+            branch: str,
+            message: str = "",
+            __user__: Optional[dict] = None,
     ) -> str:
         """
         Delete a file on a branch (NOT on main — use via PR workflow).
@@ -339,7 +339,7 @@ class Tools:
     # ── internal helpers ────────────────────────────────────────
 
     async def _file_exists(
-        self, repo: str, path: str, ref: str, uv: "Tools.UserValves"
+            self, repo: str, path: str, ref: str, uv: "Tools.UserValves"
     ) -> bool:
         url = f"https://api.github.com/repos/{repo}/contents/{path}?ref={ref}"
         async with httpx.AsyncClient() as c:
@@ -347,7 +347,7 @@ class Tools:
             return r.status_code == 200
 
     async def _file_sha(
-        self, repo: str, path: str, ref: str, uv: "Tools.UserValves"
+            self, repo: str, path: str, ref: str, uv: "Tools.UserValves"
     ) -> str | None:
         url = f"https://api.github.com/repos/{repo}/contents/{path}?ref={ref}"
         async with httpx.AsyncClient() as c:
@@ -383,11 +383,11 @@ class Tools:
     # ═══════════════════════════════════════════════════════════════
 
     async def list_commits(
-        self,
-        repo: str,
-        branch: str = "main",
-        per_page: int = 20,
-        __user__: Optional[dict] = None,
+            self,
+            repo: str,
+            branch: str = "main",
+            per_page: int = 20,
+            __user__: Optional[dict] = None,
     ) -> str:
         """
         List recent commits on a branch.
@@ -418,7 +418,7 @@ class Tools:
             return f"**{repo}** ({branch}) last {len(out)} commits:\n" + "\n".join(out)
 
     async def get_commit(
-        self, repo: str, sha: str, __user__: Optional[dict] = None
+            self, repo: str, sha: str, __user__: Optional[dict] = None
     ) -> str:
         """
         Get detailed info about a single commit, including the diff.
@@ -439,15 +439,15 @@ class Tools:
                     f"  {f['status']:>7}  +{f['additions']:<4} -{f['deletions']:<4}  {f['filename']}"
                 )
             return (
-                f"## {c['sha'][:7]} {c['commit']['message'].split(chr(10))[0]}\n"
-                f"**Author:** {c['commit']['author']['name']}  |  "
-                f"**Date:** {c['commit']['author']['date']}\n"
-                f"**URL:** {c['html_url']}\n\n"
-                + ("Changed files:\n" + "\n".join(files_out) if files_out else "")
+                    f"## {c['sha'][:7]} {c['commit']['message'].split(chr(10))[0]}\n"
+                    f"**Author:** {c['commit']['author']['name']}  |  "
+                    f"**Date:** {c['commit']['author']['date']}\n"
+                    f"**URL:** {c['html_url']}\n\n"
+                    + ("Changed files:\n" + "\n".join(files_out) if files_out else "")
             )
 
     async def compare_branches(
-        self, repo: str, base: str, head: str, __user__: Optional[dict] = None
+            self, repo: str, base: str, head: str, __user__: Optional[dict] = None
     ) -> str:
         """
         Compare two branches and show the diff summary.
@@ -476,20 +476,20 @@ class Tools:
             file_lines = [f"  {f['status']:>7}  {f['filename']}" for f in files[:15]]
 
             return (
-                f"## {base} ← {head}\n"
-                f"**Status:** {status}  |  Ahead: {ahead}  |  Behind: {behind}\n"
-                + (
-                    f"\nCommits ({len(commits)}):\n" + "\n".join(commit_lines)
-                    if commit_lines
-                    else ""
-                )
-                + ("\n…and more" if len(commits) > 10 else "")
-                + (
-                    f"\n\nFiles ({len(files)}):\n" + "\n".join(file_lines)
-                    if file_lines
-                    else ""
-                )
-                + ("\n…and more" if len(files) > 15 else "")
+                    f"## {base} ← {head}\n"
+                    f"**Status:** {status}  |  Ahead: {ahead}  |  Behind: {behind}\n"
+                    + (
+                        f"\nCommits ({len(commits)}):\n" + "\n".join(commit_lines)
+                        if commit_lines
+                        else ""
+                    )
+                    + ("\n…and more" if len(commits) > 10 else "")
+                    + (
+                        f"\n\nFiles ({len(files)}):\n" + "\n".join(file_lines)
+                        if file_lines
+                        else ""
+                    )
+                    + ("\n…and more" if len(files) > 15 else "")
             )
 
     # ═══════════════════════════════════════════════════════════════
@@ -497,11 +497,11 @@ class Tools:
     # ═══════════════════════════════════════════════════════════════
 
     async def list_issues(
-        self,
-        repo: str,
-        state: str = "open",
-        labels: str = "",
-        __user__: Optional[dict] = None,
+            self,
+            repo: str,
+            state: str = "open",
+            labels: str = "",
+            __user__: Optional[dict] = None,
     ) -> str:
         """
         List issues in a GitHub repository.
@@ -529,11 +529,11 @@ class Tools:
             return "\n".join(out)
 
     async def search_issues(
-        self,
-        repo: str,
-        query: str,
-        state: str = "open",
-        __user__: Optional[dict] = None,
+            self,
+            repo: str,
+            query: str,
+            state: str = "open",
+            __user__: Optional[dict] = None,
     ) -> str:
         """
         Search issues by text in title/body.
@@ -561,7 +561,7 @@ class Tools:
             return f"Found **{data['total_count']}** issues:\n" + "\n".join(out)
 
     async def get_issue(
-        self, repo: str, issue_number: int, __user__: Optional[dict] = None
+            self, repo: str, issue_number: int, __user__: Optional[dict] = None
     ) -> str:
         """
         Get full details of a single issue.
@@ -588,13 +588,13 @@ class Tools:
             )
 
     async def create_issue(
-        self,
-        repo: str,
-        title: str,
-        body: str = "",
-        labels: str = "",
-        assignees: str = "",
-        __user__: Optional[dict] = None,
+            self,
+            repo: str,
+            title: str,
+            body: str = "",
+            labels: str = "",
+            assignees: str = "",
+            __user__: Optional[dict] = None,
     ) -> str:
         """
         Create a new issue.
@@ -622,15 +622,15 @@ class Tools:
             return f"✅ Issue **#{i['number']}** created: {i['title']}\n{i['html_url']}"
 
     async def update_issue(
-        self,
-        repo: str,
-        issue_number: int,
-        title: str = "",
-        body: str = "",
-        state: str = "",
-        labels: str = "",
-        assignees: str = "",
-        __user__: Optional[dict] = None,
+            self,
+            repo: str,
+            issue_number: int,
+            title: str = "",
+            body: str = "",
+            state: str = "",
+            labels: str = "",
+            assignees: str = "",
+            __user__: Optional[dict] = None,
     ) -> str:
         """
         Update an issue (title, body, state, labels, assignees).
@@ -668,7 +668,7 @@ class Tools:
             return f"✅ Issue **#{i['number']}** updated.\n{i['html_url']}"
 
     async def close_issue(
-        self, repo: str, issue_number: int, __user__: Optional[dict] = None
+            self, repo: str, issue_number: int, __user__: Optional[dict] = None
     ) -> str:
         """
         Close an issue.
@@ -681,7 +681,7 @@ class Tools:
         )
 
     async def reopen_issue(
-        self, repo: str, issue_number: int, __user__: Optional[dict] = None
+            self, repo: str, issue_number: int, __user__: Optional[dict] = None
     ) -> str:
         """
         Reopen a closed issue.
@@ -694,7 +694,7 @@ class Tools:
         )
 
     async def add_issue_comment(
-        self, repo: str, issue_number: int, body: str, __user__: Optional[dict] = None
+            self, repo: str, issue_number: int, body: str, __user__: Optional[dict] = None
     ) -> str:
         """
         Add a comment to an issue.
@@ -713,7 +713,7 @@ class Tools:
             return f"✅ Comment added to **#{issue_number}**\n{d['html_url']}"
 
     async def list_issue_comments(
-        self, repo: str, issue_number: int, __user__: Optional[dict] = None
+            self, repo: str, issue_number: int, __user__: Optional[dict] = None
     ) -> str:
         """
         List comments on an issue.
@@ -742,7 +742,7 @@ class Tools:
     # ═══════════════════════════════════════════════════════════════
 
     async def list_pull_requests(
-        self, repo: str, state: str = "open", __user__: Optional[dict] = None
+            self, repo: str, state: str = "open", __user__: Optional[dict] = None
     ) -> str:
         """
         List pull requests in a GitHub repository.
@@ -767,7 +767,7 @@ class Tools:
             return "\n".join(out)
 
     async def get_pull_request(
-        self, repo: str, pr_number: int, __user__: Optional[dict] = None
+            self, repo: str, pr_number: int, __user__: Optional[dict] = None
     ) -> str:
         """
         Get full details of a single pull request.
@@ -783,8 +783,8 @@ class Tools:
             r.raise_for_status()
             p = r.json()
             requested = (
-                ", ".join(r["login"] for r in p.get("requested_reviewers", []))
-                or "none"
+                    ", ".join(r["login"] for r in p.get("requested_reviewers", []))
+                    or "none"
             )
             return (
                 f"## #{p['number']} {p['title']}\n"
@@ -797,7 +797,7 @@ class Tools:
             )
 
     async def get_pr_files(
-        self, repo: str, pr_number: int, __user__: Optional[dict] = None
+            self, repo: str, pr_number: int, __user__: Optional[dict] = None
     ) -> str:
         """
         List files changed in a pull request with stats.
@@ -821,14 +821,14 @@ class Tools:
             return f"**#{pr_number}** changed files ({len(files)}):\n" + "\n".join(out)
 
     async def create_pull_request(
-        self,
-        repo: str,
-        title: str,
-        head: str,
-        base: str = "main",
-        body: str = "",
-        draft: bool = False,
-        __user__: Optional[dict] = None,
+            self,
+            repo: str,
+            title: str,
+            head: str,
+            base: str = "main",
+            body: str = "",
+            draft: bool = False,
+            __user__: Optional[dict] = None,
     ) -> str:
         """
         Create a new pull request.
@@ -860,12 +860,12 @@ class Tools:
             )
 
     async def request_reviewers(
-        self,
-        repo: str,
-        pr_number: int,
-        reviewers: str,
-        team_reviewers: str = "",
-        __user__: Optional[dict] = None,
+            self,
+            repo: str,
+            pr_number: int,
+            reviewers: str,
+            team_reviewers: str = "",
+            __user__: Optional[dict] = None,
     ) -> str:
         """
         Request reviewers for a pull request.
@@ -892,13 +892,13 @@ class Tools:
             r.raise_for_status()
             p = r.json()
             requested = (
-                ", ".join(r["login"] for r in p.get("requested_reviewers", []))
-                or "none"
+                    ", ".join(r["login"] for r in p.get("requested_reviewers", []))
+                    or "none"
             )
             return f"✅ Reviewers requested for **#{pr_number}**: {requested}\n{p['html_url']}"
 
     async def add_pr_comment(
-        self, repo: str, pr_number: int, body: str, __user__: Optional[dict] = None
+            self, repo: str, pr_number: int, body: str, __user__: Optional[dict] = None
     ) -> str:
         """
         Add a general comment to a pull request.
@@ -917,7 +917,7 @@ class Tools:
             return f"✅ Comment added to PR **#{pr_number}**\n{d['html_url']}"
 
     async def list_pr_comments(
-        self, repo: str, pr_number: int, __user__: Optional[dict] = None
+            self, repo: str, pr_number: int, __user__: Optional[dict] = None
     ) -> str:
         """
         List comments on a pull request.
@@ -968,7 +968,7 @@ class Tools:
             return "\n".join(out)
 
     async def get_workflow(
-        self, repo: str, workflow_id: str, __user__: Optional[dict] = None
+            self, repo: str, workflow_id: str, __user__: Optional[dict] = None
     ) -> str:
         """
         Get details of a single workflow.
@@ -998,13 +998,13 @@ class Tools:
             )
 
     async def list_workflow_runs(
-        self,
-        repo: str,
-        workflow_id: str = "",
-        branch: str = "",
-        status: str = "",
-        per_page: int = 15,
-        __user__: Optional[dict] = None,
+            self,
+            repo: str,
+            workflow_id: str = "",
+            branch: str = "",
+            status: str = "",
+            per_page: int = 15,
+            __user__: Optional[dict] = None,
     ) -> str:
         """
         List recent workflow runs.
@@ -1051,7 +1051,7 @@ class Tools:
             return f"**{repo}** workflow runs:\n" + "\n".join(out)
 
     async def get_workflow_run(
-        self, repo: str, run_id: str, __user__: Optional[dict] = None
+            self, repo: str, run_id: str, __user__: Optional[dict] = None
     ) -> str:
         """
         Get detailed info about a single workflow run.
@@ -1079,7 +1079,7 @@ class Tools:
             )
 
     async def get_workflow_run_logs(
-        self, repo: str, run_id: str, __user__: Optional[dict] = None
+            self, repo: str, run_id: str, __user__: Optional[dict] = None
     ) -> str:
         """
         Get logs of a workflow run (as zip download URL – best viewed in browser).
@@ -1099,12 +1099,12 @@ class Tools:
             return f"📥 Logs download URL: {location}\n_(Opens in browser – a zip of all job logs)_"
 
     async def trigger_workflow_dispatch(
-        self,
-        repo: str,
-        workflow_id: str,
-        ref: str,
-        inputs: str = "{}",
-        __user__: Optional[dict] = None,
+            self,
+            repo: str,
+            workflow_id: str,
+            ref: str,
+            inputs: str = "{}",
+            __user__: Optional[dict] = None,
     ) -> str:
         """
         Manually trigger a workflow_dispatch event.
@@ -1130,7 +1130,7 @@ class Tools:
             return f"✅ Triggered (unexpected status {r.status_code})."
 
     async def cancel_workflow_run(
-        self, repo: str, run_id: str, __user__: Optional[dict] = None
+            self, repo: str, run_id: str, __user__: Optional[dict] = None
     ) -> str:
         """
         Cancel a running workflow.
@@ -1149,7 +1149,7 @@ class Tools:
             return f"✅ Cancelled (status {r.status_code})."
 
     async def rerun_workflow(
-        self, repo: str, run_id: str, __user__: Optional[dict] = None
+            self, repo: str, run_id: str, __user__: Optional[dict] = None
     ) -> str:
         """
         Rerun a failed workflow run.
