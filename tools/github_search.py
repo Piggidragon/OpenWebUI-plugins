@@ -6,7 +6,7 @@ description: >
   issues, pull requests, commits, users, and topics — right from Open WebUI.
   Works without a token (lower rate limits), or with a token for higher limits
   and access to your private repositories.
-version: 1.0.0
+version: 1.0.1
 """
 
 import json
@@ -71,7 +71,7 @@ class Tools:
     #  MAIN SEARCH FUNCTION
     # ═══════════════════════════════════════════════════════════════
 
-    async def search_github(
+    async def github_search(
         self,
         query: str,
         search_type: Literal[
@@ -260,32 +260,32 @@ class Tools:
     #  CONVENIENCE SHORTCUTS  (same logic, shorter names)
     # ═══════════════════════════════════════════════════════════════
 
-    async def search_github_repos(
+    async def github_search_repos(
         self, query: str, per_page: int = 10, __user__: Optional[dict] = None
     ) -> str:
-        """Search public/private GitHub repositories. Shortcut for search_github(type='repositories')."""
-        return await self.search_github(query, "repositories", per_page, __user__)
+        """Search public/private GitHub repositories. Shortcut for github_search(type='repositories')."""
+        return await self.github_search(query, "repositories", per_page, __user__)
 
-    async def search_github_code(
+    async def github_search_code(
         self, query: str, per_page: int = 10, __user__: Optional[dict] = None
     ) -> str:
-        """Search source code across all of GitHub. Shortcut for search_github(type='code')."""
-        return await self.search_github(query, "code", per_page, __user__)
+        """Search source code across all of GitHub. Shortcut for github_search(type='code')."""
+        return await self.github_search(query, "code", per_page, __user__)
 
-    async def search_github_issues(
+    async def github_search_issues(
         self, query: str, per_page: int = 10, __user__: Optional[dict] = None
     ) -> str:
-        """Search issues and pull requests across GitHub. Shortcut for search_github(type='issues')."""
-        return await self.search_github(query, "issues", per_page, __user__)
+        """Search issues and pull requests across GitHub. Shortcut for github_search(type='issues')."""
+        return await self.github_search(query, "issues", per_page, __user__)
 
-    async def search_github_commits(
+    async def github_search_commits(
         self, query: str, per_page: int = 10, __user__: Optional[dict] = None
     ) -> str:
-        """Search commit messages across GitHub. Shortcut for search_github(type='commits')."""
-        return await self.search_github(query, "commits", per_page, __user__)
+        """Search commit messages across GitHub. Shortcut for github_search(type='commits')."""
+        return await self.github_search(query, "commits", per_page, __user__)
 
-    async def search_github_users(
+    async def github_search_users(
         self, query: str, per_page: int = 10, __user__: Optional[dict] = None
     ) -> str:
-        """Search GitHub users and organizations. Shortcut for search_github(type='users')."""
-        return await self.search_github(query, "users", per_page, __user__)
+        """Search GitHub users and organizations. Shortcut for github_search(type='users')."""
+        return await self.github_search(query, "users", per_page, __user__)
