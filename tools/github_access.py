@@ -1,21 +1,12 @@
 """
-GitHub Integration Tool
-─────────────────────────
-Read repo contents, manage issues, pull requests, branches,
-commits, and GitHub Actions workflows — directly from OpenWebUI.
-Uses the GitHub REST API with your Personal Access Token.
-
-UserValves (set under Account → Valves):
-  • GITHUB_TOKEN           – Your GitHub PAT (ghp_… or github_pat_…)
-  • ENABLE_CONTENT         – Toggle repo browsing / file reading
-  • ENABLE_CONTENT_WRITE   – Toggle branch creation & file writes (always via PR)
-  • ENABLE_ISSUES          – Toggle issue read / write / comments
-  • ENABLE_PULL_REQUESTS   – Toggle PR read / write / reviews / comments
-  • ENABLE_WORKFLOWS       – Toggle GitHub Actions workflow read / trigger
-
-Code-writing workflow (enforced):
-  github_create_branch → github_create_or_update_file → github_create_pull_request
-  (No direct main writes, no merge function.)
+title: GitHub Access
+author: Piggidragon
+description: >
+  Full read/write access to GitHub repositories, issues, pull requests,
+  branches, commits, and GitHub Actions workflows — directly from OpenWebUI.
+  Uses the GitHub REST API with your Personal Access Token.
+  Enforces a branch→file→PR workflow; no direct writes to main.
+version: 1.1.0
 """
 
 import base64
@@ -27,7 +18,7 @@ from typing import Optional
 
 class Tools:
     class Valves(BaseModel):
-        """Global / admin settings – left empty on purpose."""
+        """Global / admin settings — left empty on purpose."""
 
         pass
 
@@ -72,7 +63,7 @@ class Tools:
         t = uv.GITHUB_TOKEN
         if not t:
             raise ValueError(
-                "No GitHub token set. Go to Account -> Valves "
+                "No GitHub token set. Go to Account → Valves "
                 "and enter your PAT in GITHUB_TOKEN."
             )
         return {
@@ -134,13 +125,13 @@ class Tools:
         """
         Get metadata about a single repository.
 
-        :param repo: Repository as 'owner/name' (e.g. 'simeon/my-project')
+        :param repo: Repository as 'owner/name' (e.g. 'Piggidragon/OpenWebUI-plugins')
         """
         uv = self._get_valves(__user__)
         self._guard(uv.ENABLE_CONTENT, "Content")
         url = f"https://api.github.com/repos/{repo}"
         async with httpx.AsyncClient() as c:
-            r = await c.get(url, headers=self._auth(uv))
+            r = await c.get(url, headers=self._auth(Uv))
             r.raise_for_status()
             d = r.json()
             return json.dumps(
@@ -169,7 +160,7 @@ class Tools:
         """
         Read a file or directory from a GitHub repository.
 
-        :param repo: Repository as 'owner/name' (e.g. 'simeon/my-project')
+        :param repo: Repository as 'owner/name' (e.g. 'Piggidragon/OpenWebUI-plugins')
         :param path: File path inside the repo (e.g. 'src/main.py')
         :param ref: Branch, tag or commit SHA (default: main)
         """

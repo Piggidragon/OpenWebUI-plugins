@@ -1,9 +1,9 @@
 """
 title: GitHub Global Search
-author: Simeon
+author: Piggidragon
 description: >
   Search the entire GitHub universe — public (and private) repos, code,
-  issues, pull requests, commits, users, and topics — right from Open WebUI.
+  issues, pull requests, commits, users, and topics — right from OpenWebUI.
   Works without a token (lower rate limits), or with a token for higher limits
   and access to your private repositories.
 version: 1.0.1
