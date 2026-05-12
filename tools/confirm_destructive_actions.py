@@ -1,6 +1,6 @@
 """
 title: Confirm Destructive Action
-author: custom
+author: Piggidragon
 description: >
   Shows the user a native confirmation dialog before a destructive
   action is executed. The model calls this tool and waits for the
