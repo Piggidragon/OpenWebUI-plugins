@@ -26,23 +26,25 @@ Full read/write access to GitHub repositories, issues, pull requests and workflo
 **Capabilities:**
 - Browse repositories, files and directories
 - Read commits, branches and diffs
-- Create branches, write and delete files
-- Create, read and comment on issues
-- List, create and review pull requests
+- Create branches, create/write/rename/delete files and directories
+- Create, read, update, close issues
+- Add, list, update, delete comments on issues and PRs
+- List, create, update pull requests, request reviewers, get diffs
+- Rename files and directories
 - Trigger and monitor GitHub Actions workflows
 
 **User Valves:**
 | Valve | Default | Controls |
 |-------|---------|----------|
 | `ENABLE_CONTENT` | on | Read access to repos, files, branches, commits |
-| `ENABLE_CONTENT_WRITE` | on | Create branches, write/delete files |
-| `ENABLE_ISSUES` | on | Read, create, update issues |
-| `ENABLE_PULL_REQUESTS` | on | Read, create PRs, request reviewers |
+| `ENABLE_CONTENT_WRITE` | on | Create branches, create/write/rename/delete files and directories |
+| `ENABLE_ISSUES` | on | Read, create, update, close issues; add/list/update/delete comments |
+| `ENABLE_PULL_REQUESTS` | on | Read, create, update PRs, request reviewers, diff |
 | `ENABLE_WORKFLOWS` | on | List, trigger, cancel workflow runs |
 
 **Workflow rule:**
 ```
-github_create_branch → github_create_or_update_file → github_create_pull_request
+github_create_branch → github_write_file → github_create_pull_request
 ```
 No direct writes to `main`. No merge function.
 
@@ -50,7 +52,7 @@ No direct writes to `main`. No merge function.
 
 ### `confirm_destructive_actions.py` — Destructive Action Guard
 
-Shows a confirmation dialog before irreversible operations (file deletion, branch deletion, etc.). The model must call this and receive `"confirmed"` before proceeding.
+Shows a confirmation dialog before irreversible operations (file/directory deletion, etc.). The model must call this and receive `"confirmed"` before proceeding.
 
 ---
 
@@ -100,7 +102,7 @@ For the best experience, add this to your model's system prompt:
 
 ```
 When interacting with GitHub, use the "github-workflow" skill.
-Never write directly to main. Always follow: github_create_branch → github_create_or_update_file → github_create_pull_request.
+Never write directly to main. Always follow: github_create_branch → github_write_file → github_create_pull_request.
 ```
 
 ---

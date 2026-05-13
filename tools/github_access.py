@@ -6,7 +6,7 @@ description: >
   branches, commits, and GitHub Actions workflows — directly from OpenWebUI.
   Uses the GitHub REST API with your Personal Access Token.
   Enforces a branch→file→PR workflow; no direct writes to main.
-version: 1.1.0
+version: 1.4.0
 """
 
 import base64
@@ -33,15 +33,15 @@ class Tools:
         )
         ENABLE_CONTENT_WRITE: bool = Field(
             default=True,
-            description="Enable tools: create branches, write/delete files (always via PR workflow)",
+            description="Enable tools: create branches, create/write/rename/delete files and directories (always via PR workflow)",
         )
         ENABLE_ISSUES: bool = Field(
             default=True,
-            description="Enable tools: list, create, update, close, comment on issues",
+            description="Enable tools: list, create, update, close issues; add/list/update/delete comments on issues and PRs",
         )
         ENABLE_PULL_REQUESTS: bool = Field(
             default=True,
-            description="Enable tools: list, create PRs, request reviewers, comment (NO merge)",
+            description="Enable tools: list, create, update PRs, request reviewers, diff (NO merge)",
         )
         ENABLE_WORKFLOWS: bool = Field(
             default=True,
@@ -131,7 +131,7 @@ class Tools:
         self._guard(uv.ENABLE_CONTENT, "Content")
         url = f"https://api.github.com/repos/{repo}"
         async with httpx.AsyncClient() as c:
-            r = await c.get(url, headers=self._auth(Uv))
+            r = await c.get(url, headers=self._auth(uv))
             r.raise_for_status()
             d = r.json()
             return json.dumps(
@@ -209,6 +209,37 @@ class Tools:
                 items
             )
 
+
+    async def github_search_code_global(
+            self,
+            query: str,
+            per_page: int = 10,
+            __user__: Optional[dict] = None,
+    ) -> str:
+        """
+        Search code across ALL of GitHub (global search, not limited to one repo).
+
+        :param query: Search term (e.g. 'function login language:python')
+        :param per_page: Number of results (default: 10, max: 30)
+        """
+        uv = self._get_valves(__user__)
+        self._guard(uv.ENABLE_CONTENT, "Content")
+        url = f"https://api.github.com/search/code?q={query}&per_page={min(per_page, 30)}"
+        async with httpx.AsyncClient() as c:
+            r = await c.get(url, headers=self._auth(uv))
+            r.raise_for_status()
+            data = r.json()
+            if data["total_count"] == 0:
+                return f"No results for '{query}' across GitHub."
+            items = []
+            for i in data["items"]:
+                repo_name = i.get("repository", {}).get("full_name", "unknown")
+                items.append(f"- `{i['path']}` in **{repo_name}**")
+            return (
+                f"Found **{data['total_count']}** results across GitHub for '{query}':\n"
+                + "\n".join(items)
+            )
+
     # ═══════════════════════════════════════════════════════════════
     #  CONTENT – Writing (Branch → File → PR workflow ONLY)
     # ═══════════════════════════════════════════════════════════════
@@ -243,7 +274,7 @@ class Tools:
             r2.raise_for_status()
             return f"Branch **{branch}** created in {repo} (from {from_branch})."
 
-    async def github_create_or_update_file(
+    async def github_create_file(
             self,
             repo: str,
             path: str,
@@ -253,12 +284,63 @@ class Tools:
             __user__: Optional[dict] = None,
     ) -> str:
         """
-        Create or update a file on a branch (NOT on main — use via PR workflow).
+        Create a NEW file on a branch. Fails if the file already exists.
+        Use for initial file creation only. To overwrite an existing file, use github_write_file instead.
+        NEVER write directly to main — always use a branch + PR workflow.
 
-        :param repo: Repository 'owner/name'
-        :param path: File path inside the repo (e.g. 'docs/readme.md')
-        :param content: New file content (plain text)
-        :param branch: Branch to commit to (REQUIRED — new branch from create_branch)
+        :param repo: Repository 'owner/name' (e.g. 'Piggidragon/OpenWebUI-plugins')
+        :param path: File path inside the repo (e.g. 'src/main.py')
+        :param content: The COMPLETE file content as a plain text string. You MUST provide the entire file — partial content will result in data loss.
+        :param branch: Branch to commit to (REQUIRED — must be a new branch from github_create_branch)
+        :param message: Commit message (auto-generated if empty)
+        """
+        uv = self._get_valves(__user__)
+        self._guard(uv.ENABLE_CONTENT_WRITE, "Content Write")
+
+        existing = await self._file_sha(repo, path, branch, uv)
+        if existing:
+            return (
+                f"File '{path}' already exists on branch '{branch}'. "
+                f"Use github_write_file to overwrite an existing file."
+            )
+
+        if not message:
+            message = f"Create {path}"
+
+        url = f"https://api.github.com/repos/{repo}/contents/{path}"
+        payload: dict = {
+            "message": message,
+            "content": base64.b64encode(content.encode("utf-8")).decode("ascii"),
+            "branch": branch,
+        }
+
+        async with httpx.AsyncClient() as c:
+            r = await c.put(url, headers=self._auth(uv), json=payload)
+            r.raise_for_status()
+            d = r.json()
+            return (
+                f"**{d['content']['name']}** created on `{branch}`\n"
+                f"Commit: {d['commit']['sha'][:7]} — {d['commit']['message']}\n"
+                f"URL: {d['content']['html_url']}"
+            )
+
+    async def github_write_file(
+            self,
+            repo: str,
+            path: str,
+            content: str,
+            branch: str,
+            message: str = "",
+            __user__: Optional[dict] = None,
+    ) -> str:
+        """
+        Overwrite an existing file on a branch with new content. Also works for creating new files.
+        NEVER write directly to main — always use a branch + PR workflow.
+
+        :param repo: Repository 'owner/name' (e.g. 'Piggidragon/OpenWebUI-plugins')
+        :param path: File path inside the repo (e.g. 'src/main.py')
+        :param content: The COMPLETE file content as a plain text string. You MUST provide the entire file — do NOT send only the changed parts. Partial content will replace the entire file and cause data loss.
+        :param branch: Branch to write to (REQUIRED — must be a branch, never main)
         :param message: Commit message (auto-generated if empty)
         """
         uv = self._get_valves(__user__)
@@ -288,7 +370,7 @@ class Tools:
             r.raise_for_status()
             d = r.json()
             return (
-                f"**{d['content']['name']}** committed to `{branch}`\n"
+                f"**{d['content']['name']}** written to `{branch}`\n"
                 f"Commit: {d['commit']['sha'][:7]} — {d['commit']['message']}\n"
                 f"URL: {d['content']['html_url']}"
             )
@@ -349,6 +431,214 @@ class Tools:
 
     # ═══════════════════════════════════════════════════════════════
     #  BRANCHES – Reading
+    async def github_create_directory(
+            self,
+            repo: str,
+            path: str,
+            branch: str,
+            message: str = "",
+            __user__: Optional[dict] = None,
+    ) -> str:
+        """
+        Create an empty directory by committing a .gitkeep file.
+        Git does not track empty directories; the .gitkeep file ensures the directory exists.
+
+        :param repo: Repository 'owner/name'
+        :param path: Directory path to create (e.g. 'src/utils')
+        :param branch: Branch to commit to
+        :param message: Commit message (auto-generated if empty)
+        """
+        uv = self._get_valves(__user__)
+        self._guard(uv.ENABLE_CONTENT_WRITE, "Content Write")
+        keep_path = path.rstrip("/") + "/.gitkeep"
+        if not message:
+            message = f"Create directory {path}"
+        return await self.github_write_file(
+            repo=repo,
+            path=keep_path,
+            content="",
+            branch=branch,
+            message=message,
+            __user__=__user__,
+        )
+
+    async def github_delete_directory(
+            self,
+            repo: str,
+            path: str,
+            branch: str,
+            message: str = "",
+            __user__: Optional[dict] = None,
+    ) -> str:
+        """
+        Delete a directory and all its contents recursively on a branch.
+        Lists all files under the path and deletes them one by one.
+
+        :param repo: Repository 'owner/name'
+        :param path: Directory path to delete (e.g. 'src/utils')
+        :param branch: Branch to delete from
+        :param message: Commit message (auto-generated if empty)
+        """
+        uv = self._get_valves(__user__)
+        self._guard(uv.ENABLE_CONTENT_WRITE, "Content Write")
+        
+        if not message:
+            message = f"Delete directory {path}"
+        
+        # Recursively collect all file paths
+        files_to_delete = []
+        async def _collect_files(dir_path: str):
+            url = f"https://api.github.com/repos/{repo}/contents/{dir_path}?ref={branch}"
+            async with httpx.AsyncClient() as c:
+                r = await c.get(url, headers=self._auth(uv))
+                if r.status_code != 200:
+                    return
+                items = r.json()
+                if not isinstance(items, list):
+                    return
+                for item in items:
+                    if item["type"] == "file":
+                        files_to_delete.append(item["path"])
+                    elif item["type"] == "dir":
+                        await _collect_files(item["path"])
+        
+        await _collect_files(path)
+        
+        if not files_to_delete:
+            return f"Directory '{path}' is empty or not found on branch '{branch}'."
+        
+        results = []
+        for fpath in files_to_delete:
+            result = await self.github_delete_file(
+                repo=repo, path=fpath, branch=branch, message=message, __user__=__user__
+            )
+            results.append(result)
+        
+        return f"Deleted {len(files_to_delete)} files from '{path}':\n" + "\n".join(results)
+
+    async def github_rename_file(
+            self,
+            repo: str,
+            path: str,
+            new_path: str,
+            branch: str,
+            message: str = "",
+            __user__: Optional[dict] = None,
+    ) -> str:
+        """
+        Rename or move a file on a branch (NOT on main — use via PR workflow).
+        Creates the file at the new path and deletes the old one.
+
+        :param repo: Repository 'owner/name'
+        :param path: Current file path (e.g. 'src/old_name.py')
+        :param new_path: New file path (e.g. 'src/new_name.py')
+        :param branch: Branch to commit to
+        :param message: Commit message (auto-generated if empty)
+        """
+        uv = self._get_valves(__user__)
+        self._guard(uv.ENABLE_CONTENT_WRITE, "Content Write")
+
+        old_file_url = f"https://api.github.com/repos/{repo}/contents/{path}?ref={branch}"
+        async with httpx.AsyncClient() as c:
+            r = await c.get(old_file_url, headers=self._auth(uv))
+            if r.status_code == 404:
+                return f"File '{path}' not found on branch '{branch}' in {repo}."
+            r.raise_for_status()
+            old_data = r.json()
+
+        old_content = old_data.get("content", "")
+        old_sha = old_data["sha"]
+
+        if not message:
+            message = f"Rename {path} → {new_path}"
+
+        new_url = f"https://api.github.com/repos/{repo}/contents/{new_path}"
+        create_payload: dict = {
+            "message": message,
+            "content": old_content,
+            "branch": branch,
+        }
+        new_sha = await self._file_sha(repo, new_path, branch, uv)
+        if new_sha:
+            create_payload["sha"] = new_sha
+
+        async with httpx.AsyncClient() as c:
+            r_create = await c.put(new_url, headers=self._auth(uv), json=create_payload)
+            r_create.raise_for_status()
+
+        delete_url = f"https://api.github.com/repos/{repo}/contents/{path}"
+        delete_payload = {
+            "message": message,
+            "sha": old_sha,
+            "branch": branch,
+        }
+        async with httpx.AsyncClient() as c:
+            r_delete = await c.delete(delete_url, headers=self._auth(uv), json=delete_payload)
+            r_delete.raise_for_status()
+
+        return f"Renamed **{path}** → **{new_path}** on `{branch}`."
+
+    async def github_rename_directory(
+            self,
+            repo: str,
+            path: str,
+            new_path: str,
+            branch: str,
+            message: str = "",
+            __user__: Optional[dict] = None,
+    ) -> str:
+        """
+        Rename or move a directory on a branch (NOT on main — use via PR workflow).
+        Moves all files from the old directory to the new one.
+
+        :param repo: Repository 'owner/name'
+        :param path: Current directory path (e.g. 'src/old_dir')
+        :param new_path: New directory path (e.g. 'src/new_dir')
+        :param branch: Branch to commit to
+        :param message: Commit message (auto-generated if empty)
+        """
+        uv = self._get_valves(__user__)
+        self._guard(uv.ENABLE_CONTENT_WRITE, "Content Write")
+
+        if not message:
+            message = f"Rename directory {path} → {new_path}"
+
+        files_to_move = []
+        async def _collect_files(dir_path: str):
+            url = f"https://api.github.com/repos/{repo}/contents/{dir_path}?ref={branch}"
+            async with httpx.AsyncClient() as c:
+                r = await c.get(url, headers=self._auth(uv))
+                if r.status_code != 200:
+                    return
+                items = r.json()
+                if not isinstance(items, list):
+                    return
+                for item in items:
+                    if item["type"] == "file":
+                        files_to_move.append(item["path"])
+                    elif item["type"] == "dir":
+                        await _collect_files(item["path"])
+
+        await _collect_files(path)
+
+        if not files_to_move:
+            return f"Directory '{path}' is empty or not found on branch '{branch}'."
+
+        results = []
+        for old_file_path in files_to_move:
+            new_file_path = new_path + old_file_path[len(path):]
+            result = await self.github_rename_file(
+                repo=repo,
+                path=old_file_path,
+                new_path=new_file_path,
+                branch=branch,
+                message=f"{message}: {old_file_path} → {new_file_path}",
+                __user__=__user__,
+            )
+            results.append(result)
+
+        return f"Renamed directory **{path}** → **{new_path}** ({len(files_to_move)} files moved):\n" + "\n".join(results)
+
     # ═══════════════════════════════════════════════════════════════
 
     async def github_list_branches(self, repo: str, __user__: Optional[dict] = None) -> str:
@@ -368,6 +658,29 @@ class Tools:
                 return f"No branches in {repo}."
             out = [f"🔀 **{b['name']}**  ({b['commit']['sha'][:7]})" for b in branches]
             return f"**{repo}** branches ({len(branches)}):\n" + "\n".join(out)
+
+    async def github_rename_branch(
+            self,
+            repo: str,
+            branch: str,
+            new_name: str,
+            __user__: Optional[dict] = None,
+    ) -> str:
+        """
+        Rename a branch in a repository.
+
+        :param repo: Repository 'owner/name'
+        :param branch: Current branch name
+        :param new_name: New branch name
+        """
+        uv = self._get_valves(__user__)
+        self._guard(uv.ENABLE_CONTENT_WRITE, "Content Write")
+        url = f"https://api.github.com/repos/{repo}/branches/{branch}/rename"
+        async with httpx.AsyncClient() as c:
+            r = await c.post(url, headers=self._auth(uv), json={"new_name": new_name})
+            r.raise_for_status()
+            d = r.json()
+            return f"Branch **{branch}** renamed to **{new_name}** in {repo}."
 
     # ═══════════════════════════════════════════════════════════════
     #  COMMITS – Reading
@@ -684,49 +997,101 @@ class Tools:
             repo, issue_number, state="open", __user__=__user__
         )
 
-    async def github_add_issue_comment(
-            self, repo: str, issue_number: int, body: str, __user__: Optional[dict] = None
+    # ═══════════════════════════════════════════════════════════════
+    #  COMMENTS (Issues & Pull Requests)
+    # ═══════════════════════════════════════════════════════════════
+
+    async def github_add_comment(
+            self, repo: str, number: int, body: str, __user__: Optional[dict] = None
     ) -> str:
         """
-        Add a comment to an issue.
+        Add a comment to an issue or pull request.
+        GitHub uses the same API for both — pass the issue or PR number.
 
         :param repo: Repository 'owner/name'
-        :param issue_number: Issue number
+        :param number: Issue or PR number
         :param body: Comment text (GitHub markdown)
         """
         uv = self._get_valves(__user__)
-        self._guard(uv.ENABLE_ISSUES, "Issues")
-        url = f"https://api.github.com/repos/{repo}/issues/{issue_number}/comments"
+        if not uv.ENABLE_ISSUES and not uv.ENABLE_PULL_REQUESTS:
+            raise ValueError("Issues and Pull Requests are both disabled in your User Valves.")
+        url = f"https://api.github.com/repos/{repo}/issues/{number}/comments"
         async with httpx.AsyncClient() as c:
             r = await c.post(url, headers=self._auth(uv), json={"body": body})
             r.raise_for_status()
             d = r.json()
-            return f"Comment added to **#{issue_number}**\n{d['html_url']}"
+            return f"Comment added to **#{number}**\n{d['html_url']}"
 
-    async def github_list_issue_comments(
-            self, repo: str, issue_number: int, __user__: Optional[dict] = None
+    async def github_list_comments(
+            self, repo: str, number: int, __user__: Optional[dict] = None
     ) -> str:
         """
-        List comments on an issue.
+        List comments on an issue or pull request.
+        GitHub uses the same API for both — pass the issue or PR number.
 
         :param repo: Repository 'owner/name'
-        :param issue_number: Issue number
+        :param number: Issue or PR number
         """
         uv = self._get_valves(__user__)
-        self._guard(uv.ENABLE_ISSUES, "Issues")
-        url = f"https://api.github.com/repos/{repo}/issues/{issue_number}/comments?per_page=20"
+        if not uv.ENABLE_ISSUES and not uv.ENABLE_PULL_REQUESTS:
+            raise ValueError("Issues and Pull Requests are both disabled in your User Valves.")
+        url = f"https://api.github.com/repos/{repo}/issues/{number}/comments?per_page=20"
         async with httpx.AsyncClient() as c:
             r = await c.get(url, headers=self._auth(uv))
             r.raise_for_status()
             comments = r.json()
             if not comments:
-                return f"No comments on #{issue_number}."
+                return f"No comments on #{number}."
             out = [
                 f"**{c['user']['login']}** ({c['created_at']}):\n{c['body'][:200]}"
                 + ("…" if len(c["body"]) > 200 else "")
                 for c in comments
             ]
-            return f"## Comments on #{issue_number}\n\n" + "\n\n".join(out)
+            return f"## Comments on #{number}\n\n" + "\n\n".join(out)
+
+    async def github_update_comment(
+            self,
+            repo: str,
+            comment_id: int,
+            body: str,
+            __user__: Optional[dict] = None,
+    ) -> str:
+        """
+        Update an existing comment on an issue or pull request.
+        Works for both issue comments and PR review comments.
+
+        :param repo: Repository 'owner/name'
+        :param comment_id: Comment ID to edit
+        :param body: New comment text (GitHub markdown)
+        """
+        uv = self._get_valves(__user__)
+        if not uv.ENABLE_ISSUES and not uv.ENABLE_PULL_REQUESTS:
+            raise ValueError("Issues and Pull Requests are both disabled in your User Valves.")
+        url = f"https://api.github.com/repos/{repo}/issues/comments/{comment_id}"
+        async with httpx.AsyncClient() as c:
+            r = await c.patch(url, headers=self._auth(uv), json={"body": body})
+            r.raise_for_status()
+            d = r.json()
+            return f"Comment updated.\n{d['html_url']}"
+
+    async def github_delete_comment(
+            self, repo: str, comment_id: int, __user__: Optional[dict] = None
+    ) -> str:
+        """
+        Delete a comment on an issue or pull request.
+        Works for both issue comments and PR review comments.
+
+        :param repo: Repository 'owner/name'
+        :param comment_id: Comment ID to delete
+        """
+        uv = self._get_valves(__user__)
+        if not uv.ENABLE_ISSUES and not uv.ENABLE_PULL_REQUESTS:
+            raise ValueError("Issues and Pull Requests are both disabled in your User Valves.")
+        url = f"https://api.github.com/repos/{repo}/issues/comments/{comment_id}"
+        async with httpx.AsyncClient() as c:
+            r = await c.delete(url, headers=self._auth(uv))
+            r.raise_for_status()
+            return f"Comment **{comment_id}** deleted."
 
     # ═══════════════════════════════════════════════════════════════
     #  PULL REQUESTS
@@ -888,49 +1253,86 @@ class Tools:
             )
             return f"Reviewers requested for **#{pr_number}**: {requested}\n{p['html_url']}"
 
-    async def github_add_pr_comment(
-            self, repo: str, pr_number: int, body: str, __user__: Optional[dict] = None
+
+    async def github_update_pull_request(
+            self,
+            repo: str,
+            pr_number: int,
+            title: str = "",
+            body: str = "",
+            state: str = "",
+            draft: bool = None,
+            base: str = "",
+            __user__: Optional[dict] = None,
     ) -> str:
         """
-        Add a general comment to a pull request.
+        Update a pull request (title, body, state, draft status, or base branch).
 
         :param repo: Repository 'owner/name'
         :param pr_number: Pull request number
-        :param body: Comment text (GitHub markdown)
+        :param title: New title (omit to keep current)
+        :param body: New body (omit to keep current)
+        :param state: 'open' or 'closed' (omit to keep current)
+        :param draft: Set True/False to toggle draft status (omit to keep current)
+        :param base: New target branch (omit to keep current)
         """
         uv = self._get_valves(__user__)
         self._guard(uv.ENABLE_PULL_REQUESTS, "Pull Requests")
-        url = f"https://api.github.com/repos/{repo}/issues/{pr_number}/comments"
+        url = f"https://api.github.com/repos/{repo}/pulls/{pr_number}"
+        payload: dict = {}
+        if title:
+            payload["title"] = title
+        if body:
+            payload["body"] = body
+        if state:
+            payload["state"] = state
+        if draft is not None:
+            payload["draft"] = bool(draft)
+        if base:
+            payload["base"] = base
+        if not payload:
+            return "No fields to update."
         async with httpx.AsyncClient() as c:
-            r = await c.post(url, headers=self._auth(uv), json={"body": body})
+            r = await c.patch(url, headers=self._auth(uv), json=payload)
             r.raise_for_status()
-            d = r.json()
-            return f"Comment added to PR **#{pr_number}**\n{d['html_url']}"
+            p = r.json()
+            draft_tag = " (draft)" if p.get("draft") else " (ready for review)"
+            return (
+                f"PR **#{p['number']}** updated: {p['title']}{draft_tag}\n"
+                f"State: {p['state']}  |  Branch: {p['head']['ref']} -> {p['base']['ref']}\n"
+                f"{p['html_url']}"
+            )
 
-    async def github_list_pr_comments(
+    async def github_get_pr_diff(
             self, repo: str, pr_number: int, __user__: Optional[dict] = None
     ) -> str:
         """
-        List comments on a pull request.
+        Get the raw diff (patch) of a pull request.
 
         :param repo: Repository 'owner/name'
         :param pr_number: Pull request number
         """
         uv = self._get_valves(__user__)
         self._guard(uv.ENABLE_PULL_REQUESTS, "Pull Requests")
-        url = f"https://api.github.com/repos/{repo}/issues/{pr_number}/comments?per_page=20"
+        url = f"https://api.github.com/repos/{repo}/pulls/{pr_number}"
+        headers = self._auth(uv)
+        headers["Accept"] = "application/vnd.github.v3.diff"
         async with httpx.AsyncClient() as c:
-            r = await c.get(url, headers=self._auth(uv))
+            r = await c.get(url, headers=headers)
             r.raise_for_status()
-            comments = r.json()
-            if not comments:
-                return f"No comments on PR #{pr_number}."
-            out = [
-                f"**{c['user']['login']}** ({c['created_at']}):\n{c['body'][:200]}"
-                + ("…" if len(c["body"]) > 200 else "")
-                for c in comments
-            ]
-            return f"## Comments on PR #{pr_number}\n\n" + "\n\n".join(out)
+            diff_text = r.text
+            if not diff_text.strip():
+                return f"No diff available for PR #{pr_number}."
+            # Truncate very large diffs
+            MAX_DIFF = 30000
+            if len(diff_text) > MAX_DIFF:
+                return (
+                    diff_text[:MAX_DIFF] +
+                    f"\n\n[... diff truncated: {len(diff_text) - MAX_DIFF} more chars ...]"
+                )
+            return diff_text
+
+
 
     # ═══════════════════════════════════════════════════════════════
     #  WORKFLOWS (GitHub Actions)
