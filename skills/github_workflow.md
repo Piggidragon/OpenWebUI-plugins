@@ -1,102 +1,47 @@
 # GitHub Workflow & Python Doc Standard
 
 ## 0️⃣ Hard Rules
-**Rule 1:** Never push or write directly to `main`. Every change must follow:
-```
-Create branch → Write code locally → Create pull request
-```
 
-**Rule 2:** All files MUST be written locally FIRST in the `github/` directory with correct subfolder structure, never directly to `/home/` or anywhere else.
-
+**Rule 1:** Never write directly to `main`. Every change must follow:
 ```
-github/
-├── tools/       ← Tool plugins (Tools class)
-├── pipelines/   ← Pipe plugins (Pipe/Pipeline class)
-├── prompts/     ← Markdown prompt templates
-└── README.md    ← Repository documentation
+github_create_branch → github_create_file / github_write_file → github_create_pull_request
 ```
 
-**Rule 3:** Every Python file must have the standard docstring header (see §4).
+**Rule 2:** When using `github_write_file`, you MUST provide the COMPLETE file content. Never send only the changed parts — partial content will overwrite the entire file and cause data loss.
 
-**Rule 4:** All pull request content, commit messages, issue comments, code comments, and documentation MUST be written in **English** only. No German or other languages in repository-facing content.
+**Rule 3:** All commit messages, PR titles, PR bodies, issue comments, and documentation MUST be in **English** only.
+
+**Rule 4:** Every Python file must have the standard docstring header (see §3).
 
 ---
 
 ## 1️⃣ Branch Naming
 
-Format: `<type>/<short-description>`
+Format: `<type>/<short-description>` (kebab-case, max 5 words)
 
-| Type | When | Example |
-|------|------|---------|
-| `feature/` | New tool or feature | `feature/github-search-tool` |
-| `fix/` | Bugfix | `fix/rate-limit-handling` |
-| `refactor/` | Code restructuring, no new features | `refactor/cleanup-helpers` |
-| `docs/` | Documentation only | `docs/add-workflow-examples` |
-| `chore/` | Config, CI, dependencies | `chore/update-valves-defaults` |
-
-Description: **kebab-case**, max 5 words, English.
+| Type | When |
+|------|------|
+| `feature/` | New tool or feature |
+| `fix/` | Bugfix |
+| `refactor/` | Code restructuring |
+| `docs/` | Documentation only |
+| `chore/` | Config, CI, dependencies |
 
 ---
 
-## 2️⃣ Write Code — Local First
+## 2️⃣ Editing Existing Files
 
-1. Create the file under `github/` with the correct subfolder:
-   - Tool → `github/tools/name.py`
-   - Pipeline → `github/pipelines/name.py`
-   - Prompt → `github/prompts/name.md`
+To edit a file, always read it first, then write the full content back:
+1. `github_get_file(repo, path, branch)` — read current content
+2. `github_write_file(repo, path, COMPLETE_content, branch)` — write entire updated file
 
-2. Write the file with the standard docstring header (see §4).
-
-3. Commit to the branch using `github_create_file` (for new files) or `github_write_file` (to overwrite existing files) with `branch` parameter.
+Use `github_create_file` only for files that do not yet exist. It will refuse if the file already exists.
 
 ---
 
-## 3️⃣ Pull Request
+## 3️⃣ Python Doc Standard
 
-### PR Title Format
-```
-<Type>: <Short description>
-```
-
-Examples:
-- `Feature: GitHub Global Search Tool`
-- `Fix: Rate limit handling in search`
-- `Docs: Add workflow examples`
-- `Refactor: Remove duplicate helpers`
-- `Chore: Update valve defaults`
-
-### PR Body Structure
-
-Always include these sections in English:
-
-```
-## What does this change?
-
-[2-3 sentences explaining what changed and why]
-
-## Changes
-
-- [Point 1]
-- [Point 2]
-- [Point 3]
-
-## How was this tested?
-
-- Test A
-- Test B
-
-## Notes
-
-[Any additional context]
-```
-
----
-
-## 4️⃣ Python Doc Standard (Tools & Pipelines)
-
-### 4.1 File Header Docstring
-
-Every Python file starts with a triple-quoted docstring with these fields:
+### File Header
 
 ```python
 """
@@ -105,23 +50,11 @@ author: Piggidragon
 version: <semver>
 description: >
   One or two lines describing what it does.
-  Can wrap to multiple lines with `>` prefix.
-  Tools: explain what the model can use it for.
-  Pipelines: explain architecture and what it does/doesn't do.
 requirements: <pip-packages>  (optional; pipelines only)
 """
 ```
 
-**Existing examples:**
-
-- **Tools** (`github_search.py`): `title`, `author`, `description`, `version`
-- **Pipelines** (`agent-pipeline-deprecated.py`): `title`, `author`, `version`, `description`, `requirements`
-
-**Tool-specific:** Add `requirements: <packages>` only if the tool has pip dependencies.
-
-### 4.2 Class Structure
-
-**Tools** follow this pattern:
+### Class Structure
 
 ```python
 class Tools:
@@ -136,88 +69,37 @@ class Tools:
         self.valves = self.Valves()
 ```
 
-**Pipelines** follow this pattern:
+### Function Docstrings
 
 ```python
-class Pipe:
-    class Valves(BaseModel):
-        SETTING: str = Field(default="", description="...")
-
-    def __init__(self):
-        self.type = "manifold"  # or "pipe"
-        self.valves = self.Valves()
-```
-
-### 4.3 Function Docstrings
-
-Every public async method needs a docstring:
-
-```python
-async def my_tool(self, param1: str, param2: int = 10, __user__: Optional[dict] = None) -> str:
+async def my_tool(self, param1: str, __user__: Optional[dict] = None) -> str:
     """
     Short description of what this tool does.
 
     :param param1: What this parameter controls
-    :param param2: What this parameter controls (default: 10)
     :param __user__: Injected by OWUI (not user-provided)
-    :return: What the model gets back
     """
 ```
 
-Rules:
-- First line = short description (one sentence)
-- `:param` annotations for every parameter the model will see
-- `__user__`, `__event_emitter__`, `__event_call__` get a brief note that they're injected
-- No need to document internal helpers (start with `_`)
-
-### 4.4 Internal Helpers
-
-Prefix with underscore `_`. No docstring needed unless complex logic.
-
-```python
-def _get_uv(self, __user__: Optional[dict]) -> "Tools.UserValves":
-    """Extract UserValves from the __user__ dict injected by OpenWebUI."""
-    ...
-```
+Internal helpers start with `_` and only need a docstring if the logic is complex.
 
 ---
 
-## 5️⃣ Folder Structure Reference
+## 4️⃣ Commit & PR Conventions
+
+**Commit messages:** `<type>: <short description>`
+**PR titles:** `<Type>: <Short description>`
 
 ```
-github/                                      ← Local working copy
-├── tools/
-│   ├── github_access.py                     ← Full GitHub CRUD (47KB)
-│   ├── github_search.py                     ← GitHub global search (14KB)
-│   └── confirm_destructive_actions.py        ← Confirmation dialog (7KB)
-├── pipelines/
-│   ├── agent-pipeline-deprecated.py          ← Old agent pipeline (138KB)
-│   └── agent_loop.py                         ← New minimal agent loop (666 lines)
-├── prompts/
-│   └── model-systemprompt.md                 ← System prompt template
-├── .gitignore
-├── LICENSE
-└── README.md
+feat: add GitHub global search tool
+fix: handle rate limit errors
+docs: add workflow examples
+refactor: remove duplicate helpers
+chore: update valve defaults
 ```
 
-When creating new files:
-- Tool with a `Tools` class → `github/tools/`
-- Pipeline with a `Pipe` or `Pipeline` class → `github/pipelines/`
-- Markdown templates → `github/prompts/`
-
----
-
-## 6️⃣ Commit Message Convention
-
-```
-<type>: <short description>
-
-<optional body explaining why>
-```
-
-Examples:
-- `feat: add GitHub global search tool`
-- `refactor: simplify agent loop pipe v2.0.0`
-- `docs: add workflow examples to README`
-- `fix: handle rate limit errors in search`
-- `chore: update valve defaults`
+**PR body** must include:
+- What does this change?
+- Changes (bullet points)
+- How was this tested?
+- Notes (optional)
