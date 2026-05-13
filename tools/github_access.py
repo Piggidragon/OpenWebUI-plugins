@@ -6,7 +6,7 @@ description: >
   branches, commits, and GitHub Actions workflows — directly from OpenWebUI.
   Uses the GitHub REST API with your Personal Access Token.
   Enforces a branch→file→PR workflow; no direct writes to main.
-version: 1.1.0
+version: 1.2.0
 """
 
 import base64
@@ -41,7 +41,7 @@ class Tools:
         )
         ENABLE_PULL_REQUESTS: bool = Field(
             default=True,
-            description="Enable tools: list, create PRs, request reviewers, comment (NO merge)",
+            description="Enable tools: list, create PRs, request reviewers, comment, update (NO merge)",
         )
         ENABLE_WORKFLOWS: bool = Field(
             default=True,
@@ -207,6 +207,37 @@ class Tools:
             items = [f"- `{i['path']}`" for i in data["items"]]
             return f"Found **{data['total_count']}** results in {repo}:\n" + "\n".join(
                 items
+            )
+
+
+    async def github_search_code_global(
+            self,
+            query: str,
+            per_page: int = 10,
+            __user__: Optional[dict] = None,
+    ) -> str:
+        """
+        Search code across ALL of GitHub (global search, not limited to one repo).
+
+        :param query: Search term (e.g. 'function login language:python')
+        :param per_page: Number of results (default: 10, max: 30)
+        """
+        uv = self._get_valves(__user__)
+        self._guard(uv.ENABLE_CONTENT, "Content")
+        url = f"https://api.github.com/search/code?q={query}&per_page={min(per_page, 30)}"
+        async with httpx.AsyncClient() as c:
+            r = await c.get(url, headers=self._auth(uv))
+            r.raise_for_status()
+            data = r.json()
+            if data["total_count"] == 0:
+                return f"No results for '{query}' across GitHub."
+            items = []
+            for i in data["items"]:
+                repo_name = i.get("repository", {}).get("full_name", "unknown")
+                items.append(f"- `{i['path']}` in **{repo_name}**")
+            return (
+                f"Found **{data['total_count']}** results across GitHub for '{query}':\n"
+                + "\n".join(items)
             )
 
     # ═══════════════════════════════════════════════════════════════
@@ -931,6 +962,110 @@ class Tools:
                 for c in comments
             ]
             return f"## Comments on PR #{pr_number}\n\n" + "\n\n".join(out)
+
+
+    async def github_update_pull_request(
+            self,
+            repo: str,
+            pr_number: int,
+            title: str = "",
+            body: str = "",
+            state: str = "",
+            draft: bool = None,
+            base: str = "",
+            __user__: Optional[dict] = None,
+    ) -> str:
+        """
+        Update a pull request (title, body, state, draft status, or base branch).
+
+        :param repo: Repository 'owner/name'
+        :param pr_number: Pull request number
+        :param title: New title (omit to keep current)
+        :param body: New body (omit to keep current)
+        :param state: 'open' or 'closed' (omit to keep current)
+        :param draft: Set True/False to toggle draft status (omit to keep current)
+        :param base: New target branch (omit to keep current)
+        """
+        uv = self._get_valves(__user__)
+        self._guard(uv.ENABLE_PULL_REQUESTS, "Pull Requests")
+        url = f"https://api.github.com/repos/{repo}/pulls/{pr_number}"
+        payload: dict = {}
+        if title:
+            payload["title"] = title
+        if body:
+            payload["body"] = body
+        if state:
+            payload["state"] = state
+        if draft is not None:
+            payload["draft"] = bool(draft)
+        if base:
+            payload["base"] = base
+        if not payload:
+            return "No fields to update."
+        async with httpx.AsyncClient() as c:
+            r = await c.patch(url, headers=self._auth(uv), json=payload)
+            r.raise_for_status()
+            p = r.json()
+            draft_tag = " (draft)" if p.get("draft") else " (ready for review)"
+            return (
+                f"PR **#{p['number']}** updated: {p['title']}{draft_tag}\n"
+                f"State: {p['state']}  |  Branch: {p['head']['ref']} -> {p['base']['ref']}\n"
+                f"{p['html_url']}"
+            )
+
+    async def github_get_pr_diff(
+            self, repo: str, pr_number: int, __user__: Optional[dict] = None
+    ) -> str:
+        """
+        Get the raw diff (patch) of a pull request.
+
+        :param repo: Repository 'owner/name'
+        :param pr_number: Pull request number
+        """
+        uv = self._get_valves(__user__)
+        self._guard(uv.ENABLE_PULL_REQUESTS, "Pull Requests")
+        url = f"https://api.github.com/repos/{repo}/pulls/{pr_number}"
+        headers = self._auth(uv)
+        headers["Accept"] = "application/vnd.github.v3.diff"
+        async with httpx.AsyncClient() as c:
+            r = await c.get(url, headers=headers)
+            r.raise_for_status()
+            diff_text = r.text
+            if not diff_text.strip():
+                return f"No diff available for PR #{pr_number}."
+            # Truncate very large diffs
+            MAX_DIFF = 30000
+            if len(diff_text) > MAX_DIFF:
+                return (
+                    diff_text[:MAX_DIFF] +
+                    f"\n\n[... diff truncated: {len(diff_text) - MAX_DIFF} more chars ...]"
+                )
+            return diff_text
+
+    async def github_update_pr_comment(
+            self,
+            repo: str,
+            pr_number: int,
+            comment_id: int,
+            body: str,
+            __user__: Optional[dict] = None,
+    ) -> str:
+        """
+        Update an existing comment on a pull request or issue.
+
+        :param repo: Repository 'owner/name'
+        :param pr_number: Issue/PR number (for context only; the comment_id determines which comment)
+        :param comment_id: Comment ID to edit
+        :param body: New comment text (GitHub markdown)
+        """
+        uv = self._get_valves(__user__)
+        self._guard(uv.ENABLE_PULL_REQUESTS, "Pull Requests")
+        url = f"https://api.github.com/repos/{repo}/issues/comments/{comment_id}"
+        async with httpx.AsyncClient() as c:
+            r = await c.patch(url, headers=self._auth(uv), json={"body": body})
+            r.raise_for_status()
+            d = r.json()
+            return f"Comment updated on PR #{pr_number}\n{d['html_url']}"
 
     # ═══════════════════════════════════════════════════════════════
     #  WORKFLOWS (GitHub Actions)
