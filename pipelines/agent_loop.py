@@ -1,24 +1,25 @@
 """
 title: Agent Loop
 author: Piggidragon
-version: 2.2.0
+version: 3.0.0
 description: >
   OpenWebUI-native Agent Loop with modular per-phase tool control.
 
   Architecture:
   - SINGLE model loop (Plan -> Execute -> Review -> Replan -> Execute...)
   - Per-phase tool filtering via Valves -- only relevant tools exposed to the LLM
-  - Internal control tools (terminate, replan, complete_task, fail_task) always available
+  - Internal control tools (terminate, replan, fix_plan, complete_task, fail_task, confirm_plan) always available
   - Uses OpenWebUI native tool infrastructure (get_tools, get_builtin_tools, get_terminal_tools)
-  - Hard replan reset: new plan, cleared state, direct restart to Execute
+  - Replan as internal tool: updates task list and transitions to EXECUTE phase
   - Context window management with adaptive history truncation
+  - Plan confirmation via custom JS UI (UserValves: ENABLE_PLAN_APPROVAL, YOLO_MODE)
 
-  v2.2.0 changes:
-  - Phase-based tool filtering via Valves (PLAN_TOOLS, EXECUTE_TOOLS, etc.)
-  - Global tool denylist (TOOLS_DENYLIST)
-  - Per-phase custom system prompt overrides
-  - Internal tools always injected regardless of phase filters
-  - Cleaner tool resolution with phase-aware filtering
+  v3.0.0 changes:
+  - Removed REPLAN as a separate phase -- replan is now an internal tool only
+  - Calling replan updates the task list and transitions directly to EXECUTE
+  - Hard history reset removed from replan; history is preserved
+  - Three phases remain: PLAN -> EXECUTE -> REVIEW
+  - Added fix_plan internal tool for lightweight plan corrections without history reset
 requirements: open-webui>=0.9.1
 """
 
@@ -56,14 +57,14 @@ What to do:
 2. Read relevant files, search the web, query knowledge -- use any tools to gather context.
 3. Create a numbered task list that covers the entire goal.
 4. Each task should be a clear, actionable step.
-5. After creating the plan, call ask_user_questions to present the plan and ask for confirmation.
+5. After creating the plan, call confirm_plan with the full plan text to present it for review.
 
 Rules:
 - Be thorough -- read files before planning changes.
 - Break complex tasks into small, verifiable steps.
 - If the request is simple (1-2 tasks), still list them explicitly.
 - Call exactly ONE tool per step.
-- When done planning, call ask_user_questions with the plan for confirmation.
+- When done planning, call confirm_plan with the plan for confirmation.
 - NEVER call terminate in PLAN mode -- the user must confirm first.
 - NEVER call replan in PLAN mode.
 - You may only use the tools listed above.
@@ -89,58 +90,32 @@ Rules:
 - Call exactly ONE tool per step.
 - NEVER repeat identical failed tool calls (duplicate detection is active).
 - When all tasks are done, call terminate with a summary.
-- If you realise the plan was completely wrong, call replan with what needs to change.
+- If a tool returns an error (timeout, file not found, syntax error, wrong path), analyze the error and retry the same or a similar tool with corrected parameters. You do NOT need to call fix_plan for trivial errors like typos or wrong paths — just fix it and continue.
+- Only call fix_plan if the same task fails repeatedly (3+ attempts) or if the error reveals that the task itself was incorrectly designed.
+- Only call replan(mode='soft') if you realize the entire approach or task list is fundamentally wrong.
+- Only call replan(mode='hard') if the overall strategy needs a complete replacement.
 - You MUST call complete_task(index) or fail_task(index, reason) after working on a task.
 - You may only use the tools listed above. Do NOT ask the user questions.
 """
 
 DEFAULT_REVIEW_PROMPT = """\
-You are in REVIEW mode. Verify that all original requirements are met.
+You are in REVIEW mode. Your ONLY job is to pick one of three actions.
 
 PHASE: REVIEW
-
 Original goal: {goal}
-
 Available tools: {tool_names}
-
 {task_state}
 
-What to do:
-1. Check each original requirement against what was actually done.
-2. If everything is complete and correct -> call terminate with the final result.
-3. If something is missing or wrong -> call replan with what needs to be redone or added.
+You MUST call exactly ONE of these tools:
+
+1. `terminate(final_answer)` — Everything is done and correct. Provide a concise final answer summarising what was accomplished.
+2. `fix_plan(reason, updated_tasks)` — Only minor fixes are needed (a task failed or needs a small correction). List just the new/corrected tasks.
+3. `replan(reason, updated_tasks, mode="soft")` — The overall strategy is broken and tasks need to be replaced entirely.
 
 Rules:
-- Be honest -- don't mark something as done if it isn't.
-- If the result is good enough, terminate. Don't gold-plate.
-- You may only use the tools listed above.
-"""
-
-DEFAULT_REPLAN_PROMPT = """\
-You are in RE-PLAN mode. The previous plan needs adjustments.
-
-PHASE: RE-PLAN
-
-Original goal: {goal}
-
-Available tools: {tool_names}
-
-{task_state}
-
-What went wrong or is missing: {replan_reason}
-
-What to do:
-1. Assess what worked and what didn't.
-2. Create a completely NEW task list that covers ONLY what is still needed.
-3. Do NOT include already completed tasks.
-4. Focus on fixing the failures and filling the gaps.
-5. Then call replan() with the new plan and the reason.
-
-Rules:
-- Don't repeat tasks that already succeeded.
-- Focus only on what's broken or missing.
-- Call replan() to restart execution with the new plan.
-- Do NOT call ask_user_questions -- the user already confirmed at the start.
+- If there are only minor issues with individual tasks, ALWAYS prefer `fix_plan` over `replan`. Only use `replan` if the overall strategy is broken.
+- Be honest — don't call `terminate` if something is missing or wrong.
+- If the result is good enough, call `terminate`. Don't gold-plate.
 - You may only use the tools listed above.
 """
 
@@ -273,15 +248,14 @@ class AgentLoopEngine:
     PHASE_PLAN = "plan"
     PHASE_EXECUTE = "execute"
     PHASE_REVIEW = "review"
-    PHASE_REPLAN = "replan"
 
     MAX_HISTORY_MESSAGES = 50
     TRUNCATE_TOOL_RESULTS_AT = 30
 
     # Internal tools that are ALWAYS available regardless of phase filters
-    INTERNAL_TOOLS = {"terminate", "replan", "complete_task", "fail_task"}
+    INTERNAL_TOOLS = {"terminate", "replan", "complete_task", "fail_task", "confirm_plan", "fix_plan"}
 
-    def __init__(self, request, user, body, event_emitter, event_call, metadata, valves):
+    def __init__(self, request, user, body, event_emitter, event_call, metadata, valves, user_valves=None):
         self.request = request
         self.user = user
         self.body = body
@@ -289,6 +263,7 @@ class AgentLoopEngine:
         self.event_call = event_call
         self.metadata = metadata
         self.valves = valves
+        self.user_valves = user_valves
 
         self.pipe_metadata = metadata.get("__metadata__", metadata)
         self.chat_id = metadata.get("__chat_id__", "")
@@ -304,7 +279,6 @@ class AgentLoopEngine:
         self.task_list = []
         self.completed_tasks = []
         self.failed_tasks = []
-        self._replan_reason = ""
         self.consecutive_json_errors = 0
         self.loop_count = 0
         self.goal = ""
@@ -398,12 +372,13 @@ class AgentLoopEngine:
         self.all_tools_dict["replan"] = {
             "spec": {
                 "name": "replan",
-                "description": "Signal that the current plan needs a complete restart. Provide the new plan and reason.",
+                "description": "Adjust the plan. Mode 'soft' (default) compresses history and keeps context for continuity. Mode 'hard' does a full reset with new task list.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "reason": {"type": "string", "description": "What went wrong or what is missing"},
                         "updated_tasks": {"type": "string", "description": "Updated task list as numbered steps (only what is still needed)"},
+                        "mode": {"type": "string", "enum": ["soft", "hard"], "description": "Replan mode: 'soft' (default) = compress history and keep context, 'hard' = full reset with new task list"},
                     },
                     "required": ["reason"],
                 },
@@ -442,6 +417,37 @@ class AgentLoopEngine:
             "callable": self._tool_fail_task,
             "type": "function",
         }
+        self.all_tools_dict["confirm_plan"] = {
+            "spec": {
+                "name": "confirm_plan",
+                "description": "Present the task plan to the user for approval. Call this after creating the plan in PLAN phase. The user can accept or provide feedback for revision.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "plan": {"type": "string", "description": "The full plan text with numbered tasks to present for review"},
+                    },
+                    "required": ["plan"],
+                },
+            },
+            "callable": self._tool_confirm_plan,
+            "type": "function",
+        }
+        self.all_tools_dict["fix_plan"] = {
+            "spec": {
+                "name": "fix_plan",
+                "description": "Add correction tasks for minor issues without resetting history. Use when individual tasks failed but the overall approach is still correct. The new tasks will be appended to the current task list.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "reason": {"type": "string", "description": "Why the fix is needed"},
+                        "updated_tasks": {"type": "string", "description": "Newline-separated list of correction or replacement tasks to append"},
+                    },
+                    "required": ["reason", "updated_tasks"],
+                },
+            },
+            "callable": self._tool_fix_plan,
+            "type": "function",
+        }
 
     def _get_model_features(self, model_info):
         info = model_info.get("info", {}) or {}
@@ -467,8 +473,6 @@ class AgentLoopEngine:
             allowlist = set(_comma_list(self.valves.EXECUTE_TOOLS))
         elif phase == self.PHASE_REVIEW:
             allowlist = set(_comma_list(self.valves.REVIEW_TOOLS))
-        elif phase == self.PHASE_REPLAN:
-            allowlist = set(_comma_list(self.valves.REPLAN_TOOLS))
 
         # Global denylist
         denylist = set(_comma_list(self.valves.TOOLS_DENYLIST))
@@ -507,8 +511,49 @@ class AgentLoopEngine:
     async def _tool_terminate(self, **kwargs):
         return json.dumps({"terminated": True, "result": kwargs.get("result", ""), "success": kwargs.get("success", True)})
 
-    async def _tool_replan(self, **kwargs):
-        return json.dumps({"replan": True, "reason": kwargs.get("reason", ""), "updated_tasks": kwargs.get("updated_tasks", "")})
+    # Soft or hard reset. Prefer soft mode to preserve compressed history.
+    async def _tool_replan(self, reason: str, updated_tasks: str, mode: str = "soft", **kwargs):
+        """Process a replan: update task list and compress or reset history."""
+        new_tasks = [t.strip() for t in updated_tasks.splitlines() if t.strip()] if updated_tasks else []
+
+        if mode == "soft":
+            # Soft replan: append new tasks (or keep remaining), compress history
+            if new_tasks:
+                self.task_list.extend(new_tasks)
+            else:
+                failed_task_names = {f["task"] for f in self.failed_tasks}
+                self.task_list = [
+                    t for t in self.task_list
+                    if t not in self.completed_tasks and t not in failed_task_names
+                ]
+            self.completed_tasks = []
+            self.failed_tasks = []
+            self.consecutive_json_errors = 0
+            self.loop_count = 0
+            self.history = self._compress_history()
+        else:
+            # Hard replan: replace task list entirely, full history reset
+            if new_tasks:
+                self.task_list = new_tasks
+            else:
+                failed_task_names = {f["task"] for f in self.failed_tasks}
+                self.task_list = [
+                    t for t in self.task_list
+                    if t not in self.completed_tasks and t not in failed_task_names
+                ]
+            self.completed_tasks = []
+            self.failed_tasks = []
+            self.consecutive_json_errors = 0
+            self.loop_count = 0
+            self.history = [
+                {"role": "system", "content": self._build_system_prompt()},
+                {"role": "user", "content": self.goal},
+            ]
+
+        if self.phase != self.PHASE_EXECUTE:
+            self._transition_to(self.PHASE_EXECUTE)
+
+        return json.dumps({"replan": True, "reason": reason, "updated_tasks": updated_tasks, "mode": mode})
 
     async def _tool_complete_task(self, **kwargs):
         idx = kwargs.get("index", -1)
@@ -529,6 +574,158 @@ class AgentLoopEngine:
                 self.failed_tasks.append(entry)
             return json.dumps({"failed": True, "task": task, "index": idx, "reason": reason})
         return json.dumps({"failed": False, "error": f"Invalid task index {idx}"})
+
+    # Lightweight correction tool. Use this instead of replan for minor issues.
+    async def _tool_fix_plan(self, reason: str, updated_tasks: str, **kwargs):
+        new_tasks = [t.strip() for t in updated_tasks.splitlines() if t.strip()]
+        if not new_tasks:
+            return json.dumps({"fix_plan": False, "error": "No tasks provided in updated_tasks"})
+        for task_text in new_tasks:
+            for ft in self.failed_tasks[:]:
+                if ft["task"] == task_text:
+                    self.failed_tasks.remove(ft)
+                    break
+        self.task_list.extend(new_tasks)
+        return json.dumps({"fix_plan": True, "appended_tasks": new_tasks, "reason": reason})
+
+    async def _tool_confirm_plan(self, **kwargs):
+        plan_text = kwargs.get("plan", "")
+        uv = self.user_valves
+
+        if uv and (getattr(uv, "YOLO_MODE", False) or not getattr(uv, "ENABLE_PLAN_APPROVAL", False)):
+            return json.dumps({"action": "accept"})
+
+        if not self.event_call:
+            return json.dumps({"action": "accept"})
+
+        tasks = self._extract_task_list(plan_text)
+        tasks_data = [{"task_id": f"T{i+1}", "description": t} for i, t in enumerate(tasks)]
+        if not tasks_data:
+            tasks_data = [{"task_id": "T1", "description": plan_text}]
+
+        js = self._build_plan_approval_js(tasks_data)
+        try:
+            raw = await self.event_call({"type": "execute", "data": {"code": js}})
+        except Exception as e:
+            logger.error(f"Plan approval event_call failed: {e}")
+            return json.dumps({"action": "accept"})
+
+        raw_str = raw if isinstance(raw, str) else (raw.get("result") or raw.get("value") or "{}") if raw else "{}"
+        try:
+            res = json.loads(raw_str) if isinstance(raw_str, str) and raw_str.startswith("{") else {"action": "accept"}
+        except (json.JSONDecodeError, AttributeError):
+            res = {"action": "accept"}
+
+        return json.dumps(res)
+
+    def _base_theme_js(self):
+        return """
+            const col = {
+                overlay: 'rgba(0,0,0,0.55)', panel: '#1e293b', border: '#334155',
+                text: '#f1f5f9', sub: '#94a3b8', input: '#0f172a', inputBorder: '#475569',
+                btn: '#334155', btnText: '#e2e8f0', btnBorder: '#475569',
+                btnPrimary: '#3b82f6', btnPrimaryText: '#ffffff',
+            };
+            try { const s = getComputedStyle(document.documentElement);
+              col.panel = s.getPropertyValue('--color-gray-900').trim() || col.panel;
+              col.text = s.getPropertyValue('--color-gray-50').trim() || col.text;
+              col.btnPrimary = s.getPropertyValue('--color-blue-500').trim() || col.btnPrimary;
+            } catch(e) {}
+        """
+
+    def _build_plan_approval_js(self, tasks: list, timeout_s: int = 600) -> str:
+        ts = json.dumps(tasks)
+        return f"""
+    return (function() {{
+      return new Promise((resolve) => {{
+    {self._base_theme_js()}
+        let _timer;
+        const overlay = document.createElement('div');
+        overlay.style.cssText = `position:fixed;inset:0;z-index:999999;background:${{col.overlay}};display:flex;align-items:center;justify-content:center;padding:20px;backdrop-filter:blur(4px);`;
+        const panel = document.createElement('div');
+        panel.style.cssText = `background:${{col.panel}};border:1px solid ${{col.border}};border-radius:20px;box-shadow:0 20px 60px rgba(0,0,0,0.3);color:${{col.text}};font-family:ui-sans-serif,system-ui,sans-serif;width:100%;max-width:520px;max-height:90vh;padding:32px;display:flex;flex-direction:column;gap:24px;`;
+
+        const header = document.createElement('div');
+        header.style.cssText = 'display:flex;align-items:center;gap:12px;flex-shrink:0;';
+        const icon = document.createElement('div'); icon.textContent = '\uD83D\uDCCB'; icon.style.cssText = 'font-size:24px;';
+        const title = document.createElement('div'); title.textContent = 'Review Proposed Plan'; title.style.cssText = `font-size:20px;font-weight:800;color:${{col.text}};letter-spacing:-0.4px;`;
+        header.appendChild(icon); header.appendChild(title); panel.appendChild(header);
+
+        const scrollContainer = document.createElement('div');
+        scrollContainer.style.cssText = 'overflow-y:auto;flex:1;display:flex;flex-direction:column;gap:12px;padding-right:8px;';
+
+        const tasksData = {ts};
+        tasksData.forEach((t, i) => {{
+            const card = document.createElement('div');
+            card.style.cssText = `background:${{col.input}};border:1px solid ${{col.inputBorder}};border-radius:12px;padding:12px 16px;display:flex;gap:12px;align-items:flex-start;`;
+
+            const num = document.createElement('div');
+            num.textContent = i + 1;
+            num.style.cssText = `width:24px;height:24px;background:${{col.btnPrimary}};color:${{col.btnPrimaryText}};border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:bold;flex-shrink:0;margin-top:2px;`;
+
+            const content = document.createElement('div');
+            content.style.cssText = 'display:flex;flex-direction:column;gap:4px;';
+            const tid = document.createElement('div'); tid.textContent = t.task_id; tid.style.cssText = `font-size:11px;font-weight:bold;color:${{col.sub}};text-transform:uppercase;`;
+            const desc = document.createElement('div'); desc.textContent = t.description; desc.style.cssText = `font-size:14px;color:${{col.text}};line-height:1.4;`;
+
+            content.appendChild(tid); content.appendChild(desc);
+            card.appendChild(num); card.appendChild(content);
+            scrollContainer.appendChild(card);
+        }});
+        panel.appendChild(scrollContainer);
+
+        const inputContainer = document.createElement('div');
+        inputContainer.style.cssText = 'display:flex;flex-direction:column;gap:10px;flex-shrink:0;';
+        const inputLabel = document.createElement('div'); inputLabel.textContent = 'Feedback (optional):'; inputLabel.style.cssText = `font-size:12px;font-weight:700;color:${{col.sub}};text-transform:uppercase;letter-spacing:0.5px;`;
+        const feedbackInput = document.createElement('textarea');
+        feedbackInput.placeholder = 'e.g., "Add a step to check for X" or "Skip the second task"';
+        feedbackInput.style.cssText = `background:${{col.input}};border:1px solid ${{col.inputBorder}};color:${{col.text}};padding:14px;border-radius:14px;font-size:14px;outline:none;min-height:70px;resize:none;transition:border-color 0.2s;`;
+        feedbackInput.onfocus = () => feedbackInput.style.borderColor = 'var(--color-blue-500)';
+        feedbackInput.onblur = () => feedbackInput.style.borderColor = col.inputBorder;
+        inputContainer.appendChild(inputLabel); inputContainer.appendChild(feedbackInput); panel.appendChild(inputContainer);
+
+        const footer = document.createElement('div');
+        footer.style.cssText = 'display:flex;gap:12px;flex-shrink:0;';
+
+        const makeBtn = (label, primary) => {{
+            const b = document.createElement('button');
+            b.textContent = label;
+            b.style.cssText = `flex:1;padding:14px 20px;border-radius:9999px;font-size:15px;font-weight:700;cursor:pointer;transition:all 0.2s;border:1px solid ${{primary ? 'transparent' : col.btnBorder}};background:${{primary ? col.btnPrimary : col.btn}};color:${{primary ? col.btnPrimaryText : col.btnText}};`;
+            b.onmouseenter = () => {{ b.style.opacity='0.9'; b.style.transform='translateY(-1px)'; }};
+            b.onmouseleave = () => {{ b.style.opacity='1'; b.style.transform='translateY(0)'; }};
+            return b;
+        }};
+
+        const acceptBtn = makeBtn('Accept Plan', true);
+        const feedbackBtn = makeBtn('Send Feedback', false);
+
+        const cleanup = () => {{ overlay.remove(); }};
+
+        acceptBtn.onclick = () => {{ clearTimeout(_timer); cleanup(); resolve(JSON.stringify({{action:'accept'}})); }};
+        feedbackBtn.onclick = () => {{
+            const val = feedbackInput.value.trim();
+            if (val) {{ clearTimeout(_timer); cleanup(); resolve(JSON.stringify({{action:'feedback', value: val}})); }}
+            else {{ acceptBtn.onclick(); }}
+        }};
+
+        footer.appendChild(acceptBtn); footer.appendChild(feedbackBtn); panel.appendChild(footer);
+
+        const countdown = document.createElement('div');
+        countdown.style.cssText = `font-size:11px;color:${{col.sub}};text-align:center;margin-top:-12px;flex-shrink:0;`;
+        panel.appendChild(countdown);
+
+        overlay.appendChild(panel); document.body.appendChild(overlay);
+        feedbackInput.focus();
+
+        let remaining = {timeout_s};
+        const updateCountdown = () => {{
+            countdown.textContent = remaining > 0 ? `Auto-accepting in ${{remaining}}s...` : '';
+            if (remaining <= 0) {{ cleanup(); resolve(JSON.stringify({{action:'accept'}})); }}
+        }};
+        updateCountdown();
+        _timer = setInterval(() => {{ remaining--; updateCountdown(); }}, 1000);
+      }});
+    }})();"""
 
     # ── Task State String ──
 
@@ -638,23 +835,13 @@ class AgentLoopEngine:
             base = self.valves.REVIEW_PROMPT or DEFAULT_REVIEW_PROMPT
             return base.format(goal=self.goal, task_state=task_state, tool_names=tool_names)
 
-        elif self.phase == self.PHASE_REPLAN:
-            base = self.valves.REPLAN_PROMPT or DEFAULT_REPLAN_PROMPT
-            return base.format(
-                goal=self.goal,
-                replan_reason=self._replan_reason or "Previous plan was incomplete",
-                task_state=task_state,
-                tool_names=tool_names,
-            )
-
         return DEFAULT_PLAN_PROMPT.format(tool_names=tool_names)
 
     # ── Phase Transitions ──
 
-    def _transition_to(self, phase, replan_reason=""):
+    def _transition_to(self, phase):
         """Transition to a new phase: update tools, system prompt, state."""
         self.phase = phase
-        self._replan_reason = replan_reason
 
         # Rebuild filtered tools for new phase
         self._filter_tools_for_phase(phase)
@@ -678,6 +865,76 @@ class AgentLoopEngine:
             return self.valves.MAX_TOOL_RESULT_CHARS // 3
         return self.valves.MAX_TOOL_RESULT_CHARS
 
+    def _compress_history(self):
+        """
+        Compress history for a soft replan: preserve system prompt, user goal,
+        an execution summary, compressed middle messages, and recent context.
+        """
+        preserved = []
+        goal_message = None
+        for msg in self.history:
+            role = msg.get("role")
+            if role == "system":
+                preserved.append(msg)
+            elif role == "user" and goal_message is None:
+                goal_message = msg
+
+        if goal_message:
+            preserved.append(goal_message)
+
+        task_summary_parts = ["=== Previous Execution Summary ==="]
+        task_summary_parts.append(f"Goal: {self.goal}")
+        task_summary_parts.append(f"Completed tasks: {', '.join(self.completed_tasks) if self.completed_tasks else 'None'}")
+
+        if self.failed_tasks:
+            task_summary_parts.append("Failed tasks:")
+            for ft in self.failed_tasks:
+                task_summary_parts.append(f"  - {ft.get('task', 'unknown')}: {ft.get('reason', 'no reason')}")
+        else:
+            task_summary_parts.append("Failed tasks: None")
+
+        if self.task_list:
+            task_summary_parts.append(f"Remaining tasks before replan: {', '.join(self.task_list)}")
+
+        summary_message = {
+            "role": "system",
+            "content": "\n".join(task_summary_parts)
+        }
+
+        keep_last_n = 6
+        recent = self.history[-keep_last_n:] if len(self.history) > keep_last_n else []
+
+        start_idx = len(preserved)
+        end_idx = len(self.history) - keep_last_n
+
+        middle = []
+        if end_idx > start_idx:
+            for msg in self.history[start_idx:end_idx]:
+                role = msg.get("role")
+                content = msg.get("content", "")
+
+                if role == "assistant":
+                    snippet = content[:250].replace("\n", " ")
+                    middle.append({
+                        "role": "assistant",
+                        "content": f"[Compressed assistant message] {snippet}..."
+                    })
+                elif role == "user":
+                    snippet = content[:150].replace("\n", " ")
+                    middle.append({
+                        "role": "user",
+                        "content": f"[Compressed] {snippet}..."
+                    })
+                # Tool results and tool_calls in the middle section are discarded
+                # since they are summarized in the execution summary above.
+
+        compressed = preserved.copy()
+        compressed.append(summary_message)
+        compressed.extend(middle)
+        compressed.extend(recent)
+
+        return compressed
+
     # ── Main Loop ──
 
     async def run(self, user_msg, model):
@@ -686,7 +943,6 @@ class AgentLoopEngine:
 
         self.goal = user_msg
         self.phase = self.PHASE_PLAN
-        self._replan_reason = ""
         self.task_list = []
         self.completed_tasks = []
         self.failed_tasks = []
@@ -713,13 +969,11 @@ class AgentLoopEngine:
                 self.PHASE_PLAN: "[PLAN]",
                 self.PHASE_EXECUTE: "[EXEC]",
                 self.PHASE_REVIEW: "[REVU]",
-                self.PHASE_REPLAN: "[RPLN]",
             }
             phase_name = {
                 self.PHASE_PLAN: "Plan",
                 self.PHASE_EXECUTE: "Execute",
                 self.PHASE_REVIEW: "Review",
-                self.PHASE_REPLAN: "Re-Plan",
             }
             icon = phase_icons.get(self.phase, "[LOOP]")
             name = phase_name.get(self.phase, "Loop")
@@ -830,56 +1084,32 @@ class AgentLoopEngine:
                 if tool_name == "replan":
                     reason = args.get("reason", "Plan needs adjustment")
                     updated = args.get("updated_tasks", "")
+                    mode = args.get("mode", "soft")
 
-                    new_tasks = []
-                    if updated:
-                        new_tasks = [t.strip() for t in updated.split("\n") if t.strip()]
-
-                    if new_tasks:
-                        self.task_list = new_tasks
-                    else:
+                    if not updated or not [t.strip() for t in updated.splitlines() if t.strip()]:
+                        # No new tasks provided -- check if any remaining tasks exist
                         failed_task_names = {f["task"] for f in self.failed_tasks}
-                        self.task_list = [
+                        remaining = [
                             t for t in self.task_list
                             if t not in self.completed_tasks and t not in failed_task_names
                         ]
-                        if not self.task_list:
+                        if not remaining:
                             output_parts.append(f"\n[WARN] Replan requested but no remaining tasks. Terminating.")
                             await self.emit_status("No tasks remaining", done=True)
                             return "".join(output_parts)
 
-                    self.completed_tasks = []
-                    self.failed_tasks = []
-                    self._replan_reason = reason
-                    self.consecutive_json_errors = 0
-                    self.loop_count = 0
                     recent_calls = []
-
-                    # If we are NOT in REPLAN phase -> enter REPLAN to think about new plan
-                    if self.phase != self.PHASE_REPLAN:
-                        self._transition_to(self.PHASE_REPLAN, reason)
-                        # Add replan tool result to history so LLM sees it
-                        result_json = await self._tool_replan(**args)
-                        self.history.append({
-                            "role": "tool",
-                            "content": result_json,
-                            "tool_call_id": call_id,
-                            "name": tool_name,
-                        })
-                        output_parts.append(f"\n[RPLN] **Re-planning:** {reason}\n")
-                        await self.emit_status(f"[RPLN] Re-planning: {reason}")
-                        continue
-                    else:
-                        # We ARE in REPLAN phase -> this is the "done thinking" signal
-                        # Hard reset and jump to EXECUTE
-                        self._transition_to(self.PHASE_EXECUTE)
-                        self.history = [
-                            {"role": "system", "content": self._build_system_prompt()},
-                            {"role": "user", "content": self.goal},
-                        ]
-                        output_parts.append(f"\n[RPLN] **Re-plan complete:** {reason}\n")
-                        await self.emit_status(f"[RPLN] Re-plan complete: {reason}")
-                        continue
+                    result_json = await self._tool_replan(reason=reason, updated_tasks=updated, mode=mode)
+                    self.history.append({
+                        "role": "tool",
+                        "content": result_json,
+                        "tool_call_id": call_id,
+                        "name": tool_name,
+                    })
+                    mode_label = "soft" if mode == "soft" else "hard"
+                    output_parts.append(f"\n[RPLN] **Re-planning ({mode_label}):** {reason}\n")
+                    await self.emit_status(f"[RPLN] Re-planning ({mode_label}): {reason}")
+                    continue
 
                 # ── Handle complete_task ──
                 if tool_name == "complete_task":
@@ -911,11 +1141,58 @@ class AgentLoopEngine:
                     })
                     continue
 
-                # ── Phase transition on ask_user_questions ──
-                if self.phase == self.PHASE_PLAN and tool_name == "ask_user_questions":
-                    if not self.task_list and content:
-                        self.task_list = self._extract_task_list(content)
-                    self._transition_to(self.PHASE_EXECUTE)
+                # ── Handle fix_plan ──
+                if tool_name == "fix_plan":
+                    result_json = await self._tool_fix_plan(**args)
+                    result_data = json.loads(result_json)
+                    if result_data.get("fix_plan"):
+                        output_parts.append(f"\n[FIX] **Plan fixed:** {result_data.get('reason', '')}\n")
+                        output_parts.append(f"[FIX] Appended tasks: {', '.join(result_data.get('appended_tasks', []))}\n")
+                    else:
+                        output_parts.append(f"\n[FIX] **Fix failed:** {result_data.get('error', 'Unknown error')}\n")
+                    self.history.append({
+                        "role": "tool",
+                        "content": result_json,
+                        "tool_call_id": call_id,
+                        "name": tool_name,
+                    })
+                    if self.phase == self.PHASE_REVIEW:
+                        self._transition_to(self.PHASE_EXECUTE)
+                    continue
+
+                # ── Handle confirm_plan ──
+                if tool_name == "confirm_plan":
+                    plan_text = args.get("plan", content or "")
+                    if not self.task_list:
+                        self.task_list = self._extract_task_list(plan_text or content or "")
+                    result_json = await self._tool_confirm_plan(**args)
+                    result_data = json.loads(result_json)
+
+                    if result_data.get("action") == "feedback":
+                        feedback = result_data.get("value", "")
+                        self.history.append({
+                            "role": "tool",
+                            "content": result_json,
+                            "tool_call_id": call_id,
+                            "name": tool_name,
+                        })
+                        self.history.append({
+                            "role": "user",
+                            "content": f"SYSTEM: User provided feedback on the proposed plan: {feedback}. Please revise the plan and call confirm_plan again with the updated plan.",
+                        })
+                        output_parts.append(f"\n[PLAN] Plan rejected \u2014 user feedback: {feedback}\n")
+                        await self.emit_status("[PLAN] Revising plan based on feedback...")
+                        continue
+                    else:
+                        self._transition_to(self.PHASE_EXECUTE)
+                        self.history.append({
+                            "role": "tool",
+                            "content": result_json,
+                            "tool_call_id": call_id,
+                            "name": tool_name,
+                        })
+                        output_parts.append(f"\n[PLAN] Plan approved. Moving to execution.\n")
+                        continue
 
                 # ── Duplicate detection ──
                 sig = f"{tool_name}:{json.dumps(args, sort_keys=True)}"
@@ -992,7 +1269,7 @@ class AgentValves(BaseModel):
         description=(
             "Comma-separated tool names allowed in PLAN phase. "
             "Leave EMPTY to allow ALL tools. "
-            "Example: ask_user_questions, read_file, search_web, read_github, search_github"
+            "Example: confirm_plan, read_file, search_web, read_github, search_github"
         )
     )
     EXECUTE_TOOLS: str = Field(
@@ -1009,14 +1286,6 @@ class AgentValves(BaseModel):
             "Comma-separated tool names allowed in REVIEW phase. "
             "Leave EMPTY to allow ALL tools. "
             "Typically empty or minimal -- review should use few tools."
-        )
-    )
-    REPLAN_TOOLS: str = Field(
-        default="",
-        description=(
-            "Comma-separated tool names allowed in REPLAN phase. "
-            "Leave EMPTY to allow ALL tools. "
-            "Example: read_file, search_web, read_github (read-only tools only)"
         )
     )
 
@@ -1043,9 +1312,16 @@ class AgentValves(BaseModel):
         default="",
         description="Custom system prompt for REVIEW phase. Leave empty for default. Use {goal}, {task_state}, and {tool_names} placeholders."
     )
-    REPLAN_PROMPT: str = Field(
-        default="",
-        description="Custom system prompt for REPLAN phase. Leave empty for default. Use {goal}, {replan_reason}, {task_state}, and {tool_names} placeholders."
+
+
+class AgentUserValves(BaseModel):
+    ENABLE_PLAN_APPROVAL: bool = Field(
+        default=False,
+        description="Enable plan confirmation UI. When off, plans are auto-approved without asking the user.",
+    )
+    YOLO_MODE: bool = Field(
+        default=False,
+        description="Skip all user confirmations. Auto-approve plans and ignore iteration limits.",
     )
 
 
@@ -1057,6 +1333,7 @@ class Pipe:
     def __init__(self):
         self.type = "manifold"
         self.valves = AgentValves()
+        self.user_valves = AgentUserValves()
 
     def pipes(self):
         return [{"id": "agent-loop", "name": "Agent Loop"}]
@@ -1083,6 +1360,11 @@ class Pipe:
         user_id = __user__.get("id") if isinstance(__user__, dict) else ""
         user_obj = await Users.get_user_by_id(user_id) if user_id else None
 
+        user_valves = (
+            __user__.pop("valves", None) if isinstance(__user__, dict)
+            else getattr(__user__, "valves", None)
+        ) or self.user_valves
+
         model = self.valves.AGENT_MODEL or body.get("model", "")
 
         messages = body.get("messages", [])
@@ -1107,9 +1389,10 @@ class Pipe:
             user=user_obj or __user__,
             body=body,
             event_emitter=__event_emitter,
-            event_call=__event_call__,
+            event_call=__event_call,
             metadata=metadata,
             valves=self.valves,
+            user_valves=user_valves,
         )
 
         return await engine.run(user_msg, model)
