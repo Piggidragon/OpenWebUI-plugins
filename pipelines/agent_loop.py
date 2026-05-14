@@ -517,9 +517,10 @@ class AgentLoopEngine:
         new_tasks = [t.strip() for t in updated_tasks.splitlines() if t.strip()] if updated_tasks else []
 
         if mode == "soft":
-            # Soft replan: append new tasks (or keep remaining), compress history
+            # Soft replan: replace task list (or keep remaining), compress history
             if new_tasks:
-                self.task_list.extend(new_tasks)
+                # Replace the task list entirely; old tasks are preserved in compressed history
+                self.task_list = new_tasks
             else:
                 failed_task_names = {f["task"] for f in self.failed_tasks}
                 self.task_list = [
@@ -580,11 +581,8 @@ class AgentLoopEngine:
         new_tasks = [t.strip() for t in updated_tasks.splitlines() if t.strip()]
         if not new_tasks:
             return json.dumps({"fix_plan": False, "error": "No tasks provided in updated_tasks"})
-        for task_text in new_tasks:
-            for ft in self.failed_tasks[:]:
-                if ft["task"] == task_text:
-                    self.failed_tasks.remove(ft)
-                    break
+        # All current failures are being addressed by the new fix tasks
+        self.failed_tasks = []
         self.task_list.extend(new_tasks)
         return json.dumps({"fix_plan": True, "appended_tasks": new_tasks, "reason": reason})
 
@@ -903,6 +901,16 @@ class AgentLoopEngine:
 
         keep_last_n = 6
         recent = self.history[-keep_last_n:] if len(self.history) > keep_last_n else []
+
+        # Keep last N messages, but if the cutoff lands inside a tool call pair,
+        # append the missing tool results so the assistant call isn't dangling.
+        if recent and recent[-1].get("role") == "assistant" and recent[-1].get("tool_calls"):
+            num_calls = len(recent[-1]["tool_calls"])
+            extra_start = len(self.history) - keep_last_n
+            for i in range(num_calls):
+                idx = extra_start + i
+                if 0 <= idx < len(self.history) and self.history[idx].get("role") == "tool":
+                    recent.append(self.history[idx])
 
         start_idx = len(preserved)
         end_idx = len(self.history) - keep_last_n
