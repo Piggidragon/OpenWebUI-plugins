@@ -1656,7 +1656,7 @@ class HelixAgentEngine:
         await self.resolve_tools()
 
         # Attempt DB-backed state recovery at start of turn
-        await self._recover_state_from_files(body if isinstance(self.body, dict) else {})
+        await self._recover_state_from_files(self.body if isinstance(self.body, dict) else {})
         self.consecutive_json_errors = 0
 
         if self.goal and self.task_list:
