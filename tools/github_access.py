@@ -6,14 +6,14 @@ description: >
   branches, commits, and GitHub Actions workflows — directly from OpenWebUI.
   Uses the GitHub REST API with your Personal Access Token.
   Enforces a branch→file→PR workflow; no direct writes to main.
-version: 2.1.0
+version: 2.2.0
 """
 
 import base64
 import httpx
 import json
 from pydantic import BaseModel, Field
-from typing import Optional
+from typing import Optional, Callable, Awaitable, Any
 
 
 class Tools:
@@ -145,7 +145,8 @@ class Tools:
                 else f"User '{username}' has no public repos."
             )
 
-    async def github_get_repo(self, repo: str, __user__: Optional[dict] = None) -> str:
+    async def github_get_repo(self, repo: str, __user__: Optional[dict] = None,
+            __event_emitter__: Optional[Callable[[Any], Awaitable[None]]] = None) -> str:
         """
         Get metadata about a single repository.
 
@@ -158,6 +159,17 @@ class Tools:
             r = await c.get(url, headers=self._auth(uv))
             r.raise_for_status()
             d = r.json()
+            if __event_emitter__:
+                await __event_emitter__(
+                    {
+                        "type": "citation",
+                        "data": {
+                            "document": [d.get("description") or ""],
+                            "metadata": [{"source": d["html_url"]}],
+                            "source": {"name": d["full_name"]},
+                        },
+                    }
+                )
             return json.dumps(
                 {
                     "full_name": d["full_name"],
@@ -179,7 +191,8 @@ class Tools:
             )
 
     async def github_get_file(
-            self, repo: str, path: str, ref: str = "main", __user__: Optional[dict] = None
+            self, repo: str, path: str, ref: str = "main", __user__: Optional[dict] = None,
+            __event_emitter__: Optional[Callable[[Any], Awaitable[None]]] = None,
     ) -> str:
         """
         Read a file or directory from a GitHub repository.
@@ -206,12 +219,24 @@ class Tools:
                 "utf-8", errors="replace"
             )
             lang = path.rsplit(".", 1)[-1] if "." in path else ""
+            if __event_emitter__:
+                await __event_emitter__(
+                    {
+                        "type": "citation",
+                        "data": {
+                            "document": [content[:500]],
+                            "metadata": [{"source": data["html_url"]}],
+                            "source": {"name": f"{repo}/{path}"},
+                        },
+                    }
+                )
             return (
                 f"**{repo}/{path}** ({data['size']} bytes)\n```{lang}\n{content}\n```"
             )
 
     async def github_search_code(
-            self, repo: str, query: str, __user__: Optional[dict] = None
+            self, repo: str, query: str, __user__: Optional[dict] = None,
+            __event_emitter__: Optional[Callable[[Any], Awaitable[None]]] = None,
     ) -> str:
         """
         Search code in a GitHub repository.
@@ -229,6 +254,18 @@ class Tools:
             if data["total_count"] == 0:
                 return f"No results for '{query}' in {repo}."
             items = [f"- `{i['path']}`" for i in data["items"]]
+            if __event_emitter__:
+                for i in data["items"]:
+                    await __event_emitter__(
+                        {
+                            "type": "citation",
+                            "data": {
+                                "document": [i.get("name", i.get("path", ""))],
+                                "metadata": [{"source": i["html_url"]}],
+                                "source": {"name": f"{repo}/{i['path']}"},
+                            },
+                        }
+                    )
             return f"Found **{data['total_count']}** results in {repo}:\n" + "\n".join(
                 items
             )
@@ -239,6 +276,7 @@ class Tools:
             query: str,
             per_page: int = 10,
             __user__: Optional[dict] = None,
+            __event_emitter__: Optional[Callable[[Any], Awaitable[None]]] = None,
     ) -> str:
         """
         Search code across ALL of GitHub (global search, not limited to one repo).
@@ -259,6 +297,17 @@ class Tools:
             for i in data["items"]:
                 repo_name = i.get("repository", {}).get("full_name", "unknown")
                 items.append(f"- `{i['path']}` in **{repo_name}**")
+                if __event_emitter__:
+                    await __event_emitter__(
+                        {
+                            "type": "citation",
+                            "data": {
+                                "document": [i.get("name", i.get("path", ""))],
+                                "metadata": [{"source": i["html_url"]}],
+                                "source": {"name": f"{repo_name}/{i['path']}"},
+                            },
+                        }
+                    )
             return (
                 f"Found **{data['total_count']}** results across GitHub for '{query}':\n"
                 + "\n".join(items)
@@ -746,7 +795,8 @@ class Tools:
             return f"**{repo}** ({branch}) last {len(out)} commits:\n" + "\n".join(out)
 
     async def github_get_commit(
-            self, repo: str, sha: str, __user__: Optional[dict] = None
+            self, repo: str, sha: str, __user__: Optional[dict] = None,
+            __event_emitter__: Optional[Callable[[Any], Awaitable[None]]] = None,
     ) -> str:
         """
         Get detailed info about a single commit, including the diff.
@@ -766,6 +816,17 @@ class Tools:
                 files_out.append(
                     f"  {f['status']:>7}  +{f['additions']:<4} -{f['deletions']:<4}  {f['filename']}"
                 )
+            if __event_emitter__:
+                await __event_emitter__(
+                    {
+                        "type": "citation",
+                        "data": {
+                            "document": [c["commit"]["message"]],
+                            "metadata": [{"source": c["html_url"]}],
+                            "source": {"name": f"{repo}@{sha[:7]}"},
+                        },
+                    }
+                )
             return (
                     f"## {c['sha'][:7]} {c['commit']['message'].split(chr(10))[0]}\n"
                     f"**Author:** {c['commit']['author']['name']}  |  "
@@ -775,7 +836,8 @@ class Tools:
             )
 
     async def github_compare_branches(
-            self, repo: str, base: str, head: str, __user__: Optional[dict] = None
+            self, repo: str, base: str, head: str, __user__: Optional[dict] = None,
+            __event_emitter__: Optional[Callable[[Any], Awaitable[None]]] = None,
     ) -> str:
         """
         Compare two branches and show the diff summary.
@@ -802,6 +864,18 @@ class Tools:
                 for c in commits[:10]
             ]
             file_lines = [f"  {f['status']:>7}  {f['filename']}" for f in files[:15]]
+            compare_url = f"https://github.com/{repo}/compare/{base}...{head}"
+            if __event_emitter__:
+                await __event_emitter__(
+                    {
+                        "type": "citation",
+                        "data": {
+                            "document": [f"Comparing {base} and {head} in {repo}"],
+                            "metadata": [{"source": compare_url}],
+                            "source": {"name": f"{repo}: {base}...{head}"},
+                        },
+                    }
+                )
 
             return (
                     f"## {base} ← {head}\n"
@@ -889,7 +963,8 @@ class Tools:
             return f"Found **{data['total_count']}** issues:\n" + "\n".join(out)
 
     async def github_get_issue(
-            self, repo: str, issue_number: int, __user__: Optional[dict] = None
+            self, repo: str, issue_number: int, __user__: Optional[dict] = None,
+            __event_emitter__: Optional[Callable[[Any], Awaitable[None]]] = None,
     ) -> str:
         """
         Get full details of a single issue.
@@ -906,6 +981,17 @@ class Tools:
             i = r.json()
             labels = ", ".join(l["name"] for l in i.get("labels", [])) or "none"
             assignees = ", ".join(a["login"] for a in i.get("assignees", [])) or "none"
+            if __event_emitter__:
+                await __event_emitter__(
+                    {
+                        "type": "citation",
+                        "data": {
+                            "document": [i.get("body") or i.get("title") or ""],
+                            "metadata": [{"source": i["html_url"]}],
+                            "source": {"name": f"Issue #{issue_number} in {repo}"},
+                        },
+                    }
+                )
             return (
                 f"## #{i['number']} {i['title']}\n"
                 f"**State:** {i['state']}  |  **Author:** {i['user']['login']}  |  "
@@ -1143,7 +1229,8 @@ class Tools:
             return "\n".join(out)
 
     async def github_get_pull_request(
-            self, repo: str, pr_number: int, __user__: Optional[dict] = None
+            self, repo: str, pr_number: int, __user__: Optional[dict] = None,
+            __event_emitter__: Optional[Callable[[Any], Awaitable[None]]] = None,
     ) -> str:
         """
         Get full details of a single pull request.
@@ -1162,6 +1249,17 @@ class Tools:
                     ", ".join(r["login"] for r in p.get("requested_reviewers", []))
                     or "none"
             )
+            if __event_emitter__:
+                await __event_emitter__(
+                    {
+                        "type": "citation",
+                        "data": {
+                            "document": [p.get("body") or p.get("title") or ""],
+                            "metadata": [{"source": p["html_url"]}],
+                            "source": {"name": f"PR #{pr_number} in {repo}"},
+                        },
+                    }
+                )
             return (
                 f"## #{p['number']} {p['title']}\n"
                 f"**State:** {p['state']}  |  **Mergeable:** {p.get('mergeable', '?')}"
@@ -1324,7 +1422,8 @@ class Tools:
             )
 
     async def github_get_pr_diff(
-            self, repo: str, pr_number: int, __user__: Optional[dict] = None
+            self, repo: str, pr_number: int, __user__: Optional[dict] = None,
+            __event_emitter__: Optional[Callable[[Any], Awaitable[None]]] = None,
     ) -> str:
         """
         Get the raw diff (patch) of a pull request.
@@ -1343,6 +1442,17 @@ class Tools:
             diff_text = r.text
             if not diff_text.strip():
                 return f"No diff available for PR #{pr_number}."
+            if __event_emitter__:
+                await __event_emitter__(
+                    {
+                        "type": "citation",
+                        "data": {
+                            "document": [diff_text[:500]],
+                            "metadata": [{"source": f"https://github.com/{repo}/pull/{pr_number}"}],
+                            "source": {"name": f"PR #{pr_number} diff in {repo}"},
+                        },
+                    }
+                )
             # Truncate very large diffs
             MAX_DIFF = 30000
             if len(diff_text) > MAX_DIFF:
