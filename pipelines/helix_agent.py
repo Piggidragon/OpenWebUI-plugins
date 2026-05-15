@@ -1,29 +1,33 @@
 """
 title: Helix Agent
 author: Piggidragon
-version: 4.4.0
+version: 4.6.0
 description: >
   Helix Agent — OpenWebUI-native agent loop with modular per-phase tool control.
 
   Architecture:
   - SINGLE model loop (Plan -> Execute -> Review -> Replan -> Execute...)
   - Per-phase tool filtering via Valves -- only relevant tools exposed to the LLM
-  - Internal control tools (terminate, replan, fix_plan, complete_task, fail_task, confirm_plan) always available
+  - Internal control tools (terminate, replan, fix_plan, complete_task, fail_task, confirm_plan, rag_search) always available
   - Uses OpenWebUI native tool infrastructure (get_tools, get_builtin_tools, get_terminal_tools)
   - Replan as internal tool: updates task list and transitions to EXECUTE phase
   - Context window management with adaptive history truncation and tool-call pair integrity
   - Plan confirmation via custom JS UI (UserValves: ENABLE_PLAN_APPROVAL, YOLO_MODE)
   - Native OpenWebUI task progress UI via chat:message:tasks events, finalized on termination
   - System prompt refresh: task mutations (complete, fail, fix_plan) update the LLM's task state context
-   - State persistence via [AGENT_STATE] messages; restored on conversation continuation
+   - State persistence via JSON file attachments synced to OpenWebUI chat DB
    - Iteration limit with Continue/Cancel modal; graceful shutdown on CancelledError/GeneratorExit
-requirements: open-webui>=0.9.1
+   - File handling: add_file_context + chat_completion_files_handler for native multimodal/text file injection
+   - RAG search built-in: agent can query attached large files via vector search
+requirements: open-webui>=0.9.1, chromadb, sentence-transformers, langchain-text-splitters
 """
 
 import asyncio
 import inspect
+import io
 import json
 import logging
+import os
 import re
 import copy
 import uuid
@@ -34,10 +38,23 @@ from fastapi import Request
 
 from open_webui.utils.chat import generate_chat_completion
 from open_webui.utils.tools import get_tools, get_builtin_tools, get_terminal_tools
-from open_webui.utils.middleware import process_tool_result, add_file_context
+from open_webui.utils.middleware import (
+    process_tool_result,
+    add_file_context,
+    chat_completion_files_handler,
+)
 
 logger = logging.getLogger(__name__)
 
+# v4.6+: OpenWebUI DB-backed state persistence
+try:
+    from open_webui.models.chats import Chats
+    from open_webui.routers.files import upload_file_handler, Files
+    from starlette.datastructures import UploadFile, Headers
+
+    HAS_DB_PERSISTENCE = True
+except Exception:
+    HAS_DB_PERSISTENCE = False
 
 # ──────────────────────────────────────────────────────────────────
 #  DEFAULT PROMPTS (overridable via Valves)
@@ -57,6 +74,8 @@ What to do:
 3. Create a numbered task list that covers the entire goal.
 4. Each task should be a clear, actionable step.
 5. After creating the plan, call confirm_plan with the plan text to present it for review.
+
+File paths: If the plan involves creating files, decide on a project folder name (short slug based on the goal) under `/home/userxy/agent/`. All files for this task must be written within that project folder.
 
 Plan format for confirm_plan:
 When calling confirm_plan, provide the plan parameter as a numbered list with one task per line:
@@ -97,6 +116,8 @@ What to do:
 3. After the task is truly done, call complete_task(index) where index is the task number shown in the list.
 4. If a task fails and cannot be recovered, call fail_task(index, reason) to mark it.
 5. Move on to the next task.
+
+File paths: Create a project folder under `/home/userxy/agent/` named after the current task/goal (use a short slug). All files for this project must be written within that folder. Do not scatter files across unrelated directories.
 
 Rules:
 - Call exactly ONE tool per step.
@@ -328,7 +349,7 @@ class HelixAgentEngine:
     MAX_HISTORY_MESSAGES = 50
 
     # Internal tools that are ALWAYS available regardless of phase filters
-    INTERNAL_TOOLS = {"terminate", "replan", "complete_task", "fail_task", "confirm_plan", "fix_plan"}
+    INTERNAL_TOOLS = {"terminate", "replan", "complete_task", "fail_task", "confirm_plan", "fix_plan", "rag_search"}
 
     def __init__(self, request, user, body, event_emitter, event_call, metadata, valves, user_valves=None):
         self.request = request
@@ -354,10 +375,10 @@ class HelixAgentEngine:
         self.task_list = []
         self.completed_tasks = []
         self.failed_tasks = []
-        self.consecutive_json_errors = 0
+        self.produced_files = []
+        self._files_lock = asyncio.Lock()
         self._consecutive_tool_misses: Dict[str, int] = {}
         self._seen_file_ids: Set[str] = set()
-        self._state_restored = False
         self._output_parts = []
         self.loop_count = 0
         self.goal = ""
@@ -387,42 +408,142 @@ class HelixAgentEngine:
             filtered.append(part)
         return "".join(filtered)
 
-    def _save_state_to_history(self):
-        state = json.dumps({
-            "goal": self.goal,
-            "task_list": self.task_list,
-            "completed": self.completed_tasks,
-            "failed": self.failed_tasks,
-            "phase": self.phase,
-        }, ensure_ascii=False)
+    # ── State Persistence (DB + File Attachments) ──
 
-        # Remove old state messages to prevent bloat
-        self.history = [
-            m for m in self.history
-            if not (m.get("role") == "system" and m.get("content", "").startswith("[AGENT_STATE]"))
-        ]
+    async def _save_state_to_file(self) -> None:
+        """Serialize agent state to a JSON file and bind it to the chat DB."""
+        if not HAS_DB_PERSISTENCE or not self.chat_id or not self.request or not self.user:
+            return
+        try:
+            state_data = {
+                "goal": self.goal,
+                "task_list": self.task_list,
+                "completed": self.completed_tasks,
+                "failed": self.failed_tasks,
+                "phase": self.phase,
+                "loop_count": self.loop_count,
+            }
+            filename = f"helix_state_{self.chat_id}.json"
+            content = json.dumps(state_data, ensure_ascii=False).encode("utf-8")
 
-        self.history.append({
-            "role": "system",
-            "content": f"[AGENT_STATE] {state}",
-        })
+            file_upload = UploadFile(
+                file=io.BytesIO(content),
+                filename=filename,
+                headers=Headers({"content-type": "application/json"}),
+            )
 
-    def _restore_state_from_messages(self, messages):
-        for msg in reversed(messages):
-            content = msg.get("content", "")
-            if msg.get("role") == "system" and content.startswith("[AGENT_STATE]"):
+            file_item = await upload_file_handler(
+                request=self.request,
+                file=file_upload,
+                metadata={},
+                process=False,
+                user=self.user,
+            )
+
+            if not file_item:
+                return
+            file_id = getattr(file_item, "id", None)
+            if not file_id:
+                return
+            file_info = {"file_id": str(file_id), "name": filename}
+
+            # Update internal metadata
+            internal_files = self.metadata.get("__files__")
+            if isinstance(internal_files, list):
+                internal_files.append(file_info)
+
+            # Direct DB binding
+            if self.chat_id and self.message_id:
                 try:
-                    payload = json.loads(content.replace("[AGENT_STATE] ", "", 1))
-                    self.task_list = payload.get("task_list", [])
-                    self.completed_tasks = payload.get("completed", [])
-                    self.failed_tasks = payload.get("failed", [])
-                    self.phase = payload.get("phase", self.PHASE_PLAN)
-                    self.goal = payload.get("goal", self.goal)
-                    self.loop_count = 0
-                    self._state_restored = True
-                except Exception:
-                    pass
-                break
+                    await Chats.add_message_files_by_id_and_message_id(
+                        self.chat_id,
+                        self.message_id,
+                        [file_info],
+                    )
+                    logger.info(
+                        f"Persisted state file to chat {self.chat_id} message {self.message_id}"
+                    )
+                except Exception as db_err:
+                    logger.warning(f"DB file binding failed: {db_err}")
+
+            # Emit for immediate UI feedback
+            if self.event_emitter:
+                await self.event_emitter(
+                    {"type": "chat:message:files", "data": {"files": [file_info]}}
+                )
+        except Exception as e:
+            logger.error(f"Failed to save state file: {e}")
+
+    async def _recover_state_from_files(self, body: dict) -> None:
+        """Restore agent state from JSON file attachments in the chat."""
+        if not HAS_DB_PERSISTENCE:
+            return
+
+        state_file = None
+        # 1. Look in current message attachments
+        current_files = body.get("files") or body.get("__files__")
+        if current_files:
+            for f in reversed(current_files):
+                name = f.get("name", f.get("filename", ""))
+                if "helix_state" in name and name.endswith(".json"):
+                    state_file = f
+                    break
+
+        # 2. Deep DB history scan
+        if not state_file and self.chat_id:
+            logger.info(f"Deep history scan for chat {self.chat_id}...")
+            try:
+                chat_obj = await Chats.get_chat_by_id(self.chat_id)
+                if chat_obj and hasattr(chat_obj, "chat"):
+                    messages_map = chat_obj.chat.get("history", {}).get("messages", {})
+                    current_id = chat_obj.chat.get("history", {}).get("currentId")
+                    visited = set()
+                    while current_id and current_id not in visited:
+                        visited.add(current_id)
+                        msg = messages_map.get(current_id)
+                        if not msg:
+                            break
+                        msg_files = msg.get("files")
+                        if msg_files:
+                            for f in reversed(msg_files):
+                                name = f.get("name", f.get("filename", ""))
+                                if "helix_state" in name and name.endswith(".json"):
+                                    state_file = f
+                                    logger.info(f"Recovered state from DB history: {name}")
+                                    break
+                        if state_file:
+                            break
+                        current_id = msg.get("parentId")
+            except Exception as e:
+                logger.warning(f"DB history scan failed: {e}")
+
+        if not state_file:
+            logger.info("No Helix state file found in attachments or DB history.")
+            return
+
+        try:
+            file_id = state_file.get("file_id") or state_file.get("id")
+            if not file_id or Files is None:
+                return
+            file_obj = await Files.get_file_by_id(file_id)
+            if not file_obj:
+                return
+            file_path = getattr(file_obj, "path", None)
+            if not file_path and hasattr(file_obj, "meta"):
+                file_path = file_obj.meta.get("path")
+            if not file_path or not os.path.exists(file_path):
+                return
+            with open(file_path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            self.task_list = data.get("task_list", [])
+            self.completed_tasks = data.get("completed", [])
+            self.failed_tasks = data.get("failed", [])
+            self.phase = data.get("phase", self.PHASE_PLAN)
+            self.goal = data.get("goal", self.goal)
+            self.loop_count = data.get("loop_count", 0)
+            logger.info("Helix state recovered from file attachment.")
+        except Exception as e:
+            logger.warning(f"State recovery from file failed: {e}")
 
     async def emit_status(self, msg, done=False):
         if self.event_emitter:
@@ -434,7 +555,22 @@ class HelixAgentEngine:
     async def emit_output(self, text):
         self._output_parts.append(text)
 
-    # ── Tool Resolution ──
+    def get_current_files(self) -> list:
+        """Return a deduplicated list of all known files (metadata + produced + DB canonical)."""
+        files_map = {}
+        # 1. Metadata files
+        for f in self.metadata.get("__files__", []):
+            if isinstance(f, dict):
+                fid = f.get("id") or f.get("file_id") or f.get("url")
+                if fid:
+                    files_map[fid] = f
+        # 2. Produced files from this turn
+        for f in self.produced_files:
+            if isinstance(f, dict):
+                fid = f.get("id") or f.get("file_id") or f.get("url")
+                if fid:
+                    files_map[fid] = f
+        return list(files_map.values()) if files_map else []
 
     async def resolve_tools(self):
         """Resolve ALL tools from OWUI's infrastructure into all_tools_dict."""
@@ -592,6 +728,23 @@ class HelixAgentEngine:
             "callable": self._tool_fix_plan,
             "type": "function",
         }
+        self.all_tools_dict["rag_search"] = {
+            "spec": {
+                "name": "rag_search",
+                "description": "Semantic search inside an attached file using RAG (Retrieval-Augmented Generation). Use this when the attached file is too large to inline. Returns the most relevant chunks.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "file_id": {"type": "string", "description": "The file ID or name of the attached document to search."},
+                        "query": {"type": "string", "description": "The search query describing what you are looking for in the document."},
+                        "top_k": {"type": "integer", "default": 5, "description": "Number of top relevant chunks to return."},
+                    },
+                    "required": ["file_id", "query"],
+                },
+            },
+            "callable": self._tool_rag_search,
+            "type": "function",
+        }
 
     def _get_model_features(self, model_info):
         info = model_info.get("info", {}) or {}
@@ -691,7 +844,7 @@ class HelixAgentEngine:
         if self.phase != self.PHASE_EXECUTE:
             self._transition_to(self.PHASE_EXECUTE)
 
-        self._save_state_to_history()
+        await self._save_state_to_file()
         await self.emit_task_update()
         return json.dumps({"replan": True, "reason": reason, "updated_tasks": updated_tasks, "mode": mode})
 
@@ -701,7 +854,7 @@ class HelixAgentEngine:
             task = self.task_list[idx]
             if task not in self.completed_tasks:
                 self.completed_tasks.append(task)
-            self._save_state_to_history()
+            await self._save_state_to_file()
             self.history[0]["content"] = self._build_system_prompt()
             await self.emit_task_update()
             return json.dumps({"completed": True, "task": task, "index": idx})
@@ -715,7 +868,7 @@ class HelixAgentEngine:
             entry = {"task": task, "reason": reason}
             if not any(f["task"] == task for f in self.failed_tasks):
                 self.failed_tasks.append(entry)
-            self._save_state_to_history()
+            await self._save_state_to_file()
             self.history[0]["content"] = self._build_system_prompt()
             await self.emit_task_update()
             return json.dumps({"failed": True, "task": task, "index": idx, "reason": reason})
@@ -746,7 +899,7 @@ class HelixAgentEngine:
 
         self.task_list[insert_idx:insert_idx] = new_tasks
 
-        self._save_state_to_history()
+        await self._save_state_to_file()
         self.history[0]["content"] = self._build_system_prompt()
         await self.emit_task_update()
         return json.dumps({"fix_plan": True, "inserted_tasks": new_tasks, "reason": reason})
@@ -780,6 +933,93 @@ class HelixAgentEngine:
             res = {"action": "accept"}
 
         return json.dumps(res)
+
+    async def _tool_rag_search(self, file_id: str, query: str, top_k: int = 5, **kwargs):
+        """RAG search: chunk, embed (if needed) and retrieve top_k chunks."""
+        try:
+            from chromadb import PersistentClient
+            from sentence_transformers import SentenceTransformer
+            from langchain_text_splitters import RecursiveCharacterTextSplitter
+        except ImportError as imp_err:
+            return json.dumps({"error": f"RAG dependencies missing: {imp_err}"})
+
+        if not file_id or not query:
+            return json.dumps({"error": "file_id and query are required"})
+
+        # Resolve upload dir & read file bytes
+        upload_dirs = [
+            getattr(self.request.app.state, "UPLOAD_DIR", None),
+            "/app/backend/data/uploads",
+            "/app/data/uploads",
+            "/data/uploads",
+            "./data/uploads",
+            "data/uploads",
+        ]
+        file_path = None
+        for d in upload_dirs:
+            if d:
+                p = os.path.join(d, file_id)
+                if os.path.isfile(p):
+                    file_path = p
+                    break
+
+        if not file_path:
+            return json.dumps({"error": f"File {file_id} not found on disk"})
+
+        try:
+            with open(file_path, "r", encoding="utf-8", errors="replace") as fh:
+                text = fh.read()
+        except Exception as read_err:
+            return json.dumps({"error": f"Could not read {file_id}: {read_err}"})
+
+        # Persistent vector DB path
+        db_path = os.environ.get("HELIX_RAG_DB", "/app/backend/data/helix_rag_db")
+        os.makedirs(db_path, exist_ok=True)
+
+        try:
+            client = PersistentClient(path=db_path)
+            collection = client.get_or_create_collection(file_id)
+            embedder = SentenceTransformer("all-MiniLM-L6-v2")
+
+            # Check if already embedded
+            existing = collection.count()
+            if existing == 0:
+                splitter = RecursiveCharacterTextSplitter(
+                    chunk_size=1000,
+                    chunk_overlap=200,
+                )
+                chunks = splitter.split_text(text)
+                if not chunks:
+                    return json.dumps({"error": "No extractable text in file"})
+
+                embeddings = embedder.encode(chunks).tolist()
+                collection.add(
+                    ids=[f"{file_id}-{i}" for i in range(len(chunks))],
+                    embeddings=embeddings,
+                    documents=chunks,
+                    metadatas=[{"source": file_id}] * len(chunks),
+                )
+
+            query_embedding = embedder.encode([query]).tolist()
+            results = collection.query(
+                query_embeddings=query_embedding,
+                n_results=top_k,
+            )
+
+            chunks = results.get("documents", [[]])[0]
+            if not chunks:
+                return json.dumps({"result": "No relevant chunks found."})
+
+            context = "\n\n".join(
+                f'<source id="{i+1}">{chunk}</source>' for i, chunk in enumerate(chunks)
+            )
+            return json.dumps({
+                "result": f"Use the following context:\n{context}\n\nQuestion: {query}",
+                "chunks": chunks,
+            })
+        except Exception as rag_err:
+            logger.error("RAG search failed: %s", rag_err)
+            return json.dumps({"error": f"RAG search failed: {rag_err}"})
 
     def _base_theme_js(self):
         return """
@@ -1011,6 +1251,162 @@ class HelixAgentEngine:
                 lines.append(f"  - {f['task']}: {f['reason']}")
         return "\n".join(lines)
 
+    # ── File Context Preparation (planner_v3 parity) ──
+
+    async def _apply_file_prep(self, msgs: list) -> list:
+        """Mirror OWUI middleware: add_file_context then chat_completion_files_handler."""
+        if not self.request or not self.user or not self.pipe_metadata:
+            return msgs
+
+        # 1. add_file_context — injects text-file content into messages
+        prep = copy.deepcopy(msgs)
+        try:
+            prep = await add_file_context(prep, self.chat_id, self.user)
+            logger.debug("add_file_context succeeded")
+        except Exception as e:
+            logger.warning("add_file_context failed: %s", e)
+
+        # 2. chat_completion_files_handler — converts remaining attachments to multimodal blocks
+        try:
+            udump = self.user.model_dump() if hasattr(self.user, "model_dump") else {}
+            extra = {
+                "__event_emitter__": self.event_emitter,
+                "__metadata__": self.pipe_metadata,
+                "__user__": udump,
+                "__request__": self.request,
+            }
+            body, _flags = await chat_completion_files_handler(
+                self.request,
+                {"messages": prep, "model": self.body.get("model", "")},
+                extra,
+                self.user,
+            )
+            prep = body.get("messages", prep)
+        except Exception as e:
+            logger.warning("chat_completion_files_handler failed: %s", e)
+
+        return prep
+
+    # ── File Persistence (tools → DB sync) ──
+
+    async def _append_produced_files(self, raw_files: list) -> list:
+        """Deduplicate and append tool-generated files under lock. Return unique new files."""
+        if not raw_files:
+            return []
+        new_files = []
+        async with self._files_lock:
+            for f in raw_files:
+                if not isinstance(f, dict):
+                    continue
+                fid = f.get("id") or f.get("file_id") or f.get("url")
+                if fid and fid not in self._seen_file_ids:
+                    self._seen_file_ids.add(fid)
+                    new_files.append(f)
+            if new_files:
+                self.produced_files.extend(new_files)
+                # Mutate metadata so OWUI core persists files at stream cleanup
+                mfiles = self.metadata.get("__files__")
+                if isinstance(mfiles, list):
+                    mfiles.extend(new_files)
+                elif mfiles is None:
+                    self.metadata["__files__"] = new_files.copy()
+                raw_meta = self.metadata.get("__metadata__")
+                if isinstance(raw_meta, dict):
+                    meta_files = raw_meta.get("files")
+                    if isinstance(meta_files, list):
+                        meta_files.extend(new_files)
+                    else:
+                        raw_meta["files"] = self.produced_files.copy()
+        return new_files
+
+    async def _delayed_sync_with_backoff(
+        self,
+        chat_id: str,
+        message_id: str,
+        expected_files: list,
+        max_attempts: int = 4,
+        base_delay: float = 0.5,
+    ):
+        """Retries file sync with exponential backoff until DB reflects expected files."""
+        if not HAS_DB_PERSISTENCE or not chat_id or not message_id:
+            return
+        expected_ids = {
+            f.get("id") or f.get("file_id") or f.get("url")
+            for f in expected_files
+            if isinstance(f, dict)
+        }
+        if not expected_ids:
+            return
+        for attempt in range(max_attempts):
+            delay = base_delay * (2 ** attempt)  # 0.5, 1.0, 2.0, 4.0
+            try:
+                await asyncio.sleep(delay)
+            except asyncio.CancelledError:
+                return
+            try:
+                current_message = await Chats.get_message_by_id_and_message_id(
+                    chat_id, message_id
+                )
+                if current_message:
+                    current_ids = {
+                        f.get("id") or f.get("file_id") or f.get("url")
+                        for f in current_message.get("files", [])
+                        if isinstance(f, dict)
+                    }
+                    missing = expected_ids - current_ids
+                    if not missing:
+                        logger.debug(
+                            f"[Helix] Delayed sync attempt {attempt + 1}: all {len(expected_ids)} files already in DB."
+                        )
+                        return
+                    logger.info(
+                        f"[Helix] Delayed sync attempt {attempt + 1}: {len(missing)} files missing. Writing..."
+                    )
+                await Chats.add_message_files_by_id_and_message_id(
+                    chat_id, message_id, expected_files
+                )
+                logger.info(f"[Helix] Delayed sync succeeded at attempt {attempt + 1}.")
+                return
+            except asyncio.CancelledError:
+                return
+            except Exception as e:
+                logger.warning(f"[Helix] Delayed sync attempt {attempt + 1} failed: {e}")
+                if attempt == max_attempts - 1:
+                    logger.error(
+                        f"[Helix] Delayed sync exhausted all {max_attempts} attempts."
+                    )
+
+    async def _sync_produced_files_to_db(self):
+        """Deduplicate and bind all tool-generated files to the chat DB message."""
+        if not HAS_DB_PERSISTENCE or not self.chat_id or not self.message_id:
+            return
+
+        # Deduplicate by id/file_id/url
+        seen = set()
+        unique_files = []
+        async with self._files_lock:
+            for f in self.produced_files:
+                if not isinstance(f, dict):
+                    continue
+                fid = f.get("id") or f.get("file_id") or f.get("url")
+                if fid and fid not in seen:
+                    seen.add(fid)
+                    unique_files.append(f)
+            self.produced_files = unique_files.copy()
+
+        if not unique_files:
+            return
+
+        try:
+            await Chats.add_message_files_by_id_and_message_id(
+                self.chat_id,
+                self.message_id,
+                unique_files,
+            )
+            logger.info(f"Synced {len(unique_files)} tool files to DB.")
+        except Exception as e:
+            logger.warning(f"Tool file DB sync failed: {e}")
+
     # ── Execute Tool ──
 
     async def _execute_tool(self, tool_name, args, call_id):
@@ -1138,15 +1534,10 @@ class HelixAgentEngine:
             return messages
 
         to_remove = len(messages) - self.MAX_HISTORY_MESSAGES
-        # Build head: system prompt + goal + [AGENT_STATE] messages (always preserved)
+        # Build head: system prompt + goal (always preserved)
         head = messages[:2]
-        state_indices = set()
-        for i, m in enumerate(messages[2:], start=2):
-            if m.get("role") == "system" and m.get("content", "").startswith("[AGENT_STATE]"):
-                head.append(m)
-                state_indices.add(i)
         # Non-state messages after head, split into removed and tail
-        non_state = [m for i, m in enumerate(messages[2:], start=2) if i not in state_indices]
+        non_state = messages[2:]
         removed = non_state[:to_remove]
         tail = non_state[to_remove:]
 
@@ -1264,18 +1655,13 @@ class HelixAgentEngine:
         await self.emit_status("Agent starting...")
         await self.resolve_tools()
 
+        # Attempt DB-backed state recovery at start of turn
+        await self._recover_state_from_files(body if isinstance(self.body, dict) else {})
         self.consecutive_json_errors = 0
-        self.loop_count = 0
 
-        if self._state_restored:
-            # Preserve restored task state, phase, and history.
-            # Append new user message to the goal and history.
+        if self.goal and self.task_list:
+            # State was restored from file attachment
             self.goal = f"{self.goal}; Updated: {user_msg}"
-            # Remove stale [AGENT_STATE] system messages from history
-            self.history = [
-                m for m in self.history
-                if not (m.get("role") == "system" and m.get("content", "").startswith("[AGENT_STATE]"))
-            ]
             # Refresh the system prompt (phase may have changed)
             if self.history and self.history[0].get("role") == "system":
                 self.history[0]["content"] = self._build_system_prompt()
@@ -1284,6 +1670,8 @@ class HelixAgentEngine:
             self.history.append({"role": "user", "content": user_msg})
             # Filter tools for the restored phase
             self._filter_tools_for_phase(self.phase)
+            # Restore task list UI so it is visible immediately on re-entering the chat
+            await self.emit_task_update()
         else:
             # Fresh session: initialize everything from scratch
             self.goal = user_msg
@@ -1345,7 +1733,7 @@ class HelixAgentEngine:
 
 
             self.history = self._manage_context_window(self.history)
-            # Strip system messages (including [AGENT_STATE] bookkeeping) from LLM context
+            # Strip system messages from LLM context
             # Only the first message (system prompt) is kept
             call_messages = [self.history[0]] + [m for m in self.history[1:] if m.get("role") != "system"]
 
@@ -1357,12 +1745,11 @@ class HelixAgentEngine:
                 "metadata": self.pipe_metadata,
             }
 
+            # Apply OpenWebUI file context prep (add_file_context + chat_completion_files_handler)
             try:
-                completion_body["messages"] = await add_file_context(
-                    copy.deepcopy(call_messages), self.chat_id, self.user
-                )
-            except Exception:
-                pass
+                completion_body["messages"] = await self._apply_file_prep(copy.deepcopy(call_messages))
+            except Exception as e:
+                logger.warning("_apply_file_prep failed: %s", e)
 
             # ── Stream LLM response ──
             tc_dict = {}
@@ -1456,7 +1843,7 @@ class HelixAgentEngine:
                     result = args.get("result", "Task complete.")
                     success = args.get("success", True)
                     icon = "[OK]" if success else "[FAIL]"
-                    self._save_state_to_history()
+                    await self._save_state_to_file()
                     await self.emit_task_update(finalize_tasks=True)
                     if content:
                         await self.emit_output(content + "\n\n")
@@ -1578,7 +1965,7 @@ class HelixAgentEngine:
                         return self._format_output()
                     else:
                         self._transition_to(self.PHASE_EXECUTE)
-                        self._save_state_to_history()
+                        await self._save_state_to_file()
                         await self.emit_task_update()
                         self.history.append({
                             "role": "tool",
@@ -1598,11 +1985,13 @@ class HelixAgentEngine:
                     recent_calls.append(sig)
                     await self.emit_status(f"Running: {tool_name}...")
                     result_str, result_files = await self._execute_tool(tool_name, args, call_id)
-                    # Deduplicate files by id/file_id/url
-                    for f in result_files:
-                        fid = (f.get("id") or f.get("file_id") or f.get("url") or "") if isinstance(f, dict) else ""
-                        if fid and fid not in self._seen_file_ids:
-                            self._seen_file_ids.add(fid)
+                    # Track and persist tool-generated files safely
+                    new_files = await self._append_produced_files(result_files)
+                    if new_files and self.event_emitter:
+                        await self.event_emitter({
+                            "type": "chat:message:files",
+                            "data": {"files": new_files},
+                        })
                     truncation_limit = self._get_truncation_limit()
                     tool_result = smart_truncate(result_str, truncation_limit)
 
@@ -1645,13 +2034,13 @@ class HelixAgentEngine:
             # Currently pipe() returns a string, so this catch will not be triggered by
             # OpenWebUI's normal cancellation mechanism. CancelledError handles asyncio cancellation.
             logger.info("Agent loop cancelled by user (GeneratorExit).")
-            self._save_state_to_history()
+            await self._save_state_to_file()
             await self.emit_task_update(finalize_tasks=True)
             await self.emit_status("Cancelled", done=True)
             raise
         except asyncio.CancelledError:
             logger.info("Agent loop cancelled (CancelledError).")
-            self._save_state_to_history()
+            await self._save_state_to_file()
             await self.emit_task_update(finalize_tasks=True)
             await self.emit_status("Cancelled", done=True)
             raise
@@ -1660,6 +2049,16 @@ class HelixAgentEngine:
             await self.emit_task_update(finalize_tasks=True)
             return f"\n[ERROR] Agent loop failed: {e}"
         finally:
+            # Final immediate DB sync
+            await self._sync_produced_files_to_db()
+            # Fire-and-forget delayed sync with backoff to survive heavy DB load
+            if HAS_DB_PERSISTENCE and self.chat_id and self.message_id:
+                snapshot = list(self.produced_files)
+                asyncio.get_running_loop().create_task(
+                    self._delayed_sync_with_backoff(
+                        self.chat_id, self.message_id, snapshot
+                    )
+                )
             self._seen_file_ids.clear()
 
     def _extract_task_list(self, text):
@@ -1853,8 +2252,5 @@ class Pipe:
             valves=self.valves,
             user_valves=user_valves,
         )
-
-        # Restore state from previous [AGENT_STATE] messages in chat history
-        engine._restore_state_from_messages(messages)
 
         return await engine.run(user_msg, last_user_msg_raw, model)
