@@ -1,7 +1,7 @@
 """
 title: Helix Agent
 author: Piggidragon
-version: 4.6.4
+version: 4.7.1
 description: >
   Helix Agent - OpenWebUI-native agent loop with modular per-phase tool control.
 
@@ -160,6 +160,37 @@ Rules:
 - Be honest - don't call `terminate` if something is missing or wrong.
 - If the result is good enough, call `terminate`. Don't gold-plate.
 - Provide a brief reasoning for your assessment before calling the final tool.
+- You may only use the tools listed above.
+"""
+
+DEFAULT_REPLAN_SKIP_PROMPT = """\
+You are in QUICK REPLAN mode. The previous session has finished. The user has a new follow-up request.
+
+PHASE: QUICK REPLAN
+
+Available tools: {tool_names}
+
+Recent context (previous goal):
+{goal}
+
+What to do:
+1. Review the previous goal and the user's new request.
+2. Create a minimal, focused task plan (1-3 tasks) that addresses the new request in the context of what was already done.
+3. Call confirm_plan with the updated plan.
+
+Plan format for confirm_plan:
+When calling confirm_plan, provide the plan parameter as a numbered list with one task per line:
+1. First task description
+2. Second task description
+
+Alternatively, you may provide the plan as JSON: {{"tasks": ["task 1", "task 2"]}}
+
+Rules:
+- Keep the plan short and actionable. 1-3 tasks maximum.
+- Re-use previous context where relevant.
+- Call exactly ONE tool per step.
+- When done, call confirm_plan to move to execution.
+- NEVER call terminate in QUICK REPLAN mode.
 - You may only use the tools listed above.
 """
 
@@ -351,8 +382,10 @@ class HelixAgentEngine:
     PHASE_PLAN = "plan"
     PHASE_EXECUTE = "execute"
     PHASE_REVIEW = "review"
+    PHASE_REPLAN_SKIP = "replan_skip"
 
     MAX_HISTORY_MESSAGES = 50
+    MAX_REPLAN_SKIP_LOOPS = 3
 
     # Internal tools that are ALWAYS available regardless of phase filters
     INTERNAL_TOOLS = {"terminate", "replan", "complete_task", "fail_task", "confirm_plan", "fix_plan", "rag_search"}
@@ -782,6 +815,8 @@ class HelixAgentEngine:
             allowlist = set(_comma_list(self.valves.EXECUTE_TOOLS))
         elif phase == self.PHASE_REVIEW:
             allowlist = set(_comma_list(self.valves.REVIEW_TOOLS))
+        elif phase == self.PHASE_REPLAN_SKIP:
+            allowlist = set(_comma_list(self.valves.REPLAN_SKIP_TOOLS))
 
         # If allowlist is empty -> allow ALL tools
         # If allowlist has entries -> only those tools (plus internals)
@@ -924,6 +959,10 @@ class HelixAgentEngine:
             return json.dumps({"action": "accept"})
 
         if not self.event_call:
+            return json.dumps({"action": "accept"})
+
+        # Auto-accept when in QUICK REPLAN phase to keep the skip flow fast
+        if self.phase == self.PHASE_REPLAN_SKIP:
             return json.dumps({"action": "accept"})
 
         tasks = self._extract_task_list(plan_text)
@@ -1754,6 +1793,10 @@ class HelixAgentEngine:
                 base = self.valves.REVIEW_PROMPT or DEFAULT_REVIEW_PROMPT
                 return base.format(goal=self.goal, task_state=task_state, tool_names=tool_names)
 
+            elif self.phase == self.PHASE_REPLAN_SKIP:
+                base = self.valves.REPLAN_SKIP_PROMPT or DEFAULT_REPLAN_SKIP_PROMPT
+                return base.format(goal=self.goal, tool_names=tool_names)
+
             return DEFAULT_PLAN_PROMPT.format(tool_names=tool_names)
         except (KeyError, IndexError, ValueError):
             # User-provided prompt may have stray braces; fall back to default
@@ -1763,6 +1806,8 @@ class HelixAgentEngine:
                 return DEFAULT_EXECUTE_PROMPT.format(tool_names=tool_names, task_state=task_state)
             elif self.phase == self.PHASE_REVIEW:
                 return DEFAULT_REVIEW_PROMPT.format(goal=self.goal, task_state=task_state, tool_names=tool_names)
+            elif self.phase == self.PHASE_REPLAN_SKIP:
+                return DEFAULT_REPLAN_SKIP_PROMPT.format(goal=self.goal, tool_names=tool_names)
             return DEFAULT_PLAN_PROMPT.format(tool_names=tool_names)
 
     # -- Phase Transitions --
@@ -1937,25 +1982,20 @@ class HelixAgentEngine:
             self._filter_tools_for_phase(self.phase)
             await self.emit_task_update()
         elif self.goal and self.task_list and not has_remaining_tasks and self.user_valves and getattr(self.user_valves, "SKIP_PLAN_ON_RESUME", True):
-            # Previous session finished. Skip full PLAN, jump to EXECUTE with a single auto-created task.
-            logger.info("Previous session finished; using resume mode with single task.")
-            max_allowed = max(0, self.valves.MAX_ITERATIONS - 5)
-            if self.loop_count > max_allowed:
-                logger.info(f"Clamped loop_count from {self.loop_count} to {max_allowed} after state restore.")
-                self.loop_count = max_allowed
-
-            new_task = user_msg
-            self.task_list = [new_task]
+            # Previous session finished. Use Quick Replan phase to let the agent plan the new request.
+            logger.info("Previous session finished; entering Quick Replan phase.")
+            self.loop_count = 0
+            self.task_list = []
             self.completed_tasks = []
             self.failed_tasks = []
-            self.goal = f"{self.goal}; Updated: {user_msg}"
-            self.phase = self.PHASE_EXECUTE
+            self.goal = self.goal + "\n\nNEW REQUEST:\n" + user_msg
+            self.phase = self.PHASE_REPLAN_SKIP
             if self.history and self.history[0].get("role") == "system":
                 self.history[0]["content"] = self._build_system_prompt()
             else:
                 self.history.insert(0, {"role": "system", "content": self._build_system_prompt()})
             self.history.append({"role": "user", "content": user_msg})
-            self._filter_tools_for_phase(self.PHASE_EXECUTE)
+            self._filter_tools_for_phase(self.PHASE_REPLAN_SKIP)
             await self.emit_task_update()
         else:
             # Fresh session: reset state and start from PLAN
@@ -2006,15 +2046,26 @@ class HelixAgentEngine:
             self.loop_count += 1
             recent_calls = recent_calls[-30:]
 
+            # Safety-net for REPLAN_SKIP: max 3 loops, then fallback to single-task EXECUTE
+            if self.phase == self.PHASE_REPLAN_SKIP and self.loop_count > self.MAX_REPLAN_SKIP_LOOPS:
+                logger.warning("REPLAN_SKIP exceeded %d loops; falling back to single-task EXECUTE.", self.MAX_REPLAN_SKIP_LOOPS)
+                self.task_list = [user_msg]
+                if self.history and len(self.history) > 0:
+                    self.history[0]["content"] = self._build_system_prompt()
+                self._transition_to(self.PHASE_EXECUTE)
+                await self.emit_task_update()
+
             phase_icons = {
                 self.PHASE_PLAN: "[PLAN]",
                 self.PHASE_EXECUTE: "[EXEC]",
                 self.PHASE_REVIEW: "[REVU]",
+                self.PHASE_REPLAN_SKIP: "[RPLN]",
             }
             phase_name = {
                 self.PHASE_PLAN: "Plan",
                 self.PHASE_EXECUTE: "Execute",
                 self.PHASE_REVIEW: "Review",
+                self.PHASE_REPLAN_SKIP: "Replan",
             }
             icon = phase_icons.get(self.phase, "[LOOP]")
             name = phase_name.get(self.phase, "Loop")
@@ -2456,6 +2507,14 @@ class Pipe:
         REVIEW_PROMPT: str = Field(
             default=DEFAULT_REVIEW_PROMPT,
             description="System prompt for REVIEW phase. Available placeholders: {goal}, {task_state}, {tool_names}."
+        )
+        REPLAN_SKIP_PROMPT: str = Field(
+            default=DEFAULT_REPLAN_SKIP_PROMPT,
+            description="System prompt for QUICK REPLAN phase. Available placeholders: {goal}, {tool_names}."
+        )
+        REPLAN_SKIP_TOOLS: str = Field(
+            default="",
+            description="Comma-separated tool names allowed in QUICK REPLAN phase. Leave EMPTY to allow ALL tools."
         )
 
     class UserValves(BaseModel):
