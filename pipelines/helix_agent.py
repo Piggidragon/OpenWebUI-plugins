@@ -1,7 +1,7 @@
 """
 title: Helix Agent
 author: Piggidragon
-version: 4.6.3
+version: 4.6.4
 description: >
   Helix Agent - OpenWebUI-native agent loop with modular per-phase tool control.
 
@@ -1936,8 +1936,29 @@ class HelixAgentEngine:
             self.history.append({"role": "user", "content": user_msg})
             self._filter_tools_for_phase(self.phase)
             await self.emit_task_update()
+        elif self.goal and self.task_list and not has_remaining_tasks and self.user_valves and getattr(self.user_valves, "SKIP_PLAN_ON_RESUME", True):
+            # Previous session finished. Skip full PLAN, jump to EXECUTE with a single auto-created task.
+            logger.info("Previous session finished; using resume mode with single task.")
+            max_allowed = max(0, self.valves.MAX_ITERATIONS - 5)
+            if self.loop_count > max_allowed:
+                logger.info(f"Clamped loop_count from {self.loop_count} to {max_allowed} after state restore.")
+                self.loop_count = max_allowed
+
+            new_task = user_msg
+            self.task_list = [new_task]
+            self.completed_tasks = []
+            self.failed_tasks = []
+            self.goal = f"{self.goal}; Updated: {user_msg}"
+            self.phase = self.PHASE_EXECUTE
+            if self.history and self.history[0].get("role") == "system":
+                self.history[0]["content"] = self._build_system_prompt()
+            else:
+                self.history.insert(0, {"role": "system", "content": self._build_system_prompt()})
+            self.history.append({"role": "user", "content": user_msg})
+            self._filter_tools_for_phase(self.PHASE_EXECUTE)
+            await self.emit_task_update()
         else:
-            # Fresh session (or all old tasks are done): reset state and start from PLAN
+            # Fresh session: reset state and start from PLAN
             if self.goal and self.task_list and not has_remaining_tasks:
                 logger.info("All tasks completed or failed; starting fresh session.")
             self.goal = user_msg
@@ -2445,6 +2466,10 @@ class Pipe:
         YOLO_MODE: bool = Field(
             default=False,
             description="Skip all user confirmations. Auto-approve plans and ignore iteration limits.",
+        )
+        SKIP_PLAN_ON_RESUME: bool = Field(
+            default=True,
+            description="When the previous session is finished, skip the full PLAN phase for a new user request and jump straight to EXECUTE with a single task. Set to False to always start fresh with full PLAN phase.",
         )
 
     def __init__(self):
