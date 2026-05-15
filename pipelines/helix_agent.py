@@ -1,7 +1,7 @@
 """
 title: Helix Agent
 author: Piggidragon
-version: 4.7.1
+version: 4.8.0
 description: >
   Helix Agent - OpenWebUI-native agent loop with modular per-phase tool control.
 
@@ -102,6 +102,7 @@ Rules:
 - If a tool returns an error during planning (e.g., file not found), try an alternative tool or note the limitation in your plan. Do not call fix_plan for planning-stage errors.
 - If the user rejects your plan with feedback, revise the plan based on their feedback and call confirm_plan again with the updated plan. Do NOT repeat the same plan unchanged.
 - If the user cancels the plan, acknowledge it and stop.
+- You may use the ask_user tool to ask the user a multiple-choice question if you need clarification before planning.
 - You may only use the tools listed above.
 """
 
@@ -191,6 +192,7 @@ Rules:
 - Call exactly ONE tool per step.
 - When done, call confirm_plan to move to execution.
 - NEVER call terminate in QUICK REPLAN mode.
+- You may use the ask_user tool to ask the user a multiple-choice question if you need clarification.
 - You may only use the tools listed above.
 """
 
@@ -790,6 +792,31 @@ class HelixAgentEngine:
             "callable": self._tool_rag_search,
             "type": "function",
         }
+        self.all_tools_dict["ask_user"] = {
+            "spec": {
+                "name": "ask_user",
+                "description": "Ask the user an interactive single-choice question with optional free-text input. Use this when you need clarification or a decision during planning. Only available during PLAN and QUICK REPLAN phases.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "question": {"type": "string", "description": "The question to ask the user."},
+                        "options": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "List of 2-6 options for the user to pick from.",
+                        },
+                        "allow_custom": {
+                            "type": "boolean",
+                            "default": True,
+                            "description": "If true, the user can type a custom answer instead of picking an option.",
+                        },
+                    },
+                    "required": ["question", "options"],
+                },
+            },
+            "callable": self._tool_ask_user,
+            "type": "function",
+        }
 
     def _get_model_features(self, model_info):
         info = model_info.get("info", {}) or {}
@@ -826,6 +853,12 @@ class HelixAgentEngine:
             # Internal tools are ALWAYS included regardless of allowlist
             if name in self.INTERNAL_TOOLS:
                 self.phase_tools_dict[name] = tool
+                continue
+
+            # ask_user is only available in PLAN and REPLAN_SKIP phases
+            if name == "ask_user":
+                if phase in (self.PHASE_PLAN, self.PHASE_REPLAN_SKIP):
+                    self.phase_tools_dict[name] = tool
                 continue
 
             # Allowlist filtering
@@ -1071,6 +1104,247 @@ class HelixAgentEngine:
         except Exception as rag_err:
             logger.error("RAG search failed: %s", rag_err)
             return json.dumps({"error": f"RAG search failed: {rag_err}"})
+
+    async def _tool_ask_user(self, question: str, options: list, allow_custom: bool = True, **kwargs):
+        """Interactive user question tool. Only available during PLAN and REPLAN_SKIP phases."""
+        if not self.event_call:
+            return "Error: interactive input not available in this context."
+
+        if not options or not isinstance(options, list):
+            return "Error: provide at least one option."
+
+        opts = [str(o) for o in options[:8]]  # max 8 options
+        if not opts:
+            return "Error: options list is empty."
+
+        js = self._build_ask_user_js(question=question, options=opts, allow_custom=allow_custom)
+        try:
+            raw = await self.event_call({"type": "execute", "data": {"code": js}})
+        except Exception as e:
+            logger.error(f"ask_user event_call failed: {e}")
+            return f"Error getting user input: {e}"
+
+        raw_str = raw if isinstance(raw, str) else (raw.get("result") or raw.get("value") or "{}") if raw else "{}"
+        try:
+            parsed = json.loads(raw_str) if isinstance(raw_str, str) and raw_str.startswith("{") else {}
+        except (json.JSONDecodeError, AttributeError):
+            parsed = {}
+
+        rtype = parsed.get("type")
+        if rtype == "select":
+            return f"User selected: {parsed.get('value', '')}"
+        elif rtype == "custom":
+            return f"User answered: {parsed.get('value', '')}"
+        elif rtype == "skip":
+            return "User skipped the question."
+        return f"User response: {raw_str}"
+
+    def _build_ask_user_js(self, question: str, options: list[str], allow_custom: bool = True) -> str:
+        q_safe = json.dumps(question)
+        opts_safe = json.dumps(options)
+        custom_js = "true" if allow_custom else "false"
+        return f"""
+return (function() {{
+  return new Promise((resolve) => {{
+    {self._base_theme_js()}
+    const question    = {q_safe};
+    const options     = {opts_safe};
+    const allowCustom = {custom_js};
+    const OVERLAY_ID  = '__owui_helix_ask_user__';
+
+    const existing = document.getElementById(OVERLAY_ID);
+    if (existing) existing.remove();
+
+    function finish(payload) {{
+      panel.style.transform   = 'scale(0.95)';
+      panel.style.opacity     = '0';
+      overlay.style.opacity   = '0';
+      setTimeout(() => {{
+        overlay.remove();
+        document.removeEventListener('keydown', onKey);
+        resolve(JSON.stringify(payload));
+      }}, 180);
+    }}
+
+    const overlay = document.createElement('div');
+    overlay.id = OVERLAY_ID;
+    Object.assign(overlay.style, {{
+      position: 'fixed', inset: '0', zIndex: '999999',
+      background: col.overlay,
+      backdropFilter: 'blur(12px)', WebkitBackdropFilter: 'blur(12px)',
+      display: 'flex', alignItems: 'center', justifyContent: 'center',
+      fontFamily: "-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif",
+      opacity: '0', transition: 'opacity 0.18s ease',
+    }});
+
+    const panel = document.createElement('div');
+    Object.assign(panel.style, {{
+      background: col.panel, border: '1px solid ' + col.border,
+      borderRadius: '16px', padding: '26px 26px 20px',
+      maxWidth: '520px', width: 'calc(100vw - 32px)',
+      maxHeight: '85vh', overflowY: 'auto',
+      boxShadow: '0 28px 80px rgba(0,0,0,0.65)',
+      display: 'flex', flexDirection: 'column', gap: '14px',
+      transform: 'scale(0.92)', opacity: '0',
+      transition: 'transform 0.22s cubic-bezier(0.34,1.56,0.64,1), opacity 0.18s ease',
+    }});
+
+    const header = document.createElement('div');
+    Object.assign(header.style, {{ display: 'flex', alignItems: 'flex-start', gap: '12px' }});
+
+    const questionEl = document.createElement('p');
+    Object.assign(questionEl.style, {{
+      margin: '0', color: col.text, fontSize: '15px',
+      fontWeight: '600', lineHeight: '1.55', flex: '1', wordBreak: 'break-word',
+    }});
+    questionEl.textContent = question;
+
+    const badge = document.createElement('span');
+    Object.assign(badge.style, {{
+      flexShrink: '0', fontSize: '10px', fontWeight: '700',
+      letterSpacing: '0.07em', padding: '3px 9px', borderRadius: '99px',
+      background: col.btnPrimary + '26', color: col.btnPrimary,
+      marginTop: '2px', whiteSpace: 'nowrap',
+    }});
+    badge.textContent = 'CHOOSE ONE';
+
+    header.appendChild(questionEl);
+    header.appendChild(badge);
+
+    const optContainer = document.createElement('div');
+    Object.assign(optContainer.style, {{
+      display: 'flex', flexDirection: 'column', gap: '7px',
+    }});
+
+    options.forEach(function(opt, i) {{
+      const btn = document.createElement('button');
+      Object.assign(btn.style, {{
+        display: 'flex', alignItems: 'center', gap: '11px',
+        background: col.btn, border: '1.5px solid ' + col.btnBorder,
+        borderRadius: '10px', padding: '11px 13px',
+        cursor: 'pointer', textAlign: 'left', width: '100%',
+        minHeight: '48px', outline: 'none', fontFamily: 'inherit', boxSizing: 'border-box',
+        transition: 'background 0.12s, border-color 0.12s, transform 0.1s',
+      }});
+
+      const textBlock = document.createElement('div');
+      Object.assign(textBlock.style, {{ flex: '1', minWidth: '0' }});
+      const optLabel = document.createElement('span');
+      Object.assign(optLabel.style, {{
+        display: 'block', color: col.text, fontSize: '14px',
+        fontWeight: '500', wordBreak: 'break-word',
+      }});
+      optLabel.textContent = opt;
+      textBlock.appendChild(optLabel);
+      btn.appendChild(textBlock);
+
+      btn.addEventListener('mouseenter', function() {{
+        if (btn.dataset.selected !== '1') {{
+          btn.style.background  = '#3c3c52';
+          btn.style.borderColor = col.btnPrimary + '77';
+          btn.style.transform   = 'translateY(-1px)';
+        }}
+      }});
+      btn.addEventListener('mouseleave', function() {{
+        if (btn.dataset.selected !== '1') {{
+          btn.style.background = col.btn;
+          btn.style.borderColor = col.btnBorder;
+        }}
+        btn.style.transform = '';
+      }});
+
+      btn.addEventListener('click', function() {{
+        finish({{ type: 'select', index: i, value: opt }});
+      }});
+
+      optContainer.appendChild(btn);
+    }});
+
+    if (allowCustom) {{
+      const customRow = document.createElement('div');
+      Object.assign(customRow.style, {{ display: 'flex', gap: '7px', alignItems: 'stretch' }});
+
+      const customInput = document.createElement('input');
+      customInput.type = 'text';
+      customInput.placeholder = 'Or type a custom answer\u2026';
+      Object.assign(customInput.style, {{
+        flex: '1', background: col.input, border: '1.5px solid ' + col.inputBorder,
+        borderRadius: '8px', padding: '10px 12px', color: col.text,
+        fontSize: '14px', minHeight: '44px', outline: 'none',
+        fontFamily: 'inherit', transition: 'border-color 0.12s',
+        boxSizing: 'border-box',
+      }});
+      customInput.addEventListener('focus', function() {{ customInput.style.borderColor = col.btnPrimary; }});
+      customInput.addEventListener('blur', function() {{ customInput.style.borderColor = customInput.value ? col.btnPrimary : col.inputBorder; }});
+      customInput.addEventListener('keydown', function(e) {{
+        if (e.key === 'Enter' && customInput.value.trim()) {{
+          e.stopPropagation();
+          finish({{ type: 'custom', value: customInput.value.trim() }});
+        }}
+      }});
+
+      const sendBtn = document.createElement('button');
+      sendBtn.title = 'Submit custom answer (Enter)';
+      Object.assign(sendBtn.style, {{
+        background: col.btnPrimary, border: 'none', borderRadius: '8px',
+        padding: '10px 16px', cursor: 'pointer', fontSize: '16px',
+        color: col.btnPrimaryText, fontWeight: '700', minHeight: '44px',
+        flexShrink: '0', transition: 'opacity 0.12s, transform 0.1s',
+        fontFamily: 'inherit',
+      }});
+      sendBtn.textContent = '\u21b5';
+      sendBtn.addEventListener('mouseenter', function() {{ sendBtn.style.transform = 'scale(1.08)'; }});
+      sendBtn.addEventListener('mouseleave', function() {{ sendBtn.style.transform = ''; }});
+      sendBtn.addEventListener('click', function() {{
+        if (customInput.value.trim()) {{
+          finish({{ type: 'custom', value: customInput.value.trim() }});
+        }}
+      }});
+
+      customRow.appendChild(customInput);
+      customRow.appendChild(sendBtn);
+      optContainer.appendChild(customRow);
+    }}
+
+    const footer = document.createElement('div');
+    Object.assign(footer.style, {{
+      display: 'flex', gap: '8px', justifyContent: 'flex-end', marginTop: '2px',
+    }});
+
+    const skipBtn = document.createElement('button');
+    skipBtn.textContent = 'Skip';
+    Object.assign(skipBtn.style, {{
+      background: 'transparent', border: '1.5px solid ' + col.btnBorder,
+      borderRadius: '8px', padding: '9px 18px', color: '#6c7086',
+      fontSize: '13px', cursor: 'pointer', fontFamily: 'inherit',
+      transition: 'border-color 0.12s, color 0.12s',
+    }});
+    skipBtn.addEventListener('mouseenter', function() {{ skipBtn.style.borderColor = '#9399b2'; skipBtn.style.color = col.text; }});
+    skipBtn.addEventListener('mouseleave', function() {{ skipBtn.style.borderColor = col.btnBorder; skipBtn.style.color = '#6c7086'; }});
+    skipBtn.addEventListener('click', function() {{ finish({{ type: 'skip' }}); }});
+    footer.appendChild(skipBtn);
+
+    function onKey(e) {{
+      if (e.key === 'Escape') {{ skipBtn.click(); return; }}
+    }}
+    document.addEventListener('keydown', onKey);
+
+    panel.appendChild(header);
+    panel.appendChild(optContainer);
+    panel.appendChild(footer);
+    overlay.appendChild(panel);
+    document.body.appendChild(overlay);
+
+    requestAnimationFrame(function() {{
+      requestAnimationFrame(function() {{
+        overlay.style.opacity = '1';
+        panel.style.transform = 'scale(1)';
+        panel.style.opacity   = '1';
+      }});
+    }});
+  }});
+}})()
+"""
 
     def _base_theme_js(self):
         return """
