@@ -77,7 +77,62 @@ See the [GitHub Search PR](https://github.com/Piggidragon/OpenWebUI-plugins/pull
 
 ---
 
-## Installation
+## Pipelines
+
+Pipelines are custom processing flows that run server-side in Open WebUI. Each pipeline is a single Python file defining a `Pipe` (or `Pipeline`) class.
+
+---
+
+### `agent_loop.py` — Agent Loop (v4.2.0)
+
+A single-model Plan → Execute → Review → Replan loop with per-phase tool control.
+
+**How it works:**
+1. **Plan** — The model creates a task list and calls `confirm_plan`.
+2. **Execute** — The model works through tasks, calling tools and marking them complete/failed.
+3. **Review** — Once all tasks are done, the model calls `terminate` to deliver the final result.
+4. **Replan** — If tasks need adjusting, the model calls `replan` or `fix_plan` and loops back to Execute.
+
+**Key features:**
+- **Per-phase tool filtering** — only expose relevant tools to the LLM at each phase (configurable via Valves).
+- **Native OWUI task list UI** — real-time task progress via `chat:message:tasks` events (pending, in_progress, completed, cancelled). No HTML hacks.
+- **Task finalization** — on termination, remaining tasks are marked completed so the task list UI dismisses cleanly.
+- **Plan confirmation** — optional modal popup (UserValves: `ENABLE_PLAN_APPROVAL`, `YOLO_MODE`).
+- **Silent mode** — strips tool call details, reasoning blocks, and intermediate status from output (UserValves: `SILENT_MODE`).
+- **Context window management** — adaptive history truncation preserving tool-call pair integrity.
+- **Iteration limit** — configurable max loop iterations with a Continue/Cancel dialog.
+- **System prompt refresh** — the LLM always sees up-to-date task state after mutations.
+- **Graceful shutdown** — handles `GeneratorExit`/`CancelledError` and saves state.
+
+**Admin Valves (AgentValves):**
+| Valve | Default | Description |
+|-------|---------|-------------|
+| `AGENT_MODEL` | (empty) | Model ID for the loop. Leave empty to use the selected model. Must support function calling. |
+| `MAX_ITERATIONS` | 24 | Maximum agent loop iterations. |
+| `MAX_TOOL_RESULT_CHARS` | 4200 | Max characters for tool results before truncation. |
+| `TOOL_TIMEOUT` | 90 | Timeout in seconds for individual tool execution. 0 to disable. |
+| `PLAN_TOOLS` | (empty) | Comma-separated tools allowed in PLAN phase. Empty = all tools. |
+| `EXECUTE_TOOLS` | (empty) | Comma-separated tools allowed in EXECUTE phase. Empty = all tools. |
+| `REVIEW_TOOLS` | (empty) | Comma-separated tools allowed in REVIEW phase. Empty = all tools. |
+| `TOOLS_DENYLIST` | (empty) | Tools never available in any phase. |
+| `PLAN_PROMPT` | (empty) | Custom PLAN system prompt. Placeholders: `{tool_names}`. |
+| `EXECUTE_PROMPT` | (empty) | Custom EXECUTE system prompt. Placeholders: `{tool_names}`, `{task_state}`. |
+| `REVIEW_PROMPT` | (empty) | Custom REVIEW system prompt. Placeholders: `{goal}`, `{task_state}`, `{tool_names}`. |
+
+**User Valves (AgentUserValves):**
+| Valve | Default | Description |
+|-------|---------|-------------|
+| `ENABLE_PLAN_APPROVAL` | false | Show plan confirmation popup before execution. |
+| `YOLO_MODE` | false | Skip all user confirmations. Auto-approve plans and ignore iteration limits. |
+| `SILENT_MODE` | false | Hide tool call details, reasoning blocks, and intermediate status. Show only plan approvals, final results, and errors. |
+
+---
+
+### `planner_v3.py` — Planner v3 (v3.10.3, by Haervwe)
+
+Multi-agent orchestrator with subagents, MCP support, and plan approval UI. See the [planner_v3.py](pipelines/planner_v3.py) header for full documentation.
+
+---
 
 ### Option A — Workspace Import (recommended)
 

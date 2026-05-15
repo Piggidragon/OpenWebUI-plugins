@@ -1,7 +1,7 @@
 """
 title: Agent Loop
 author: Piggidragon
-version: 4.1.0
+version: 4.2.0
 description: >
   OpenWebUI-native Agent Loop with modular per-phase tool control.
 
@@ -13,6 +13,13 @@ description: >
   - Replan as internal tool: updates task list and transitions to EXECUTE phase
   - Context window management with adaptive history truncation
   - Plan confirmation via custom JS UI (UserValves: ENABLE_PLAN_APPROVAL, YOLO_MODE)
+  - Native OpenWebUI task list UI via chat:message:tasks events (pending, in_progress, completed, cancelled)
+
+  v4.2.0 changes:
+  - Native task list UI: emits chat:message:tasks events instead of HTML details tables
+  - Task list finalization: remaining tasks marked completed on termination so UI dismisses cleanly
+  - System prompt refresh: complete_task, fail_task, and fix_plan now rebuild the system prompt so the LLM sees updated task state
+  - Silent mode: strips [PLAN] lines in addition to tool call and reasoning noise
 
   v4.0.0 changes:
   - Added GeneratorExit/CancelledError handling for graceful shutdown
@@ -340,7 +347,6 @@ class AgentLoopEngine:
     PHASE_REVIEW = "review"
 
     MAX_HISTORY_MESSAGES = 50
-    TRUNCATE_TOOL_RESULTS_AT = 30
 
     # Internal tools that are ALWAYS available regardless of phase filters
     INTERNAL_TOOLS = {"terminate", "replan", "complete_task", "fail_task", "confirm_plan", "fix_plan"}
@@ -372,6 +378,7 @@ class AgentLoopEngine:
         self.consecutive_json_errors = 0
         self._consecutive_tool_misses: Dict[str, int] = {}
         self._seen_file_ids: Set[str] = set()
+        self._state_restored = False
         self._working_shown = False
         self.loop_count = 0
         self.goal = ""
@@ -438,7 +445,9 @@ class AgentLoopEngine:
                     self.completed_tasks = payload.get("completed", [])
                     self.failed_tasks = payload.get("failed", [])
                     self.phase = payload.get("phase", self.PHASE_PLAN)
+                    self.goal = payload.get("goal", self.goal)
                     self.loop_count = 0
+                    self._state_restored = True
                 except Exception:
                     pass
                 break
@@ -1211,8 +1220,6 @@ class AgentLoopEngine:
         return head + tail
 
     def _get_truncation_limit(self):
-        if len(self.history) > self.TRUNCATE_TOOL_RESULTS_AT:
-            return self.valves.MAX_TOOL_RESULT_CHARS // 3
         return self.valves.MAX_TOOL_RESULT_CHARS
 
     def _compress_history(self):
@@ -1293,22 +1300,39 @@ class AgentLoopEngine:
         await self.emit_status("Agent starting...")
         await self.resolve_tools()
 
-        self.goal = user_msg
-        self.phase = self.PHASE_PLAN
-        self.task_list = []
-        self.completed_tasks = []
-        self.failed_tasks = []
         self.consecutive_json_errors = 0
         self.loop_count = 0
 
-        # Initial tool filtering for PLAN phase
-        self._filter_tools_for_phase(self.PHASE_PLAN)
-
-        system_prompt = self._build_system_prompt()
-        self.history = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_msg},
-        ]
+        if self._state_restored:
+            # Preserve restored task state, phase, and history.
+            # Append new user message to the goal and history.
+            self.goal = f"{self.goal}; Updated: {user_msg}"
+            # Remove stale [AGENT_STATE] system messages from history
+            self.history = [
+                m for m in self.history
+                if not (m.get("role") == "system" and m.get("content", "").startswith("[AGENT_STATE]"))
+            ]
+            # Refresh the system prompt (phase may have changed)
+            if self.history and self.history[0].get("role") == "system":
+                self.history[0]["content"] = self._build_system_prompt()
+            else:
+                self.history.insert(0, {"role": "system", "content": self._build_system_prompt()})
+            self.history.append({"role": "user", "content": user_msg})
+            # Filter tools for the restored phase
+            self._filter_tools_for_phase(self.phase)
+        else:
+            # Fresh session: initialize everything from scratch
+            self.goal = user_msg
+            self.phase = self.PHASE_PLAN
+            self.task_list = []
+            self.completed_tasks = []
+            self.failed_tasks = []
+            self._filter_tools_for_phase(self.PHASE_PLAN)
+            system_prompt = self._build_system_prompt()
+            self.history = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_msg},
+            ]
 
         # Inject user-uploaded files into the conversation
         uploaded_files = self.metadata.get("__files__", [])
