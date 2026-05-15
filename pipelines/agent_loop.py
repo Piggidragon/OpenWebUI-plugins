@@ -1,7 +1,7 @@
 """
 title: Agent Loop
 author: Piggidragon
-version: 3.0.0
+version: 4.1.0
 description: >
   OpenWebUI-native Agent Loop with modular per-phase tool control.
 
@@ -14,21 +14,34 @@ description: >
   - Context window management with adaptive history truncation
   - Plan confirmation via custom JS UI (UserValves: ENABLE_PLAN_APPROVAL, YOLO_MODE)
 
-  v3.0.0 changes:
-  - Removed REPLAN as a separate phase -- replan is now an internal tool only
-  - Calling replan updates the task list and transitions directly to EXECUTE
-  - Hard history reset removed from replan; history is preserved
-  - Three phases remain: PLAN -> EXECUTE -> REVIEW
-  - Added fix_plan internal tool for lightweight plan corrections without history reset
+  v4.0.0 changes:
+  - Added GeneratorExit/CancelledError handling for graceful shutdown
+  - Cancel option in plan confirmation UI
+  - Improved thinking/reasoning tag removal (unclosed tags, pipe blocks, prefixes)
+  - XML tool call rescue for hallucinated XML-format calls
+  - No-tool-call continuation: injects system prompt instead of terminating
+  - Native OWUI task list integration via task status emitter
+  - Iteration continuation UI (Continue/Cancel modal)
+  - File deduplication in tool results
+  - Compressed history preserves tool result previews
+  - Context window trimming preserves tool call pair integrity
+  - Soft replan reduces loop_count by 3 instead of resetting to 0
+  - fix_plan inserts at correct position, uses _extract_task_list
+  - State persistence via [AGENT_STATE] messages
+  - Silent mode for minimal output
+  - Consecutive tool-miss loop breaking
+  - LLM API retry on transient errors
 requirements: open-webui>=0.9.1
 """
 
+import asyncio
+import inspect
 import json
 import logging
 import re
 import copy
 import uuid
-from typing import AsyncGenerator, Callable, Optional, Any, Set, List
+from typing import AsyncGenerator, Callable, Optional, Any, Set, List, Dict
 from pydantic import BaseModel, Field
 
 from fastapi import Request
@@ -57,7 +70,15 @@ What to do:
 2. Read relevant files, search the web, query knowledge -- use any tools to gather context.
 3. Create a numbered task list that covers the entire goal.
 4. Each task should be a clear, actionable step.
-5. After creating the plan, call confirm_plan with the full plan text to present it for review.
+5. After creating the plan, call confirm_plan with the plan text to present it for review.
+
+Plan format for confirm_plan:
+When calling confirm_plan, provide the plan parameter as a numbered list with one task per line:
+1. First task description
+2. Second task description
+3. Third task description
+
+Alternatively, you may provide the plan as JSON: {{"tasks": ["task 1", "task 2", "task 3"]}}
 
 Rules:
 - Be thorough -- read files before planning changes.
@@ -67,6 +88,9 @@ Rules:
 - When done planning, call confirm_plan with the plan for confirmation.
 - NEVER call terminate in PLAN mode -- the user must confirm first.
 - NEVER call replan in PLAN mode.
+- If a tool returns an error during planning (e.g., file not found), try an alternative tool or note the limitation in your plan. Do not call fix_plan for planning-stage errors.
+- If the user rejects your plan with feedback, revise the plan based on their feedback and call confirm_plan again with the updated plan. Do NOT repeat the same plan unchanged.
+- If the user cancels the plan, acknowledge it and stop.
 - You may only use the tools listed above.
 """
 
@@ -79,10 +103,12 @@ Available tools: {tool_names}
 
 {task_state}
 
+Task status markers: [done] = completed, [FAIL: reason] = failed, [    ] = not started.
+
 What to do:
-1. Pick the next incomplete task from the list.
+1. Pick the next incomplete task (marked [    ]) from the list above.
 2. Execute it using the appropriate tool(s).
-3. After the task is truly done, call complete_task(index) to mark it finished.
+3. After the task is truly done, call complete_task(index) where index is the task number shown in the list.
 4. If a task fails and cannot be recovered, call fail_task(index, reason) to mark it.
 5. Move on to the next task.
 
@@ -90,11 +116,12 @@ Rules:
 - Call exactly ONE tool per step.
 - NEVER repeat identical failed tool calls (duplicate detection is active).
 - When all tasks are done, call terminate with a summary.
-- If a tool returns an error (timeout, file not found, syntax error, wrong path), analyze the error and retry the same or a similar tool with corrected parameters. You do NOT need to call fix_plan for trivial errors like typos or wrong paths — just fix it and continue.
-- Only call fix_plan if the same task fails repeatedly (3+ attempts) or if the error reveals that the task itself was incorrectly designed.
-- Only call replan(mode='soft') if you realize the entire approach or task list is fundamentally wrong.
-- Only call replan(mode='hard') if the overall strategy needs a complete replacement.
+- If a tool returns an error (timeout, file not found, syntax error, wrong path), analyze the error and retry with corrected parameters. You do NOT need to call fix_plan for trivial errors.
+- Only call fix_plan if the same task fails repeatedly (3+ attempts) or if the task design was wrong.
+- Only call replan(mode='soft') if the entire approach is wrong. Use replan(mode='hard') only for complete strategy replacement.
+- If you need to think step-by-step before acting, do so — reasoning will be captured in a collapsible block.
 - You MUST call complete_task(index) or fail_task(index, reason) after working on a task.
+- If a tool named `parallel_tools` is available, use it to call multiple independent tools at once for efficiency.
 - You may only use the tools listed above. Do NOT ask the user questions.
 """
 
@@ -104,7 +131,10 @@ You are in REVIEW mode. Your ONLY job is to pick one of three actions.
 PHASE: REVIEW
 Original goal: {goal}
 Available tools: {tool_names}
+
 {task_state}
+
+Task status markers: [done] = completed, [FAIL: reason] = failed with reason, [    ] = not started.
 
 You MUST call exactly ONE of these tools:
 
@@ -116,6 +146,7 @@ Rules:
 - If there are only minor issues with individual tasks, ALWAYS prefer `fix_plan` over `replan`. Only use `replan` if the overall strategy is broken.
 - Be honest — don't call `terminate` if something is missing or wrong.
 - If the result is good enough, call `terminate`. Don't gold-plate.
+- Provide a brief reasoning for your assessment before calling the final tool.
 - You may only use the tools listed above.
 """
 
@@ -125,14 +156,28 @@ Rules:
 # ──────────────────────────────────────────────────────────────────
 
 async def stream_completion(request, body, user):
-    """Stream OWUI completion, yielding structured events."""
+    """Stream OWUI completion, yielding structured events. Retries once on transient errors."""
     body["stream"] = True
-    try:
-        response = await generate_chat_completion(request, body, user=user)
-    except Exception as e:
-        logger.error(f"generate_chat_completion failed: {e}")
-        yield {"type": "error", "text": str(e)}
-        return
+    max_retries = 1
+    last_error = None
+
+    for attempt in range(max_retries + 1):
+        try:
+            response = await generate_chat_completion(request, body, user=user)
+            break
+        except (ConnectionError, TimeoutError, asyncio.TimeoutError) as e:
+            last_error = e
+            if attempt < max_retries:
+                logger.warning(f"Transient API error (attempt {attempt + 1}), retrying: {e}")
+                await asyncio.sleep(2 ** attempt)
+                continue
+            logger.error(f"LLM API error after {attempt + 1} attempt(s): {e}")
+            yield {"type": "error", "text": str(e)}
+            return
+        except Exception as e:
+            logger.error(f"generate_chat_completion failed: {e}")
+            yield {"type": "error", "text": str(e)}
+            return
 
     if hasattr(response, "body_iterator"):
         sse_buffer = ""
@@ -222,13 +267,58 @@ def smart_truncate(text, max_chars):
 
 
 def strip_thinking(text):
-    """Remove <thinking>...</thinking> blocks from model output."""
+    """Remove thinking/reasoning blocks from model output.
+    Handles: paired tags, unclosed tags, pipe-style blocks, and reasoning prefixes."""
+    # Remove paired tags: <thinking>...</thinking> etc.
     text = re.sub(
         r"<(?:think|thinking|reason|reasoning|thought)>.*?</(?:think|thinking|reason|reasoning|thought)>",
         "", text, flags=re.DOTALL | re.IGNORECASE
     )
+    # Remove pipe-style blocks: |begin_of_thought|...|end_of_thought|
     text = re.sub(r"\|begin_of_thought\|.*?\|end_of_thought\|", "", text, flags=re.DOTALL | re.IGNORECASE)
+    # Remove unclosed tags that run to end of text or before next <
+    text = re.sub(
+        r"<(?:think|thinking|reason|reasoning|thought)>[^<]*",
+        "", text, flags=re.DOTALL | re.IGNORECASE
+    )
+    # Remove reasoning prefixes on their own line
+    text = re.sub(
+        r"^(?:Thinking|Thought|Reasoning|Analysis|Reason)\s*:\s*",
+        "", text, flags=re.MULTILINE | re.IGNORECASE
+    )
     return text.strip()
+
+
+def extract_xml_tool_calls(text):
+    """Attempt to extract tool calls from hallucinated XML <ToolCall> blocks."""
+    calls = []
+    pattern = re.compile(
+        r"<ToolCall>\s*<name>\s*(.*?)\s*</name>\s*<arguments>\s*(.*?)\s*</arguments>\s*</ToolCall>",
+        re.DOTALL | re.IGNORECASE
+    )
+    for i, m in enumerate(pattern.finditer(text)):
+        name = m.group(1).strip()
+        args_str = m.group(2).strip()
+        try:
+            args = json.loads(args_str)
+        except (json.JSONDecodeError, ValueError):
+            args = {}
+        calls.append({
+            "id": f"call_xml_{uuid.uuid4().hex[:12]}",
+            "type": "function",
+            "function": {"name": name, "arguments": json.dumps(args) if isinstance(args, dict) else args_str},
+            "index": i,
+        })
+    return calls
+
+
+def strip_html(text):
+    """Remove HTML tags and decode common entities for plain-text display."""
+    text = re.sub(r"<details[^>]*>.*?</details>", "", text, flags=re.DOTALL | re.IGNORECASE)
+    text = re.sub(r"<summary>(.*?)</summary>", r"\1: ", text, flags=re.DOTALL | re.IGNORECASE)
+    text = re.sub(r"<[^>]+>", "", text)
+    text = text.replace("&amp;", "&").replace("&lt;", "<").replace("&gt;", ">").replace("&quot;", '"')
+    return re.sub(r"\s+", " ", text).strip()
 
 
 def _comma_list(val: str) -> List[str]:
@@ -280,8 +370,78 @@ class AgentLoopEngine:
         self.completed_tasks = []
         self.failed_tasks = []
         self.consecutive_json_errors = 0
+        self._consecutive_tool_misses: Dict[str, int] = {}
+        self._seen_file_ids: Set[str] = set()
+        self._working_shown = False
         self.loop_count = 0
         self.goal = ""
+
+    @property
+    def is_silent(self):
+        return getattr(self.user_valves, "SILENT_MODE", False)
+
+    def _format_output(self, parts):
+        """Join output parts. In silent mode, suppress intermediate execution noise."""
+        if not self.is_silent:
+            return "".join(parts)
+        filtered = []
+        for part in parts:
+            s = part.strip()
+            if not s:
+                continue
+            if "<details type=\"reasoning\">" in s:
+                continue
+            if "<details type=\"tool_calls\">" in s:
+                continue
+            if s.startswith("[EXEC]"):
+                continue
+            if s.startswith("[RPLN]"):
+                continue
+            if s.startswith("[FIX]"):
+                continue
+            if s.startswith("[OK]") and "marked complete" in s:
+                continue
+            if s.startswith("[FAIL]") and "marked failed" in s:
+                continue
+            if s.startswith("[PLAN]"):
+                continue
+            filtered.append(part)
+        return "".join(filtered)
+
+    def _save_state_to_history(self):
+        state = json.dumps({
+            "goal": self.goal,
+            "task_list": self.task_list,
+            "completed": self.completed_tasks,
+            "failed": self.failed_tasks,
+            "phase": self.phase,
+        }, ensure_ascii=False)
+
+        # Remove old state messages to prevent bloat
+        self.history = [
+            m for m in self.history
+            if not (m.get("role") == "system" and m.get("content", "").startswith("[AGENT_STATE]"))
+        ]
+
+        self.history.append({
+            "role": "system",
+            "content": f"[AGENT_STATE] {state}",
+        })
+
+    def _restore_state_from_messages(self, messages):
+        for msg in reversed(messages):
+            content = msg.get("content", "")
+            if msg.get("role") == "system" and content.startswith("[AGENT_STATE]"):
+                try:
+                    payload = json.loads(content.replace("[AGENT_STATE] ", "", 1))
+                    self.task_list = payload.get("task_list", [])
+                    self.completed_tasks = payload.get("completed", [])
+                    self.failed_tasks = payload.get("failed", [])
+                    self.phase = payload.get("phase", self.PHASE_PLAN)
+                    self.loop_count = 0
+                except Exception:
+                    pass
+                break
 
     async def emit_status(self, msg, done=False):
         if self.event_emitter:
@@ -420,11 +580,11 @@ class AgentLoopEngine:
         self.all_tools_dict["confirm_plan"] = {
             "spec": {
                 "name": "confirm_plan",
-                "description": "Present the task plan to the user for approval. Call this after creating the plan in PLAN phase. The user can accept or provide feedback for revision.",
+                "description": "Present the task plan to the user for approval. Call this after creating the plan in PLAN phase. Provide the plan as a numbered list (e.g. '1. Task one\\n2. Task two') or as JSON with a 'tasks' array. The user can accept, provide feedback, or cancel.",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "plan": {"type": "string", "description": "The full plan text with numbered tasks to present for review"},
+                        "plan": {"type": "string", "description": "The full plan text. Use numbered format '1. Task description' or JSON {\"tasks\": [\"task1\", \"task2\"]}. Each task should be a clear, actionable step."},
                     },
                     "required": ["plan"],
                 },
@@ -514,7 +674,7 @@ class AgentLoopEngine:
     # Soft or hard reset. Prefer soft mode to preserve compressed history.
     async def _tool_replan(self, reason: str, updated_tasks: str, mode: str = "soft", **kwargs):
         """Process a replan: update task list and compress or reset history."""
-        new_tasks = [t.strip() for t in updated_tasks.splitlines() if t.strip()] if updated_tasks else []
+        new_tasks = self._extract_task_list(updated_tasks) if updated_tasks else []
 
         if mode == "soft":
             # Soft replan: replace task list (or keep remaining), compress history
@@ -530,7 +690,8 @@ class AgentLoopEngine:
             self.completed_tasks = []
             self.failed_tasks = []
             self.consecutive_json_errors = 0
-            self.loop_count = 0
+            # Grant 3 extra iterations without fully resetting the safety counter
+            self.loop_count = max(0, self.loop_count - 3)
             self.history = self._compress_history()
         else:
             # Hard replan: replace task list entirely, full history reset
@@ -554,6 +715,8 @@ class AgentLoopEngine:
         if self.phase != self.PHASE_EXECUTE:
             self._transition_to(self.PHASE_EXECUTE)
 
+        self._save_state_to_history()
+        await self.emit_task_update()
         return json.dumps({"replan": True, "reason": reason, "updated_tasks": updated_tasks, "mode": mode})
 
     async def _tool_complete_task(self, **kwargs):
@@ -562,6 +725,9 @@ class AgentLoopEngine:
             task = self.task_list[idx]
             if task not in self.completed_tasks:
                 self.completed_tasks.append(task)
+            self._save_state_to_history()
+            self.history[0]["content"] = self._build_system_prompt()
+            await self.emit_task_update()
             return json.dumps({"completed": True, "task": task, "index": idx})
         return json.dumps({"completed": False, "error": f"Invalid task index {idx}"})
 
@@ -573,18 +739,41 @@ class AgentLoopEngine:
             entry = {"task": task, "reason": reason}
             if not any(f["task"] == task for f in self.failed_tasks):
                 self.failed_tasks.append(entry)
+            self._save_state_to_history()
+            self.history[0]["content"] = self._build_system_prompt()
+            await self.emit_task_update()
             return json.dumps({"failed": True, "task": task, "index": idx, "reason": reason})
         return json.dumps({"failed": False, "error": f"Invalid task index {idx}"})
 
     # Lightweight correction tool. Use this instead of replan for minor issues.
     async def _tool_fix_plan(self, reason: str, updated_tasks: str, **kwargs):
-        new_tasks = [t.strip() for t in updated_tasks.splitlines() if t.strip()]
+        if not self.task_list:
+            return json.dumps({"fix_plan": False, "error": "No task list available"})
+
+        new_tasks = self._extract_task_list(updated_tasks)
         if not new_tasks:
-            return json.dumps({"fix_plan": False, "error": "No tasks provided in updated_tasks"})
-        # All current failures are being addressed by the new fix tasks
+            return json.dumps({"fix_plan": False, "error": "No tasks provided"})
+
+        # Compute insertion index BEFORE removing failed tasks
+        failed_names = {f["task"] for f in self.failed_tasks}
+        insert_idx = len(self.task_list)  # default: append
+        for i, t in enumerate(self.task_list):
+            if any(f in t or t in f for f in failed_names):
+                insert_idx = i
+                break
+
+        # Remove failed tasks from the task list
+        self.task_list = [t for t in self.task_list if t not in failed_names]
+        if insert_idx > len(self.task_list):
+            insert_idx = len(self.task_list)
         self.failed_tasks = []
-        self.task_list.extend(new_tasks)
-        return json.dumps({"fix_plan": True, "appended_tasks": new_tasks, "reason": reason})
+
+        self.task_list[insert_idx:insert_idx] = new_tasks
+
+        self._save_state_to_history()
+        self.history[0]["content"] = self._build_system_prompt()
+        await self.emit_task_update()
+        return json.dumps({"fix_plan": True, "inserted_tasks": new_tasks, "reason": reason})
 
     async def _tool_confirm_plan(self, **kwargs):
         plan_text = kwargs.get("plan", "")
@@ -696,6 +885,10 @@ class AgentLoopEngine:
 
         const acceptBtn = makeBtn('Accept Plan', true);
         const feedbackBtn = makeBtn('Send Feedback', false);
+        const cancelBtn = makeBtn('Cancel', false);
+        cancelBtn.style.background = '#7f1d1d';
+        cancelBtn.style.color = '#fecaca';
+        cancelBtn.style.borderColor = '#991b1b';
 
         const cleanup = () => {{ overlay.remove(); }};
 
@@ -705,8 +898,9 @@ class AgentLoopEngine:
             if (val) {{ clearTimeout(_timer); cleanup(); resolve(JSON.stringify({{action:'feedback', value: val}})); }}
             else {{ acceptBtn.onclick(); }}
         }};
+        cancelBtn.onclick = () => {{ clearTimeout(_timer); cleanup(); resolve(JSON.stringify({{action:'cancel'}})); }};
 
-        footer.appendChild(acceptBtn); footer.appendChild(feedbackBtn); panel.appendChild(footer);
+        footer.appendChild(acceptBtn); footer.appendChild(feedbackBtn); footer.appendChild(cancelBtn); panel.appendChild(footer);
 
         const countdown = document.createElement('div');
         countdown.style.cssText = `font-size:11px;color:${{col.sub}};text-align:center;margin-top:-12px;flex-shrink:0;`;
@@ -725,7 +919,102 @@ class AgentLoopEngine:
       }});
     }})();"""
 
+    # ── Iteration Limit UI ──
+
+    def _build_iteration_limit_js(self, current_iter, max_iter, timeout_s: int = 300) -> str:
+        """Build a Continue/Cancel modal for iteration limit reached."""
+        return f"""
+    return (function() {{
+      return new Promise((resolve) => {{
+    {self._base_theme_js()}
+        const overlay = document.createElement('div');
+        overlay.style.cssText = `position:fixed;inset:0;z-index:999999;background:${{col.overlay}};display:flex;align-items:center;justify-content:center;padding:20px;backdrop-filter:blur(4px);`;
+        const panel = document.createElement('div');
+        panel.style.cssText = `background:${{col.panel}};border:1px solid ${{col.border}};border-radius:20px;box-shadow:0 20px 60px rgba(0,0,0,0.3);color:${{col.text}};font-family:ui-sans-serif,system-ui,sans-serif;width:100%;max-width:440px;padding:32px;display:flex;flex-direction:column;gap:20px;`;
+
+        const header = document.createElement('div');
+        header.style.cssText = 'display:flex;align-items:center;gap:12px;';
+        const icon = document.createElement('div'); icon.textContent = '⚠️'; icon.style.cssText = 'font-size:24px;';
+        const title = document.createElement('div'); title.textContent = 'Iteration Limit Reached'; title.style.cssText = `font-size:18px;font-weight:800;color:${{col.text}};`;
+        header.appendChild(icon); header.appendChild(title); panel.appendChild(header);
+
+        const msg = document.createElement('div');
+        msg.style.cssText = `font-size:14px;color:${{col.sub}};line-height:1.5;`;
+        msg.textContent = `The agent has used {current_iter} of {max_iter} iterations. Continue for more?`;
+        panel.appendChild(msg);
+
+        const countdown = document.createElement('div');
+        countdown.style.cssText = `font-size:11px;color:${{col.sub}};text-align:center;margin-top:-8px;`;
+        panel.appendChild(countdown);
+
+        const footer = document.createElement('div');
+        footer.style.cssText = 'display:flex;gap:10px;';
+        const makeBtn = (label, primary) => {{
+            const b = document.createElement('button');
+            b.textContent = label;
+            b.style.cssText = `flex:1;padding:12px 18px;border-radius:9999px;font-size:14px;font-weight:700;cursor:pointer;border:1px solid ${{primary ? 'transparent' : col.btnBorder}};background:${{primary ? col.btnPrimary : col.btn}};color:${{primary ? col.btnPrimaryText : col.btnText}};`;
+            b.onmouseenter = () => {{ b.style.opacity='0.9'; }};
+            b.onmouseleave = () => {{ b.style.opacity='1'; }};
+            return b;
+        }};
+        const continueBtn = makeBtn('Continue', true);
+        const stopBtn = makeBtn('Stop', false);
+        const cleanup = () => {{ overlay.remove(); }};
+        let _timer;
+        continueBtn.onclick = () => {{ clearTimeout(_timer); cleanup(); resolve(JSON.stringify({{action:'continue'}})); }};
+        stopBtn.onclick = () => {{ clearTimeout(_timer); cleanup(); resolve(JSON.stringify({{action:'stop'}})); }};
+        footer.appendChild(continueBtn); footer.appendChild(stopBtn); panel.appendChild(footer);
+
+        overlay.appendChild(panel); document.body.appendChild(overlay);
+
+        let remaining = {timeout_s};
+        const updateCountdown = () => {{
+            countdown.textContent = remaining > 0 ? `Auto-stopping in ${{remaining}}s...` : '';
+            if (remaining <= 0) {{ cleanup(); resolve(JSON.stringify({{action:'stop'}})); }}
+        }};
+        updateCountdown();
+        _timer = setInterval(() => {{ remaining--; updateCountdown(); }}, 1000);
+      }});
+    }})();"""
+
     # ── Task State String ──
+
+    async def emit_task_update(self, finalize_tasks=False):
+        """Emit task progress via Open WebUI's native task list UI.
+
+        When finalize_tasks is True, all remaining pending/in_progress tasks
+        are marked as completed so the TaskList UI is dismissed (it only
+        renders when at least one task is active).
+        """
+        if not self.task_list:
+            return
+        first_outstanding = next(
+            (i for i, t in enumerate(self.task_list)
+             if t not in self.completed_tasks
+             and not any(f["task"] == t for f in self.failed_tasks)),
+            None,
+        )
+        tasks = []
+        for i, task in enumerate(self.task_list):
+            if task in self.completed_tasks:
+                status = "completed"
+            elif any(f["task"] == task for f in self.failed_tasks):
+                status = "cancelled"
+            elif finalize_tasks:
+                status = "completed"
+            elif i == first_outstanding:
+                status = "in_progress"
+            else:
+                status = "pending"
+            tasks.append({"id": str(i + 1), "content": task, "status": status})
+        if self.event_emitter:
+            try:
+                await self.event_emitter({
+                    "type": "chat:message:tasks",
+                    "data": {"tasks": tasks},
+                })
+            except Exception:
+                pass
 
     def _build_task_state(self):
         lines = []
@@ -734,7 +1023,8 @@ class AgentLoopEngine:
             if task in self.completed_tasks:
                 status = "[done]"
             elif any(f["task"] == task for f in self.failed_tasks):
-                status = "[FAIL]"
+                reason = next((f["reason"] for f in self.failed_tasks if f["task"] == task), "")
+                status = f"[FAIL: {reason}]"
             else:
                 status = "[    ]"
             lines.append(f"  {i}. {status} {task}")
@@ -758,7 +1048,6 @@ class AgentLoopEngine:
         allowed_keys = set(spec_params.keys())
         filtered_args = {k: v for k, v in args.items() if k in allowed_keys}
 
-        import inspect
         callable_fn = target.get("callable")
         if callable_fn and inspect.iscoroutinefunction(callable_fn):
             try:
@@ -781,7 +1070,11 @@ class AgentLoopEngine:
 
         files = []
         try:
-            result = await callable_fn(**filtered_args)
+            timeout = self.valves.TOOL_TIMEOUT if self.valves.TOOL_TIMEOUT > 0 else None
+            if timeout:
+                result = await asyncio.wait_for(callable_fn(**filtered_args), timeout=timeout)
+            else:
+                result = await callable_fn(**filtered_args)
             try:
                 processed = await process_tool_result(
                     self.request,
@@ -809,6 +1102,9 @@ class AgentLoopEngine:
             except Exception:
                 result_str = str(result) if result is not None else ""
             return result_str, files
+        except asyncio.TimeoutError:
+            logger.error(f"Tool execution timed out ({tool_name}): {self.valves.TOOL_TIMEOUT}s")
+            return f"Error: Tool '{tool_name}' timed out after {self.valves.TOOL_TIMEOUT}s.", []
         except Exception as e:
             logger.error(f"Tool execution error ({tool_name}): {e}")
             return f"Error executing {tool_name}: {e}", []
@@ -821,25 +1117,38 @@ class AgentLoopEngine:
         task_state = self._build_task_state()
 
         # Pick base prompt from Valves or fallback to default
-        if self.phase == self.PHASE_PLAN:
-            base = self.valves.PLAN_PROMPT or DEFAULT_PLAN_PROMPT
-            return base.format(tool_names=tool_names)
+        try:
+            if self.phase == self.PHASE_PLAN:
+                base = self.valves.PLAN_PROMPT or DEFAULT_PLAN_PROMPT
+                return base.format(tool_names=tool_names)
 
-        elif self.phase == self.PHASE_EXECUTE:
-            base = self.valves.EXECUTE_PROMPT or DEFAULT_EXECUTE_PROMPT
-            return base.format(tool_names=tool_names, task_state=task_state)
+            elif self.phase == self.PHASE_EXECUTE:
+                base = self.valves.EXECUTE_PROMPT or DEFAULT_EXECUTE_PROMPT
+                return base.format(tool_names=tool_names, task_state=task_state)
 
-        elif self.phase == self.PHASE_REVIEW:
-            base = self.valves.REVIEW_PROMPT or DEFAULT_REVIEW_PROMPT
-            return base.format(goal=self.goal, task_state=task_state, tool_names=tool_names)
+            elif self.phase == self.PHASE_REVIEW:
+                base = self.valves.REVIEW_PROMPT or DEFAULT_REVIEW_PROMPT
+                return base.format(goal=self.goal, task_state=task_state, tool_names=tool_names)
 
-        return DEFAULT_PLAN_PROMPT.format(tool_names=tool_names)
+            return DEFAULT_PLAN_PROMPT.format(tool_names=tool_names)
+        except (KeyError, IndexError, ValueError):
+            # User-provided prompt may have stray braces; fall back to default
+            if self.phase == self.PHASE_PLAN:
+                return DEFAULT_PLAN_PROMPT.format(tool_names=tool_names)
+            elif self.phase == self.PHASE_EXECUTE:
+                return DEFAULT_EXECUTE_PROMPT.format(tool_names=tool_names, task_state=task_state)
+            elif self.phase == self.PHASE_REVIEW:
+                return DEFAULT_REVIEW_PROMPT.format(goal=self.goal, task_state=task_state, tool_names=tool_names)
+            return DEFAULT_PLAN_PROMPT.format(tool_names=tool_names)
 
     # ── Phase Transitions ──
 
     def _transition_to(self, phase):
         """Transition to a new phase: update tools, system prompt, state."""
         self.phase = phase
+        self._consecutive_tool_misses.clear()
+        if phase == self.PHASE_EXECUTE:
+            self._working_shown = False
 
         # Rebuild filtered tools for new phase
         self._filter_tools_for_phase(phase)
@@ -851,11 +1160,54 @@ class AgentLoopEngine:
     # ── Context Window Management ──
 
     def _manage_context_window(self, messages):
+        """Trim history to MAX_HISTORY_MESSAGES while keeping tool call pairs intact."""
         if len(messages) <= self.MAX_HISTORY_MESSAGES:
             return messages
+
         to_remove = len(messages) - self.MAX_HISTORY_MESSAGES
+        # Build head: system prompt + goal + [AGENT_STATE] messages (always preserved)
         head = messages[:2]
-        tail = messages[2 + to_remove:]
+        state_indices = set()
+        for i, m in enumerate(messages[2:], start=2):
+            if m.get("role") == "system" and m.get("content", "").startswith("[AGENT_STATE]"):
+                head.append(m)
+                state_indices.add(i)
+        # Non-state messages after head, split into removed and tail
+        non_state = [m for i, m in enumerate(messages[2:], start=2) if i not in state_indices]
+        removed = non_state[:to_remove]
+        tail = non_state[to_remove:]
+
+        # Drop dangling tool results whose assistant call was removed
+        while tail and tail[0].get("role") == "tool":
+            call_id = tail[0].get("tool_call_id")
+            assistant_removed = any(
+                m.get("role") == "assistant"
+                and any(tc.get("id") == call_id for tc in m.get("tool_calls", []))
+                for m in removed
+            )
+            if assistant_removed:
+                tail = tail[1:]
+            else:
+                break
+
+        # If an assistant with tool_calls is at the front of tail,
+        # pull missing tool results back from the removed chunk
+        if tail and tail[0].get("role") == "assistant" and tail[0].get("tool_calls"):
+            missing = []
+            for tc in tail[0]["tool_calls"]:
+                tc_id = tc.get("id")
+                found_in_tail = any(
+                    m.get("role") == "tool" and m.get("tool_call_id") == tc_id
+                    for m in tail
+                )
+                if not found_in_tail:
+                    for m in removed:
+                        if m.get("role") == "tool" and m.get("tool_call_id") == tc_id:
+                            missing.append(m)
+                            break
+            if missing:
+                tail = missing + tail
+
         return head + tail
 
     def _get_truncation_limit(self):
@@ -865,87 +1217,79 @@ class AgentLoopEngine:
 
     def _compress_history(self):
         """
-        Compress history for a soft replan: preserve system prompt, user goal,
-        an execution summary, compressed middle messages, and recent context.
+        Compress history for soft replan.
+        - Keeps system prompt + goal.
+        - Summarizes old execution into a summary block.
+        - Preserves last ~6 messages, but never splits a tool call pair.
+        - Tool results that are dropped from the "middle" are replaced with
+          short previews: [Tool: name → first 200 chars of result].
         """
+        # 1. System prompt + goal (always preserved)
         preserved = []
-        goal_message = None
+        goal_msg = None
         for msg in self.history:
             role = msg.get("role")
             if role == "system":
                 preserved.append(msg)
-            elif role == "user" and goal_message is None:
-                goal_message = msg
+            elif role == "user" and goal_msg is None:
+                goal_msg = msg
+        if goal_msg:
+            preserved.append(goal_msg)
 
-        if goal_message:
-            preserved.append(goal_message)
-
-        task_summary_parts = ["=== Previous Execution Summary ==="]
-        task_summary_parts.append(f"Goal: {self.goal}")
-        task_summary_parts.append(f"Completed tasks: {', '.join(self.completed_tasks) if self.completed_tasks else 'None'}")
-
+        # 2. Build execution summary
+        summary_parts = ["=== Compressed Execution History ==="]
+        summary_parts.append(f"Goal: {self.goal}")
+        summary_parts.append(f"Completed tasks: {', '.join(self.completed_tasks) if self.completed_tasks else 'None'}")
         if self.failed_tasks:
-            task_summary_parts.append("Failed tasks:")
+            summary_parts.append("Failed tasks:")
             for ft in self.failed_tasks:
-                task_summary_parts.append(f"  - {ft.get('task', 'unknown')}: {ft.get('reason', 'no reason')}")
-        else:
-            task_summary_parts.append("Failed tasks: None")
-
+                summary_parts.append(f"  - {ft.get('task', 'unknown')}: {ft.get('reason', 'no reason')}")
         if self.task_list:
-            task_summary_parts.append(f"Remaining tasks before replan: {', '.join(self.task_list)}")
-
-        summary_message = {
-            "role": "system",
-            "content": "\n".join(task_summary_parts)
-        }
-
-        keep_last_n = 6
-        recent = self.history[-keep_last_n:] if len(self.history) > keep_last_n else []
-
-        # Keep last N messages, but if the cutoff lands inside a tool call pair,
-        # append the missing tool results so the assistant call isn't dangling.
-        if recent and recent[-1].get("role") == "assistant" and recent[-1].get("tool_calls"):
-            num_calls = len(recent[-1]["tool_calls"])
-            extra_start = len(self.history) - keep_last_n
-            for i in range(num_calls):
-                idx = extra_start + i
-                if 0 <= idx < len(self.history) and self.history[idx].get("role") == "tool":
-                    recent.append(self.history[idx])
-
+            summary_parts.append(f"Remaining tasks before replan: {', '.join(self.task_list)}")
+        # 3. Middle section: tool results become previews, everything else is dropped
+        middle_previews = []
         start_idx = len(preserved)
-        end_idx = len(self.history) - keep_last_n
 
-        middle = []
-        if end_idx > start_idx:
-            for msg in self.history[start_idx:end_idx]:
-                role = msg.get("role")
-                content = msg.get("content", "")
+        keep_last = 6
+        if len(self.history) > len(preserved) + keep_last:
+            middle = self.history[len(preserved):-keep_last]
+        else:
+            middle = []
 
-                if role == "assistant":
-                    snippet = content[:250].replace("\n", " ")
-                    middle.append({
-                        "role": "assistant",
-                        "content": f"[Compressed assistant message] {snippet}..."
-                    })
-                elif role == "user":
-                    snippet = content[:150].replace("\n", " ")
-                    middle.append({
-                        "role": "user",
-                        "content": f"[Compressed] {snippet}..."
-                    })
-                # Tool results and tool_calls in the middle section are discarded
-                # since they are summarized in the execution summary above.
+        for msg in middle:
+            if msg.get("role") == "tool":
+                name = msg.get("name", "unknown")
+                content = strip_html(msg.get("content", ""))
+                preview = content[:200].replace("\n", " ")
+                middle_previews.append(f"[Tool: {name} → {preview}...]")
+            elif msg.get("role") == "user" and len(msg.get("content", "")) < 500:
+                middle_previews.append(f"[User: {strip_html(msg['content'][:200])}]")
+
+        if middle_previews:
+            summary_parts.append("Earlier actions (summarized):")
+            summary_parts.extend(middle_previews)
+
+        summary_msg = {"role": "system", "content": "\n".join(summary_parts)}
+
+        # 4. Recent tail — safe extraction that preserves tool call pairs
+        recent = self.history[-keep_last:] if len(self.history) > keep_last else self.history[len(preserved):]
+
+        # If the cutoff split an assistant+tool_calls from its results, fix it
+        if recent and recent[-1].get("role") == "assistant" and recent[-1].get("tool_calls"):
+            call_ids = {tc.get("id") for tc in recent[-1]["tool_calls"] if tc.get("id")}
+            for msg in self.history:
+                if msg.get("role") == "tool" and msg.get("tool_call_id") in call_ids:
+                    if msg not in recent:
+                        recent.append(msg)
 
         compressed = preserved.copy()
-        compressed.append(summary_message)
-        compressed.extend(middle)
+        compressed.append(summary_msg)
         compressed.extend(recent)
-
         return compressed
 
     # ── Main Loop ──
 
-    async def run(self, user_msg, model):
+    async def _run_impl(self, user_msg, model):
         await self.emit_status("Agent starting...")
         await self.resolve_tools()
 
@@ -966,10 +1310,48 @@ class AgentLoopEngine:
             {"role": "user", "content": user_msg},
         ]
 
+        # Inject user-uploaded files into the conversation
+        uploaded_files = self.metadata.get("__files__", [])
+        if uploaded_files:
+            file_descriptions = []
+            for f in uploaded_files:
+                if isinstance(f, dict):
+                    fname = f.get("filename", "") or f.get("id", "")
+                    ftype = f.get("content_type", "") or f.get("type", "")
+                    file_descriptions.append(f"- {fname} ({ftype})" if ftype else f"- {fname}")
+            if file_descriptions:
+                self.history.append({
+                    "role": "system",
+                    "content": f"The user has attached the following files:\n" + "\n".join(file_descriptions),
+                })
+
         recent_calls = []
         output_parts = []
 
-        while self.loop_count < self.valves.MAX_ITERATIONS:
+        while True:
+            if self.loop_count >= self.valves.MAX_ITERATIONS:
+                output_parts.append(f"\n[WARN] Max iterations ({self.valves.MAX_ITERATIONS}) reached.")
+                should_continue = False
+                if self.event_call and not (self.user_valves and getattr(self.user_valves, "YOLO_MODE", False)):
+                    try:
+                        js = self._build_iteration_limit_js(self.loop_count, self.valves.MAX_ITERATIONS)
+                        raw = await self.event_call({"type": "execute", "data": {"code": js}})
+                        raw_str = raw if isinstance(raw, str) else (raw.get("result") or raw.get("value") or "{}") if raw else "{}"
+                        try:
+                            res = json.loads(raw_str) if isinstance(raw_str, str) and raw_str.startswith("{") else {}
+                        except (json.JSONDecodeError, AttributeError):
+                            res = {}
+                        should_continue = res.get("action") == "continue"
+                    except Exception as e:
+                        logger.warning(f"Iteration limit dialog failed: {e}")
+                if should_continue:
+                    self.loop_count = 0
+                    await self.emit_status("Continuing after iteration limit...")
+                    continue
+                await self.emit_task_update(finalize_tasks=True)
+                await self.emit_status("Max iterations", done=True)
+                return self._format_output(output_parts)
+
             self.loop_count += 1
             recent_calls = recent_calls[-30:]
 
@@ -988,7 +1370,17 @@ class AgentLoopEngine:
 
             await self.emit_status(f"{icon} {name} -- step {self.loop_count}/{self.valves.MAX_ITERATIONS}")
 
+            if self.is_silent and self.phase == self.PHASE_EXECUTE and not self._working_shown:
+                self._working_shown = True
+                output_parts.append(
+                    "<div style='display:flex;align-items:center;gap:8px;'>"
+                    "<span style='animation:pulse 1.5s infinite;'>⚙️</span> Working..."
+                    "</div>"
+                )
+
             self.history = self._manage_context_window(self.history)
+            # Strip system messages (including [AGENT_STATE] bookkeeping) from LLM context
+            # Only the first message (system prompt) is kept
             call_messages = [self.history[0]] + [m for m in self.history[1:] if m.get("role") != "system"]
 
             completion_body = {
@@ -1011,17 +1403,19 @@ class AgentLoopEngine:
             # ── Stream LLM response ──
             tc_dict = {}
             content_chunks = []
+            reasoning_chunks = []
 
             async for event in stream_completion(self.request, completion_body, self.user):
                 etype = event.get("type")
                 if etype == "error":
                     output_parts.append(f"\n[ERROR] LLM Error: {event.get('text', 'Unknown')}")
+                    await self.emit_task_update(finalize_tasks=True)
                     await self.emit_status("Error", done=True)
-                    return "".join(output_parts)
+                    return self._format_output(output_parts)
                 elif etype == "content":
                     content_chunks.append(event.get("text", ""))
                 elif etype == "reasoning":
-                    pass
+                    reasoning_chunks.append(event.get("text", ""))
                 elif etype == "tool_calls":
                     for tc in event.get("data", []):
                         idx = tc.get("index", 0)
@@ -1038,11 +1432,37 @@ class AgentLoopEngine:
 
             content = strip_thinking("".join(content_chunks).strip())
 
+            if reasoning_chunks:
+                reasoning_text = "".join(reasoning_chunks).strip()
+                if reasoning_text:
+                    output_parts.append(
+                        f'<details type="reasoning"><summary>Thinking</summary>{reasoning_text}</details>'
+                    )
+
             if not tc_dict:
-                if content:
-                    output_parts.append(content)
-                await self.emit_status("Done", done=True)
-                return "".join(output_parts)
+                # Try XML tool call rescue for hallucinated <ToolCall> blocks
+                xml_calls = extract_xml_tool_calls(content or "")
+                if xml_calls:
+                    tc_dict = {tc["index"]: tc for tc in xml_calls}
+                else:
+                    # No tool calls and no XML rescue — check for unfinished tasks
+                    if content and self.task_list and len(self.completed_tasks) < len(self.task_list):
+                        # Tasks remain: inject continuation prompt instead of terminating
+                        self.history.append({
+                            "role": "assistant",
+                            "content": content,
+                        })
+                        self.history.append({
+                            "role": "user",
+                            "content": "SYSTEM: You produced text but did not call any tools. You have unfinished tasks. Continue working by calling the appropriate tool. Do NOT just describe what to do — call a tool.",
+                        })
+                        output_parts.append(f"\n[WARN] No tool call produced. Re-prompting to continue.\n")
+                        continue
+                    if content:
+                        output_parts.append(content)
+                    await self.emit_task_update(finalize_tasks=True)
+                    await self.emit_status("Done", done=True)
+                    return self._format_output(output_parts)
 
             tool_calls_list = list(tc_dict.values())
             self.history.append({
@@ -1066,8 +1486,9 @@ class AgentLoopEngine:
                     self.consecutive_json_errors += 1
                     if self.consecutive_json_errors >= 3:
                         output_parts.append("\n[ERROR] JSON parse failed 3 times. Stopping.")
+                        await self.emit_task_update(finalize_tasks=True)
                         await self.emit_status("JSON error", done=True)
-                        return "".join(output_parts)
+                        return self._format_output(output_parts)
                     args = {}
                     self.history.append({
                         "role": "tool",
@@ -1082,11 +1503,13 @@ class AgentLoopEngine:
                     result = args.get("result", "Task complete.")
                     success = args.get("success", True)
                     icon = "[OK]" if success else "[FAIL]"
+                    self._save_state_to_history()
+                    await self.emit_task_update(finalize_tasks=True)
                     if content:
                         output_parts.append(content + "\n\n")
                     output_parts.append(f"{icon} **Finished:** {result}")
                     await self.emit_status("Finished", done=True)
-                    return "".join(output_parts)
+                    return self._format_output(output_parts)
 
                 # ── Handle replan ──
                 if tool_name == "replan":
@@ -1094,7 +1517,7 @@ class AgentLoopEngine:
                     updated = args.get("updated_tasks", "")
                     mode = args.get("mode", "soft")
 
-                    if not updated or not [t.strip() for t in updated.splitlines() if t.strip()]:
+                    if not updated or not self._extract_task_list(updated):
                         # No new tasks provided -- check if any remaining tasks exist
                         failed_task_names = {f["task"] for f in self.failed_tasks}
                         remaining = [
@@ -1103,10 +1526,12 @@ class AgentLoopEngine:
                         ]
                         if not remaining:
                             output_parts.append(f"\n[WARN] Replan requested but no remaining tasks. Terminating.")
+                            await self.emit_task_update(finalize_tasks=True)
                             await self.emit_status("No tasks remaining", done=True)
-                            return "".join(output_parts)
+                            return self._format_output(output_parts)
 
                     recent_calls = []
+                    self._consecutive_tool_misses.clear()
                     result_json = await self._tool_replan(reason=reason, updated_tasks=updated, mode=mode)
                     self.history.append({
                         "role": "tool",
@@ -1147,6 +1572,9 @@ class AgentLoopEngine:
                         "tool_call_id": call_id,
                         "name": tool_name,
                     })
+                    # Auto-transition to REVIEW if all tasks are done or failed
+                    if self.failed_tasks and len(self.completed_tasks) + len(self.failed_tasks) >= len(self.task_list):
+                        self._transition_to(self.PHASE_REVIEW)
                     continue
 
                 # ── Handle fix_plan ──
@@ -1155,7 +1583,7 @@ class AgentLoopEngine:
                     result_data = json.loads(result_json)
                     if result_data.get("fix_plan"):
                         output_parts.append(f"\n[FIX] **Plan fixed:** {result_data.get('reason', '')}\n")
-                        output_parts.append(f"[FIX] Appended tasks: {', '.join(result_data.get('appended_tasks', []))}\n")
+                        output_parts.append(f"[FIX] Inserted tasks: {', '.join(result_data.get('inserted_tasks', []))}\n")
                     else:
                         output_parts.append(f"\n[FIX] **Fix failed:** {result_data.get('error', 'Unknown error')}\n")
                     self.history.append({
@@ -1171,8 +1599,7 @@ class AgentLoopEngine:
                 # ── Handle confirm_plan ──
                 if tool_name == "confirm_plan":
                     plan_text = args.get("plan", content or "")
-                    if not self.task_list:
-                        self.task_list = self._extract_task_list(plan_text or content or "")
+                    self.task_list = self._extract_task_list(plan_text or content or "")
                     result_json = await self._tool_confirm_plan(**args)
                     result_data = json.loads(result_json)
 
@@ -1188,18 +1615,26 @@ class AgentLoopEngine:
                             "role": "user",
                             "content": f"SYSTEM: User provided feedback on the proposed plan: {feedback}. Please revise the plan and call confirm_plan again with the updated plan.",
                         })
-                        output_parts.append(f"\n[PLAN] Plan rejected \u2014 user feedback: {feedback}\n")
+                        output_parts.append(f"\n[PLAN] Plan rejected — user feedback: {feedback}\n")
                         await self.emit_status("[PLAN] Revising plan based on feedback...")
                         continue
+                    elif result_data.get("action") == "cancel":
+                        output_parts.append("\n[PLAN] Plan cancelled by user.\n")
+                        await self.emit_task_update(finalize_tasks=True)
+                        await self.emit_status("Plan cancelled", done=True)
+                        return self._format_output(output_parts)
                     else:
                         self._transition_to(self.PHASE_EXECUTE)
+                        self._save_state_to_history()
+                        await self.emit_task_update()
                         self.history.append({
                             "role": "tool",
                             "content": result_json,
                             "tool_call_id": call_id,
                             "name": tool_name,
                         })
-                        output_parts.append(f"\n[PLAN] Plan approved. Moving to execution.\n")
+                        task_summary = "\n".join(f"  {i+1}. {t}" for i, t in enumerate(self.task_list))
+                        output_parts.append(f"\n[PLAN] Plan approved. Moving to execution.\n\n{task_summary}\n")
                         continue
 
                 # ── Duplicate detection ──
@@ -1210,8 +1645,37 @@ class AgentLoopEngine:
                     recent_calls.append(sig)
                     await self.emit_status(f"Running: {tool_name}...")
                     result_str, result_files = await self._execute_tool(tool_name, args, call_id)
+                    # Deduplicate files by id/file_id/url
+                    for f in result_files:
+                        fid = (f.get("id") or f.get("file_id") or f.get("url") or "") if isinstance(f, dict) else ""
+                        if fid and fid not in self._seen_file_ids:
+                            self._seen_file_ids.add(fid)
                     truncation_limit = self._get_truncation_limit()
                     tool_result = smart_truncate(result_str, truncation_limit)
+
+                    # ── Consecutive tool-not-found tracking ──
+                    if "not found in current phase" in tool_result:
+                        self._consecutive_tool_misses[tool_name] = self._consecutive_tool_misses.get(tool_name, 0) + 1
+                        if self._consecutive_tool_misses[tool_name] >= 3:
+                            output_parts.append(
+                                f"<details><summary>⚠️ Tool Loop Break</summary>"
+                                f"Tool `{tool_name}` unavailable after 3 consecutive attempts. Forcing replan."
+                                f"</details>"
+                            )
+                            replan_result = await self._tool_replan(
+                                reason=f"Tool '{tool_name}' unavailable after 3 consecutive attempts",
+                                updated_tasks="",
+                                mode="soft",
+                            )
+                            self.history.append({
+                                "role": "tool",
+                                "content": replan_result,
+                                "tool_call_id": call_id,
+                                "name": "replan",
+                            })
+                            break
+                    else:
+                        self._consecutive_tool_misses.clear()
 
                 # Render
                 args_preview = smart_truncate(json.dumps(args, ensure_ascii=False), 200)
@@ -1237,11 +1701,65 @@ class AgentLoopEngine:
             if self.phase == self.PHASE_EXECUTE and self.completed_tasks and len(self.completed_tasks) >= len(self.task_list):
                 self._transition_to(self.PHASE_REVIEW)
 
-        output_parts.append(f"\n[WARN] Max iterations ({self.valves.MAX_ITERATIONS}) reached.")
-        await self.emit_status("Max iterations", done=True)
-        return "".join(output_parts)
+    async def run(self, user_msg, model):
+        try:
+            result = await self._run_impl(user_msg, model)
+            return result
+        except GeneratorExit:
+            # NOTE: GeneratorExit can only be raised if pipe() becomes an async generator.
+            # Currently pipe() returns a string, so this catch will not be triggered by
+            # OpenWebUI's normal cancellation mechanism. CancelledError handles asyncio cancellation.
+            logger.info("Agent loop cancelled by user (GeneratorExit).")
+            self._save_state_to_history()
+            await self.emit_task_update(finalize_tasks=True)
+            await self.emit_status("Cancelled", done=True)
+            raise
+        except asyncio.CancelledError:
+            logger.info("Agent loop cancelled (CancelledError).")
+            self._save_state_to_history()
+            await self.emit_task_update(finalize_tasks=True)
+            await self.emit_status("Cancelled", done=True)
+            raise
+        except Exception as e:
+            logger.error(f"Agent loop error: {e}", exc_info=True)
+            await self.emit_task_update(finalize_tasks=True)
+            return f"\n[ERROR] Agent loop failed: {e}"
+        finally:
+            self._seen_file_ids.clear()
 
     def _extract_task_list(self, text):
+        if not text:
+            return ["Complete the user's request"]
+
+        # Try JSON parsing first: {"tasks": ["task1", "task2"]} or ["task1", "task2"]
+        try:
+            data = json.loads(text)
+            if isinstance(data, dict) and "tasks" in data:
+                tasks = [t.get("description", t) if isinstance(t, dict) else str(t) for t in data["tasks"]]
+                return tasks if tasks else ["Complete the user's request"]
+            if isinstance(data, list):
+                tasks = [t.get("description", t) if isinstance(t, dict) else str(t) for t in data]
+                return tasks if tasks else ["Complete the user's request"]
+        except (json.JSONDecodeError, TypeError, AttributeError):
+            pass
+
+        # Try to extract a JSON block from within the text
+        json_match = re.search(r'\{[^{}]*"tasks"\s*:\s*\[.*?\]\s*\}', text, re.DOTALL)
+        if not json_match:
+            json_match = re.search(r'\[\s*\{.*?\}\s*\]', text, re.DOTALL)
+        if json_match:
+            try:
+                data = json.loads(json_match.group(0))
+                if isinstance(data, dict) and "tasks" in data:
+                    tasks = [t.get("description", t) if isinstance(t, dict) else str(t) for t in data["tasks"]]
+                    return tasks if tasks else ["Complete the user's request"]
+                if isinstance(data, list):
+                    tasks = [t.get("description", t) if isinstance(t, dict) else str(t) for t in data]
+                    return tasks if tasks else ["Complete the user's request"]
+            except (json.JSONDecodeError, TypeError, AttributeError):
+                pass
+
+        # Fallback: regex extraction of numbered/bulleted items
         tasks = []
         for line in text.split("\n"):
             line = line.strip()
@@ -1250,7 +1768,13 @@ class AgentLoopEngine:
                 tasks.append(m.group(1).strip())
             elif re.match(r"^[-*]\s+", line):
                 tasks.append(re.sub(r"^[-*]\s+", "", line).strip())
-        return tasks if tasks else ["Complete the user's request"]
+        if not tasks:
+            summary = text.strip().split("\n")[0].strip()[:120]
+            if summary:
+                tasks = [summary]
+            else:
+                tasks = ["Complete the user's request"]
+        return tasks
 
 
 # ──────────────────────────────────────────────────────────────────
@@ -1260,7 +1784,7 @@ class AgentLoopEngine:
 class AgentValves(BaseModel):
     AGENT_MODEL: str = Field(
         default="",
-        description="Model ID for the agent loop. Leave blank to use the selected model. Must support function calling."
+        description="Model ID for the agent loop. Leave blank to use the selected model. The model MUST support function calling (tool use). Examples: gpt-4o, claude-3.5-sonnet, gemini-2.0-flash."
     )
     MAX_ITERATIONS: int = Field(
         default=24,
@@ -1270,6 +1794,10 @@ class AgentValves(BaseModel):
         default=4200,
         description="Max characters for tool results before truncation."
     )
+    TOOL_TIMEOUT: int = Field(
+        default=90,
+        description="Timeout in seconds for individual tool execution. Set to 0 to disable."
+    )
 
     # ── Per-phase tool allowlists (comma-separated tool names) ──
     PLAN_TOOLS: str = Field(
@@ -1277,7 +1805,8 @@ class AgentValves(BaseModel):
         description=(
             "Comma-separated tool names allowed in PLAN phase. "
             "Leave EMPTY to allow ALL tools. "
-            "Example: confirm_plan, read_file, search_web, read_github, search_github"
+            "Recommended: read-only tools like read_file, search_web, get_github_file_contents. "
+            "Example: confirm_plan, read_file, search_web"
         )
     )
     EXECUTE_TOOLS: str = Field(
@@ -1293,7 +1822,8 @@ class AgentValves(BaseModel):
         description=(
             "Comma-separated tool names allowed in REVIEW phase. "
             "Leave EMPTY to allow ALL tools. "
-            "Typically empty or minimal -- review should use few tools."
+            "Recommended: minimal or empty — review should primarily use internal tools (terminate, fix_plan, replan). "
+            "Example: read_file"
         )
     )
 
@@ -1310,15 +1840,15 @@ class AgentValves(BaseModel):
     # ── Custom system prompt overrides ──
     PLAN_PROMPT: str = Field(
         default="",
-        description="Custom system prompt for PLAN phase. Leave empty for default. Use {tool_names} placeholder."
+        description="Custom system prompt for PLAN phase. Leave empty for default. Available placeholders: {tool_names}."
     )
     EXECUTE_PROMPT: str = Field(
         default="",
-        description="Custom system prompt for EXECUTE phase. Leave empty for default. Use {tool_names} and {task_state} placeholders."
+        description="Custom system prompt for EXECUTE phase. Leave empty for default. Available placeholders: {tool_names}, {task_state}."
     )
     REVIEW_PROMPT: str = Field(
         default="",
-        description="Custom system prompt for REVIEW phase. Leave empty for default. Use {goal}, {task_state}, and {tool_names} placeholders."
+        description="Custom system prompt for REVIEW phase. Leave empty for default. Available placeholders: {goal}, {task_state}, {tool_names}."
     )
 
 
@@ -1330,6 +1860,10 @@ class AgentUserValves(BaseModel):
     YOLO_MODE: bool = Field(
         default=False,
         description="Skip all user confirmations. Auto-approve plans and ignore iteration limits.",
+    )
+    SILENT_MODE: bool = Field(
+        default=False,
+        description="If True, show only plan approvals, final results, and errors. Hide tool call details, reasoning blocks, and intermediate status messages.",
     )
 
 
@@ -1344,7 +1878,8 @@ class Pipe:
         self.user_valves = AgentUserValves()
 
     def pipes(self):
-        return [{"id": "agent-loop", "name": "Agent Loop"}]
+        model_suffix = f" ({self.valves.AGENT_MODEL})" if self.valves.AGENT_MODEL else ""
+        return [{"id": "agent-loop", "name": f"Agent Loop{model_suffix}"}]
 
     async def pipe(
         self,
@@ -1368,10 +1903,16 @@ class Pipe:
         user_id = __user__.get("id") if isinstance(__user__, dict) else ""
         user_obj = await Users.get_user_by_id(user_id) if user_id else None
 
-        user_valves = (
-            __user__.pop("valves", None) if isinstance(__user__, dict)
+        user_valves_raw = (
+            __user__.get("valves", None) if isinstance(__user__, dict)
             else getattr(__user__, "valves", None)
-        ) or self.user_valves
+        )
+        if user_valves_raw and isinstance(user_valves_raw, dict):
+            user_valves = AgentUserValves(**user_valves_raw)
+        elif user_valves_raw and isinstance(user_valves_raw, AgentUserValves):
+            user_valves = user_valves_raw
+        else:
+            user_valves = self.user_valves
 
         model = self.valves.AGENT_MODEL or body.get("model", "")
 
@@ -1402,5 +1943,8 @@ class Pipe:
             valves=self.valves,
             user_valves=user_valves,
         )
+
+        # Restore state from previous [AGENT_STATE] messages in chat history
+        engine._restore_state_from_messages(messages)
 
         return await engine.run(user_msg, model)
