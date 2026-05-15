@@ -26,7 +26,7 @@ OpenWebUI plugins: tools, pipelines, and prompts that extend [Open WebUI](https:
 
 ## Pipelines
 
-- **`agent_loop.py`** (v2.3.0) — single-model Plan→Execute→Review→Replan loop with per-phase tool filtering via Valves. Requires `open-webui>=0.9.1`.
+- **`helix_agent.py`** — Helix Agent: single-model Plan→Execute→Review→Replan loop with per-phase tool filtering via Valves. Requires `open-webui>=0.9.1`.
 - **`planner_v3.py`** (v3.10.3, by Haervwe) — multi-agent orchestrator with subagents, MCP support, plan approval UI. Requires `open_webui>=0.9.1`.
 - **`agent-pipeline-deprecated.py`** — legacy v0.24.0 pipeline. Do not modify unless fixing a bug.
 

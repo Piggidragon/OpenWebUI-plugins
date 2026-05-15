@@ -1,9 +1,9 @@
 """
-title: Agent Loop
+title: Helix Agent
 author: Piggidragon
 version: 4.4.0
 description: >
-  OpenWebUI-native Agent Loop with modular per-phase tool control.
+  Helix Agent — OpenWebUI-native agent loop with modular per-phase tool control.
 
   Architecture:
   - SINGLE model loop (Plan -> Execute -> Review -> Replan -> Execute...)
@@ -22,6 +22,7 @@ requirements: open-webui>=0.9.1
 """
 
 import asyncio
+import html
 import inspect
 import json
 import logging
@@ -319,8 +320,8 @@ def _comma_list(val: str) -> List[str]:
 #  AGENT LOOP ENGINE
 # ──────────────────────────────────────────────────────────────────
 
-class AgentLoopEngine:
-    """Single-model agent loop with per-phase tool filtering."""
+class HelixAgentEngine:
+    """Helix Agent — single-model agent loop with per-phase tool filtering."""
 
     PHASE_PLAN = "plan"
     PHASE_EXECUTE = "execute"
@@ -359,20 +360,22 @@ class AgentLoopEngine:
         self._consecutive_tool_misses: Dict[str, int] = {}
         self._seen_file_ids: Set[str] = set()
         self._state_restored = False
-        self._working_shown = False
+        self._output_parts = []
         self.loop_count = 0
         self.goal = ""
+        self._stream_queue = None
+        self._turn_buffer: list[str] = []
+        self._flush_task: Optional[asyncio.Task] = None
 
     @property
     def is_silent(self):
         return getattr(self.user_valves, "SILENT_MODE", False)
 
-    def _format_output(self, parts):
-        """Join output parts. In silent mode, suppress intermediate execution noise."""
+    def _format_output(self):
         if not self.is_silent:
-            return "".join(parts)
+            return "".join(self._output_parts)
         filtered = []
-        for part in parts:
+        for part in self._output_parts:
             s = part.strip()
             if not s:
                 continue
@@ -438,6 +441,36 @@ class AgentLoopEngine:
                 await self.event_emitter({"type": "status", "data": {"description": msg, "done": done}})
             except Exception:
                 pass
+
+    async def emit_output(self, text):
+        self._output_parts.append(text)
+        if self.is_silent:
+            return
+        self._turn_buffer.append(text)
+        if self._flush_task and not self._flush_task.done():
+            self._flush_task.cancel()
+        self._flush_task = asyncio.create_task(self._schedule_flush(0.3))
+
+    async def _schedule_flush(self, delay: float):
+        try:
+            await asyncio.sleep(delay)
+            await self._flush_turn_buffer()
+        except asyncio.CancelledError:
+            pass
+
+    async def _flush_turn_buffer(self):
+        if not self._turn_buffer:
+            return
+        combined = "\n\n".join(self._turn_buffer)
+        # Ensure blank line padding so OpenWebUI's \n join never swallows <details>
+        if not combined.startswith("\n\n"):
+            combined = "\n\n" + combined
+        if not combined.endswith("\n\n"):
+            combined = combined + "\n\n"
+        self._turn_buffer.clear()
+        q = getattr(self, "_stream_queue", None)
+        if q is not None:
+            await q.put(combined)
 
     # ── Tool Resolution ──
 
@@ -1265,7 +1298,7 @@ class AgentLoopEngine:
 
     # ── Main Loop ──
 
-    async def _run_impl(self, user_msg, model):
+    async def _run_impl(self, user_msg, last_user_msg_raw, model):
         await self.emit_status("Agent starting...")
         await self.resolve_tools()
 
@@ -1300,30 +1333,15 @@ class AgentLoopEngine:
             system_prompt = self._build_system_prompt()
             self.history = [
                 {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_msg},
+                last_user_msg_raw if last_user_msg_raw else {"role": "user", "content": user_msg},
             ]
 
-        # Inject user-uploaded files into the conversation
-        uploaded_files = self.metadata.get("__files__", [])
-        if uploaded_files:
-            file_descriptions = []
-            for f in uploaded_files:
-                if isinstance(f, dict):
-                    fname = f.get("filename", "") or f.get("id", "")
-                    ftype = f.get("content_type", "") or f.get("type", "")
-                    file_descriptions.append(f"- {fname} ({ftype})" if ftype else f"- {fname}")
-            if file_descriptions:
-                self.history.append({
-                    "role": "system",
-                    "content": f"The user has attached the following files:\n" + "\n".join(file_descriptions),
-                })
-
         recent_calls = []
-        output_parts = []
+        self._output_parts = []
 
         while True:
             if self.loop_count >= self.valves.MAX_ITERATIONS:
-                output_parts.append(f"\n[WARN] Max iterations ({self.valves.MAX_ITERATIONS}) reached.")
+                await self.emit_output(f"\n[WARN] Max iterations ({self.valves.MAX_ITERATIONS}) reached.")
                 should_continue = False
                 if self.event_call and not (self.user_valves and getattr(self.user_valves, "YOLO_MODE", False)):
                     try:
@@ -1343,7 +1361,7 @@ class AgentLoopEngine:
                     continue
                 await self.emit_task_update(finalize_tasks=True)
                 await self.emit_status("Max iterations", done=True)
-                return self._format_output(output_parts)
+                return self._format_output()
 
             self.loop_count += 1
             recent_calls = recent_calls[-30:]
@@ -1362,6 +1380,8 @@ class AgentLoopEngine:
             name = phase_name.get(self.phase, "Loop")
 
             await self.emit_status(f"{icon} {name} -- step {self.loop_count}/{self.valves.MAX_ITERATIONS}")
+            if not self.is_silent:
+                await self.emit_output(f"\n### {icon} Loop {self.loop_count}\n")
 
             self.history = self._manage_context_window(self.history)
             # Strip system messages (including [AGENT_STATE] bookkeeping) from LLM context
@@ -1376,14 +1396,12 @@ class AgentLoopEngine:
                 "metadata": self.pipe_metadata,
             }
 
-            has_builtin = any(t.get("type") == "builtin" for t in self.phase_tools_dict.values())
-            if has_builtin and self.phase_tools_specs:
-                try:
-                    completion_body["messages"] = await add_file_context(
-                        copy.deepcopy(call_messages), self.chat_id, self.user
-                    )
-                except Exception:
-                    pass
+            try:
+                completion_body["messages"] = await add_file_context(
+                    copy.deepcopy(call_messages), self.chat_id, self.user
+                )
+            except Exception:
+                pass
 
             # ── Stream LLM response ──
             tc_dict = {}
@@ -1393,10 +1411,10 @@ class AgentLoopEngine:
             async for event in stream_completion(self.request, completion_body, self.user):
                 etype = event.get("type")
                 if etype == "error":
-                    output_parts.append(f"\n[ERROR] LLM Error: {event.get('text', 'Unknown')}")
+                    await self.emit_output(f"\n[ERROR] LLM Error: {event.get('text', 'Unknown')}")
                     await self.emit_task_update(finalize_tasks=True)
                     await self.emit_status("Error", done=True)
-                    return self._format_output(output_parts)
+                    return self._format_output()
                 elif etype == "content":
                     content_chunks.append(event.get("text", ""))
                 elif etype == "reasoning":
@@ -1420,8 +1438,8 @@ class AgentLoopEngine:
             if reasoning_chunks:
                 reasoning_text = "".join(reasoning_chunks).strip()
                 if reasoning_text:
-                    output_parts.append(
-                        f'<details type="reasoning"><summary>Thinking</summary>{reasoning_text}</details>'
+                    await self.emit_output(
+                        f'\n\n\u003cdetails type="reasoning"\u003e\u003csummary\u003eThinking\u003c/summary\u003e{reasoning_text}\u003c/details\u003e\n\n'
                     )
 
             if not tc_dict:
@@ -1441,13 +1459,17 @@ class AgentLoopEngine:
                             "role": "user",
                             "content": "SYSTEM: You produced text but did not call any tools. You have unfinished tasks. Continue working by calling the appropriate tool. Do NOT just describe what to do — call a tool.",
                         })
-                        output_parts.append(f"\n[WARN] No tool call produced. Re-prompting to continue.\n")
+                        await self.emit_output(f"\n[WARN] No tool call produced. Re-prompting to continue.\n")
                         continue
                     if content:
-                        output_parts.append(content)
+                        if not self.is_silent:
+                            await self.emit_output("\n\n---\n\n**Ergebnis**\n\n")
+                        await self.emit_output(content)
+                        if not self.is_silent:
+                            await self.emit_output("\n\n---\n")
                     await self.emit_task_update(finalize_tasks=True)
                     await self.emit_status("Done", done=True)
-                    return self._format_output(output_parts)
+                    return self._format_output()
 
             tool_calls_list = list(tc_dict.values())
             self.history.append({
@@ -1470,10 +1492,10 @@ class AgentLoopEngine:
                 except json.JSONDecodeError:
                     self.consecutive_json_errors += 1
                     if self.consecutive_json_errors >= 3:
-                        output_parts.append("\n[ERROR] JSON parse failed 3 times. Stopping.")
+                        await self.emit_output("\n[ERROR] JSON parse failed 3 times. Stopping.")
                         await self.emit_task_update(finalize_tasks=True)
                         await self.emit_status("JSON error", done=True)
-                        return self._format_output(output_parts)
+                        return self._format_output()
                     args = {}
                     self.history.append({
                         "role": "tool",
@@ -1491,10 +1513,10 @@ class AgentLoopEngine:
                     self._save_state_to_history()
                     await self.emit_task_update(finalize_tasks=True)
                     if content:
-                        output_parts.append(content + "\n\n")
-                    output_parts.append(f"{icon} **Finished:** {result}")
+                        await self.emit_output(content + "\n\n")
+                    await self.emit_output(f"{icon} **Finished:** {result}")
                     await self.emit_status("Finished", done=True)
-                    return self._format_output(output_parts)
+                    return self._format_output()
 
                 # ── Handle replan ──
                 if tool_name == "replan":
@@ -1510,10 +1532,10 @@ class AgentLoopEngine:
                             if t not in self.completed_tasks and t not in failed_task_names
                         ]
                         if not remaining:
-                            output_parts.append(f"\n[WARN] Replan requested but no remaining tasks. Terminating.")
+                            await self.emit_output(f"\n[WARN] Replan requested but no remaining tasks. Terminating.")
                             await self.emit_task_update(finalize_tasks=True)
                             await self.emit_status("No tasks remaining", done=True)
-                            return self._format_output(output_parts)
+                            return self._format_output()
 
                     recent_calls = []
                     self._consecutive_tool_misses.clear()
@@ -1525,7 +1547,7 @@ class AgentLoopEngine:
                         "name": tool_name,
                     })
                     mode_label = "soft" if mode == "soft" else "hard"
-                    output_parts.append(f"\n[RPLN] **Re-planning ({mode_label}):** {reason}\n")
+                    await self.emit_output(f"\n[RPLN] **Re-planning ({mode_label}):** {reason}\n")
                     await self.emit_status(f"[RPLN] Re-planning ({mode_label}): {reason}")
                     continue
 
@@ -1534,7 +1556,7 @@ class AgentLoopEngine:
                     result_json = await self._tool_complete_task(**args)
                     result_data = json.loads(result_json)
                     status_icon = "[OK]" if result_data.get("completed") else "[WARN]"
-                    output_parts.append(f"\n{status_icon} Task {args.get('index', '?')} marked complete.\n")
+                    await self.emit_output(f"\n{status_icon} Task {args.get('index', '?')} marked complete.\n")
                     self.history.append({
                         "role": "tool",
                         "content": result_json,
@@ -1550,7 +1572,7 @@ class AgentLoopEngine:
                     result_json = await self._tool_fail_task(**args)
                     result_data = json.loads(result_json)
                     status_icon = "[FAIL]" if result_data.get("failed") else "[WARN]"
-                    output_parts.append(f"\n{status_icon} Task {args.get('index', '?')} marked failed: {args.get('reason', '')}\n")
+                    await self.emit_output(f"\n{status_icon} Task {args.get('index', '?')} marked failed: {args.get('reason', '')}\n")
                     self.history.append({
                         "role": "tool",
                         "content": result_json,
@@ -1567,10 +1589,10 @@ class AgentLoopEngine:
                     result_json = await self._tool_fix_plan(**args)
                     result_data = json.loads(result_json)
                     if result_data.get("fix_plan"):
-                        output_parts.append(f"\n[FIX] **Plan fixed:** {result_data.get('reason', '')}\n")
-                        output_parts.append(f"[FIX] Inserted tasks: {', '.join(result_data.get('inserted_tasks', []))}\n")
+                        await self.emit_output(f"\n[FIX] **Plan fixed:** {result_data.get('reason', '')}\n")
+                        await self.emit_output(f"[FIX] Inserted tasks: {', '.join(result_data.get('inserted_tasks', []))}\n")
                     else:
-                        output_parts.append(f"\n[FIX] **Fix failed:** {result_data.get('error', 'Unknown error')}\n")
+                        await self.emit_output(f"\n[FIX] **Fix failed:** {result_data.get('error', 'Unknown error')}\n")
                     self.history.append({
                         "role": "tool",
                         "content": result_json,
@@ -1600,14 +1622,14 @@ class AgentLoopEngine:
                             "role": "user",
                             "content": f"SYSTEM: User provided feedback on the proposed plan: {feedback}. Please revise the plan and call confirm_plan again with the updated plan.",
                         })
-                        output_parts.append(f"\n[PLAN] Plan rejected — user feedback: {feedback}\n")
+                        await self.emit_output(f"\n[PLAN] Plan rejected — user feedback: {feedback}\n")
                         await self.emit_status("[PLAN] Revising plan based on feedback...")
                         continue
                     elif result_data.get("action") == "cancel":
-                        output_parts.append("\n[PLAN] Plan cancelled by user.\n")
+                        await self.emit_output("\n[PLAN] Plan cancelled by user.\n")
                         await self.emit_task_update(finalize_tasks=True)
                         await self.emit_status("Plan cancelled", done=True)
-                        return self._format_output(output_parts)
+                        return self._format_output()
                     else:
                         self._transition_to(self.PHASE_EXECUTE)
                         self._save_state_to_history()
@@ -1619,7 +1641,7 @@ class AgentLoopEngine:
                             "name": tool_name,
                         })
                         task_summary = "\n".join(f"  {i+1}. {t}" for i, t in enumerate(self.task_list))
-                        output_parts.append(f"\n[PLAN] Plan approved. Moving to execution.\n\n{task_summary}\n")
+                        await self.emit_output(f"\n[PLAN] Plan approved. Moving to execution.\n\n{task_summary}\n")
                         continue
 
                 # ── Duplicate detection ──
@@ -1642,7 +1664,7 @@ class AgentLoopEngine:
                     if "not found in current phase" in tool_result:
                         self._consecutive_tool_misses[tool_name] = self._consecutive_tool_misses.get(tool_name, 0) + 1
                         if self._consecutive_tool_misses[tool_name] >= 3:
-                            output_parts.append(
+                            await self.emit_output(
                                 f"<details><summary>⚠️ Tool Loop Break</summary>"
                                 f"Tool `{tool_name}` unavailable after 3 consecutive attempts. Forcing replan."
                                 f"</details>"
@@ -1666,14 +1688,18 @@ class AgentLoopEngine:
                 args_preview = smart_truncate(json.dumps(args, ensure_ascii=False), 200)
                 result_preview = smart_truncate(tool_result, 600)
                 phase_tag = phase_icons.get(self.phase, "[LOOP]")
+                # Render OpenWebUI-konformer Tool-Call-Block
+                args_json = html.escape(json.dumps(args, ensure_ascii=False))
+                result_json = html.escape(json.dumps({"result": tool_result}, ensure_ascii=False))
                 detail_block = (
-                    f'<details type="tool_calls">\n'
-                    f'<summary>{phase_tag} {tool_name}</summary>\n'
-                    f'<b>Args:</b> <code>{args_preview}</code>\n\n'
-                    f'<b>Result:</b> {result_preview}\n'
-                    f'</details>'
+                    f'\n\n\u003cdetails type="tool_calls" done="true" '
+                    f'id="{call_id}" name="{tool_name}" '
+                    f'arguments="{args_json}"\u003e\n'
+                    f'\u003csummary\u003e{tool_name}\u003c/summary\u003e\n'
+                    f'{result_json}\n'
+                    f'\u003c/details\u003e'
                 )
-                output_parts.append(f"\n{detail_block}\n")
+                await self.emit_output(detail_block)
 
                 self.history.append({
                     "role": "tool",
@@ -1686,9 +1712,9 @@ class AgentLoopEngine:
             if self.phase == self.PHASE_EXECUTE and self.completed_tasks and len(self.completed_tasks) >= len(self.task_list):
                 self._transition_to(self.PHASE_REVIEW)
 
-    async def run(self, user_msg, model):
+    async def run(self, user_msg, last_user_msg_raw, model):
         try:
-            result = await self._run_impl(user_msg, model)
+            result = await self._run_impl(user_msg, last_user_msg_raw, model)
             return result
         except GeneratorExit:
             # NOTE: GeneratorExit can only be raised if pipe() becomes an async generator.
@@ -1711,6 +1737,37 @@ class AgentLoopEngine:
             return f"\n[ERROR] Agent loop failed: {e}"
         finally:
             self._seen_file_ids.clear()
+
+    async def run_stream(self, user_msg, last_user_msg_raw, model):
+        """Run the Helix Agent loop and yield live text chunks to the caller.
+
+        In non-silent mode every emit_output() call is pushed into the
+        internal queue and yielded immediately so the chat sees the agent
+        working live.  The final return value of _run_impl is yielded only
+        in silent mode; otherwise it is already part of the stream.
+        """
+        self._stream_queue = asyncio.Queue()
+        loop_task = asyncio.create_task(
+            self._run_impl(user_msg, last_user_msg_raw, model)
+        )
+        try:
+            while not loop_task.done() or not self._stream_queue.empty():
+                try:
+                    chunk = await asyncio.wait_for(self._stream_queue.get(), timeout=0.1)
+                except asyncio.TimeoutError:
+                    continue
+                if chunk:
+                    yield chunk
+            result = await loop_task
+            if self.is_silent and result and result.strip():
+                yield result
+        except asyncio.CancelledError:
+            loop_task.cancel()
+            try:
+                await loop_task
+            except asyncio.CancelledError:
+                pass
+            raise
 
     def _extract_task_list(self, text):
         if not text:
@@ -1766,11 +1823,11 @@ class Pipe:
     class Valves(BaseModel):
         AGENT_MODEL: str = Field(
             default="",
-            description="Model ID for the agent loop. The model MUST support function calling (tool use). Examples: gpt-4o, claude-3.5-sonnet, gemini-2.0-flash."
+            description="Model ID for Helix Agent. The model MUST support function calling (tool use). Examples: gpt-4o, claude-3.5-sonnet, gemini-2.0-flash."
         )
         MAX_ITERATIONS: int = Field(
-            default=40,
-            description="Maximum agent loop iterations before stopping."
+            default=100,
+            description="Maximum Helix Agent iterations before stopping."
         )
         MAX_TOOL_RESULT_CHARS: int = Field(
             default=4200,
@@ -1840,7 +1897,7 @@ class Pipe:
 
     def pipes(self):
         model_suffix = f" ({self.valves.AGENT_MODEL})" if self.valves.AGENT_MODEL else ""
-        return [{"id": "agent-loop", "name": f"Agent Loop{model_suffix}"}]
+        return [{"id": "helix-agent", "name": f"Helix Agent{model_suffix}"}]
 
     async def pipe(
         self,
@@ -1856,7 +1913,7 @@ class Pipe:
         **kwargs,
     ):
         if __request__ is None:
-            raise TypeError("Agent Loop requires __request__.")
+            raise TypeError("Helix Agent requires __request__.")
 
         __metadata__ = __metadata__ or body.get("metadata", {})
 
@@ -1880,10 +1937,11 @@ class Pipe:
         model = self.valves.AGENT_MODEL or body.get("model", "")
 
         messages = body.get("messages", [])
-        user_msg = next(
-            (m.get("content", "") for m in reversed(messages) if m.get("role") == "user"),
-            "Unknown goal"
+        last_user_msg_raw = next(
+            (m for m in reversed(messages) if m.get("role") == "user"),
+            None
         )
+        user_msg = last_user_msg_raw.get("content", "Unknown goal") if last_user_msg_raw else "Unknown goal"
 
         metadata = {
             "__user__": __user__,
@@ -1896,7 +1954,7 @@ class Pipe:
             "__message_id__": __message_id__,
         }
 
-        engine = AgentLoopEngine(
+        engine = HelixAgentEngine(
             request=__request__,
             user=user_obj or __user__,
             body=body,
@@ -1910,4 +1968,13 @@ class Pipe:
         # Restore state from previous [AGENT_STATE] messages in chat history
         engine._restore_state_from_messages(messages)
 
-        return await engine.run(user_msg, model)
+        if engine.is_silent:
+            return await engine.run(user_msg, last_user_msg_raw, model)
+
+        async def _generator():
+            async for chunk in engine.run_stream(
+                user_msg, last_user_msg_raw, model
+            ):
+                yield chunk
+
+        return _generator()
