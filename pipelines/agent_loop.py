@@ -1136,9 +1136,6 @@ class AgentLoopEngine:
         """Transition to a new phase: update tools, system prompt, state."""
         self.phase = phase
         self._consecutive_tool_misses.clear()
-        if phase == self.PHASE_EXECUTE:
-            self._working_shown = False
-
         # Rebuild filtered tools for new phase
         self._filter_tools_for_phase(phase)
 
@@ -1373,14 +1370,6 @@ class AgentLoopEngine:
             name = phase_name.get(self.phase, "Loop")
 
             await self.emit_status(f"{icon} {name} -- step {self.loop_count}/{self.valves.MAX_ITERATIONS}")
-
-            if self.is_silent and self.phase == self.PHASE_EXECUTE and not self._working_shown:
-                self._working_shown = True
-                output_parts.append(
-                    "<div style='display:flex;align-items:center;gap:8px;'>"
-                    "<span style='animation:pulse 1.5s infinite;'>⚙️</span> Working..."
-                    "</div>"
-                )
 
             self.history = self._manage_context_window(self.history)
             # Strip system messages (including [AGENT_STATE] bookkeeping) from LLM context
@@ -1788,7 +1777,7 @@ class Pipe:
             description="Model ID for the agent loop. The model MUST support function calling (tool use). Examples: gpt-4o, claude-3.5-sonnet, gemini-2.0-flash."
         )
         MAX_ITERATIONS: int = Field(
-            default=24,
+            default=40,
             description="Maximum agent loop iterations before stopping."
         )
         MAX_TOOL_RESULT_CHARS: int = Field(
@@ -1835,16 +1824,16 @@ class Pipe:
         )
 
         PLAN_PROMPT: str = Field(
-            default="",
-            description="Custom system prompt for PLAN phase. Leave empty for default. Available placeholders: {tool_names}."
+            default=DEFAULT_PLAN_PROMPT,
+            description="System prompt for PLAN phase. Available placeholders: {tool_names}."
         )
         EXECUTE_PROMPT: str = Field(
-            default="",
-            description="Custom system prompt for EXECUTE phase. Leave empty for default. Available placeholders: {tool_names}, {task_state}."
+            default=DEFAULT_EXECUTE_PROMPT,
+            description="System prompt for EXECUTE phase. Available placeholders: {tool_names}, {task_state}."
         )
         REVIEW_PROMPT: str = Field(
-            default="",
-            description="Custom system prompt for REVIEW phase. Leave empty for default. Available placeholders: {goal}, {task_state}, {tool_names}."
+            default=DEFAULT_REVIEW_PROMPT,
+            description="System prompt for REVIEW phase. Available placeholders: {goal}, {task_state}, {tool_names}."
         )
 
     class UserValves(BaseModel):
@@ -1917,8 +1906,8 @@ class Pipe:
             "__user__": __user__,
             "__request__": __request__,
             "__metadata__": __metadata__,
-            "__event_emitter__": __event_emitter,
-            "__event_call__": __event_call,
+            "__event_emitter__": __event_emitter__,
+            "__event_call__": __event_call__,
             "__files__": __files__ or [],
             "__chat_id__": __chat_id__,
             "__message_id__": __message_id__,
@@ -1928,8 +1917,8 @@ class Pipe:
             request=__request__,
             user=user_obj or __user__,
             body=body,
-            event_emitter=__event_emitter,
-            event_call=__event_call,
+            event_emitter=__event_emitter__,
+            event_call=__event_call__,
             metadata=metadata,
             valves=self.valves,
             user_valves=user_valves,
