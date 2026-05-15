@@ -62,9 +62,9 @@ try:
 except Exception:
     HAS_DB_PERSISTENCE = False
 
-# ──────────────────────────────────────────────────────────────────
+# ------------------------------------------------------------------
 #  DEFAULT PROMPTS (overridable via Valves)
-# ──────────────────────────────────────────────────────────────────
+# ------------------------------------------------------------------
 
 DEFAULT_PLAN_PROMPT = """\
 You are in PLAN mode. Your job is to understand the user's request, gather context, \
@@ -164,9 +164,9 @@ Rules:
 """
 
 
-# ──────────────────────────────────────────────────────────────────
+# ------------------------------------------------------------------
 #  SSE STREAM PARSER
-# ──────────────────────────────────────────────────────────────────
+# ------------------------------------------------------------------
 
 async def stream_completion(request, body, user):
     """Stream OWUI completion, yielding structured events. Retries once on transient errors."""
@@ -265,9 +265,9 @@ async def stream_completion(request, body, user):
                 yield {"type": "content", "text": msg["content"]}
 
 
-# ──────────────────────────────────────────────────────────────────
+# ------------------------------------------------------------------
 #  HELPERS
-# ──────────────────────────────────────────────────────────────────
+# ------------------------------------------------------------------
 
 def smart_truncate(text, max_chars):
     if not text or len(text) <= max_chars:
@@ -341,9 +341,9 @@ def _comma_list(val: str) -> List[str]:
     return [x.strip() for x in val.split(",") if x.strip()]
 
 
-# ──────────────────────────────────────────────────────────────────
+# ------------------------------------------------------------------
 #  AGENT LOOP ENGINE
-# ──────────────────────────────────────────────────────────────────
+# ------------------------------------------------------------------
 
 class HelixAgentEngine:
     """Helix Agent - single-model agent loop with per-phase tool filtering."""
@@ -414,7 +414,7 @@ class HelixAgentEngine:
             filtered.append(part)
         return "".join(filtered)
 
-    # ── State Persistence (DB + File Attachments) ──
+    # -- State Persistence (DB + File Attachments) --
 
     async def _save_state_to_file(self) -> None:
         """Serialize agent state to a JSON file and bind it to the chat DB."""
@@ -769,7 +769,7 @@ class HelixAgentEngine:
                     features[fk] = bool(fv)
         return features
 
-    # ── Phase-aware Tool Filtering ──
+    # -- Phase-aware Tool Filtering --
 
     def _filter_tools_for_phase(self, phase: str):
         """Build phase_tools_dict from all_tools_dict based on Valves config."""
@@ -807,7 +807,7 @@ class HelixAgentEngine:
             if isinstance(t, dict) and "spec" in t
         ]
 
-    # ── Internal Tools ──
+    # -- Internal Tools --
 
     async def _tool_terminate(self, **kwargs):
         return json.dumps({"terminated": True, "result": kwargs.get("result", ""), "success": kwargs.get("success", True)})
@@ -1054,7 +1054,7 @@ class HelixAgentEngine:
         const existing = document.getElementById(OVERLAY_ID);
         if (existing) existing.remove();
 
-        // ── Overlay ──────────────────────────────────────────────────────────
+        // -- Overlay ----------------------------------------------------------
         const overlay = document.createElement('div');
         overlay.id = OVERLAY_ID;
         Object.assign(overlay.style, {{
@@ -1066,7 +1066,7 @@ class HelixAgentEngine:
           opacity: '0', transition: 'opacity 0.18s ease',
         }});
 
-        // ── Panel ──────────────────────────────────────────────────────────────
+        // -- Panel --------------------------------------------------------------
         const panel = document.createElement('div');
         Object.assign(panel.style, {{
           background: col.panel, border: '1px solid ' + col.border,
@@ -1079,7 +1079,7 @@ class HelixAgentEngine:
           transition: 'transform 0.22s cubic-bezier(0.34,1.56,0.64,1), opacity 0.18s ease',
         }});
 
-        // ── Header row ─────────────────────────────────────────────────────────
+        // -- Header row ---------------------------------------------------------
         const header = document.createElement('div');
         Object.assign(header.style, {{ display: 'flex', alignItems: 'flex-start', gap: '12px' }});
 
@@ -1107,7 +1107,7 @@ class HelixAgentEngine:
         header.appendChild(titleText);
         header.appendChild(badge);
 
-        // ── Scrollable task list ─────────────────────────────────────────────
+        // -- Scrollable task list ---------------------------------------------
         const scrollContainer = document.createElement('div');
         Object.assign(scrollContainer.style, {{
           overflowY: 'auto', flex: '1', display: 'flex', flexDirection: 'column', gap: '7px',
@@ -1155,7 +1155,7 @@ class HelixAgentEngine:
             scrollContainer.appendChild(card);
         }});
 
-        // ── Feedback input ─────────────────────────────────────────────────────
+        // -- Feedback input -----------------------------------------------------
         const inputContainer = document.createElement('div');
         Object.assign(inputContainer.style, {{ display: 'flex', flexDirection: 'column', gap: '8px' }});
         const inputLabel = document.createElement('div');
@@ -1179,7 +1179,7 @@ class HelixAgentEngine:
         inputContainer.appendChild(inputLabel);
         inputContainer.appendChild(feedbackInput);
 
-        // ── Footer buttons ───────────────────────────────────────────────────
+        // -- Footer buttons ---------------------------------------------------
         const footer = document.createElement('div');
         Object.assign(footer.style, {{ display: 'flex', gap: '8px', justifyContent: 'flex-end', marginTop: '2px' }});
 
@@ -1231,14 +1231,14 @@ class HelixAgentEngine:
         footer.appendChild(feedbackBtn);
         footer.appendChild(acceptBtn);
 
-        // ── Countdown ──────────────────────────────────────────────────────────
+        // -- Countdown ----------------------------------------------------------
         const countdown = document.createElement('div');
         countdown.textContent = '';
         Object.assign(countdown.style, {{
           fontSize: '11px', color: col.sub, textAlign: 'center', minHeight: '16px',
         }});
 
-        // ── Global keyboard handler ────────────────────────────────────────────
+        // -- Global keyboard handler --------------------------------------------
         function onKey(e) {{
           if (e.key === 'Escape') {{
             cancelBtn.click();
@@ -1251,7 +1251,7 @@ class HelixAgentEngine:
         }}
         document.addEventListener('keydown', onKey);
 
-        // ── Assemble DOM ─────────────────────────────────────────────────────
+        // -- Assemble DOM -----------------------------------------------------
         panel.appendChild(header);
         panel.appendChild(scrollContainer);
         panel.appendChild(inputContainer);
@@ -1261,7 +1261,7 @@ class HelixAgentEngine:
         document.body.appendChild(overlay);
         feedbackInput.focus();
 
-        // ── Entrance animation ───────────────────────────────────────────────
+        // -- Entrance animation -----------------------------------------------
         requestAnimationFrame(function() {{
           requestAnimationFrame(function() {{
             overlay.style.opacity = '1';
@@ -1272,7 +1272,7 @@ class HelixAgentEngine:
 
         let remaining = {timeout_s};
         function updateCountdown() {{
-            countdown.textContent = remaining > 0 ? 'Auto-accepting in ' + remaining + 's…' : '';
+            countdown.textContent = remaining > 0 ? 'Auto-accepting in ' + remaining + 's...' : '';
             if (remaining <= 0) {{ cleanup(); resolve(JSON.stringify({{action:'accept'}})); }}
         }}
         updateCountdown();
@@ -1280,7 +1280,7 @@ class HelixAgentEngine:
       }});
     }})();"""
 
-    # ── Iteration Limit UI ──
+    # -- Iteration Limit UI --
 
     def _build_iteration_limit_js(self, current_iter, max_iter, timeout_s: int = 300) -> str:
         """Build a Continue/Cancel modal for iteration limit reached."""
@@ -1292,7 +1292,7 @@ class HelixAgentEngine:
         const existing = document.getElementById(OVERLAY_ID);
         if (existing) existing.remove();
 
-        // ── Overlay ──────────────────────────────────────────────────────────
+        // -- Overlay ----------------------------------------------------------
         const overlay = document.createElement('div');
         overlay.id = OVERLAY_ID;
         Object.assign(overlay.style, {{
@@ -1304,7 +1304,7 @@ class HelixAgentEngine:
           opacity: '0', transition: 'opacity 0.18s ease',
         }});
 
-        // ── Panel ──────────────────────────────────────────────────────────────
+        // -- Panel --------------------------------------------------------------
         const panel = document.createElement('div');
         Object.assign(panel.style, {{
           background: col.panel, border: '1px solid ' + col.border,
@@ -1316,7 +1316,7 @@ class HelixAgentEngine:
           transition: 'transform 0.22s cubic-bezier(0.34,1.56,0.64,1), opacity 0.18s ease',
         }});
 
-        // ── Header row ─────────────────────────────────────────────────────────
+        // -- Header row ---------------------------------------------------------
         const header = document.createElement('div');
         Object.assign(header.style, {{ display: 'flex', alignItems: 'flex-start', gap: '12px' }});
 
@@ -1344,14 +1344,14 @@ class HelixAgentEngine:
         header.appendChild(titleText);
         header.appendChild(badge);
 
-        // ── Message ────────────────────────────────────────────────────────────
+        // -- Message ------------------------------------------------------------
         const msg = document.createElement('p');
         Object.assign(msg.style, {{
           margin: '0', color: col.sub, fontSize: '14px', lineHeight: '1.55', wordBreak: 'break-word',
         }});
         msg.textContent = `The agent has used {current_iter} of {max_iter} iterations. Continue for more?`;
 
-        // ── Footer buttons ───────────────────────────────────────────────────
+        // -- Footer buttons ---------------------------------------------------
         const footer = document.createElement('div');
         Object.assign(footer.style, {{ display: 'flex', gap: '8px', justifyContent: 'flex-end', marginTop: '2px' }});
 
@@ -1397,14 +1397,14 @@ class HelixAgentEngine:
         footer.appendChild(stopBtn);
         footer.appendChild(continueBtn);
 
-        // ── Countdown ──────────────────────────────────────────────────────────
+        // -- Countdown ----------------------------------------------------------
         const countdown = document.createElement('div');
         countdown.textContent = '';
         Object.assign(countdown.style, {{
           fontSize: '11px', color: col.sub, textAlign: 'center', minHeight: '16px',
         }});
 
-        // ── Global keyboard handler ────────────────────────────────────────────
+        // -- Global keyboard handler --------------------------------------------
         function onKey(e) {{
           if (e.key === 'Escape') {{
             stopBtn.click();
@@ -1418,7 +1418,7 @@ class HelixAgentEngine:
         }}
         document.addEventListener('keydown', onKey);
 
-        // ── Assemble DOM ─────────────────────────────────────────────────────
+        // -- Assemble DOM -----------------------------------------------------
         panel.appendChild(header);
         panel.appendChild(msg);
         panel.appendChild(footer);
@@ -1426,7 +1426,7 @@ class HelixAgentEngine:
         overlay.appendChild(panel);
         document.body.appendChild(overlay);
 
-        // ── Entrance animation ───────────────────────────────────────────────
+        // -- Entrance animation -----------------------------------------------
         requestAnimationFrame(function() {{
           requestAnimationFrame(function() {{
             overlay.style.opacity = '1';
@@ -1437,7 +1437,7 @@ class HelixAgentEngine:
 
         let remaining = {timeout_s};
         function updateCountdown() {{
-            countdown.textContent = remaining > 0 ? 'Auto-stopping in ' + remaining + 's…' : '';
+            countdown.textContent = remaining > 0 ? 'Auto-stopping in ' + remaining + 's...' : '';
             if (remaining <= 0) {{ cleanup(); resolve(JSON.stringify({{action:'stop'}})); }}
         }}
         updateCountdown();
@@ -1445,7 +1445,7 @@ class HelixAgentEngine:
       }});
     }})();"""
 
-    # ── Task State String ──
+    # -- Task State String --
 
     async def emit_task_update(self, finalize_tasks=False):
         """Emit task progress via Open WebUI's native task list UI.
@@ -1503,7 +1503,7 @@ class HelixAgentEngine:
                 lines.append(f"  - {f['task']}: {f['reason']}")
         return "\n".join(lines)
 
-    # ── File Context Preparation (planner_v3 parity) ──
+    # -- File Context Preparation (planner_v3 parity) --
 
     async def _apply_file_prep(self, msgs: list) -> list:
         """Mirror OWUI middleware: add_file_context then chat_completion_files_handler."""
@@ -1539,7 +1539,7 @@ class HelixAgentEngine:
 
         return prep
 
-    # ── File Persistence (tools → DB sync) ──
+    # -- File Persistence (tools -> DB sync) --
 
     async def _append_produced_files(self, raw_files: list) -> list:
         """Deduplicate and append tool-generated files under lock. Return unique new files."""
@@ -1659,7 +1659,7 @@ class HelixAgentEngine:
         except Exception as e:
             logger.warning(f"Tool file DB sync failed: {e}")
 
-    # ── Execute Tool ──
+    # -- Execute Tool --
 
     async def _execute_tool(self, tool_name, args, call_id):
         """Execute a single resolved tool from phase_tools_dict."""
@@ -1733,7 +1733,7 @@ class HelixAgentEngine:
             logger.error(f"Tool execution error ({tool_name}): {e}")
             return f"Error executing {tool_name}: {e}", []
 
-    # ── Phase System Prompt ──
+    # -- Phase System Prompt --
 
     def _build_system_prompt(self):
         """Build system prompt based on current phase using Valves overrides."""
@@ -1765,7 +1765,7 @@ class HelixAgentEngine:
                 return DEFAULT_REVIEW_PROMPT.format(goal=self.goal, task_state=task_state, tool_names=tool_names)
             return DEFAULT_PLAN_PROMPT.format(tool_names=tool_names)
 
-    # ── Phase Transitions ──
+    # -- Phase Transitions --
 
     def _transition_to(self, phase):
         """Transition to a new phase: update tools, system prompt, state."""
@@ -1778,7 +1778,7 @@ class HelixAgentEngine:
         if self.history:
             self.history[0]["content"] = self._build_system_prompt()
 
-    # ── Context Window Management ──
+    # -- Context Window Management --
 
     def _manage_context_window(self, messages):
         """Trim history to MAX_HISTORY_MESSAGES while keeping tool call pairs intact."""
@@ -1836,7 +1836,7 @@ class HelixAgentEngine:
         - Summarizes old execution into a summary block.
         - Preserves last ~6 messages, but never splits a tool call pair.
         - Tool results that are dropped from the "middle" are replaced with
-          short previews: [Tool: name → first 200 chars of result].
+          short previews: [Tool: name -> first 200 chars of result].
         """
         # 1. System prompt + goal (always preserved)
         preserved = []
@@ -1875,7 +1875,7 @@ class HelixAgentEngine:
                 name = msg.get("name", "unknown")
                 content = strip_html(msg.get("content", ""))
                 preview = content[:200].replace("\n", " ")
-                middle_previews.append(f"[Tool: {name} → {preview}...]")
+                middle_previews.append(f"[Tool: {name} -> {preview}...]")
             elif msg.get("role") == "user" and len(msg.get("content", "")) < 500:
                 middle_previews.append(f"[User: {strip_html(msg['content'][:200])}]")
 
@@ -1901,7 +1901,7 @@ class HelixAgentEngine:
         compressed.extend(recent)
         return compressed
 
-    # ── Main Loop ──
+    # -- Main Loop --
 
     async def _run_impl(self, user_msg, last_user_msg_raw, model):
         await self.emit_status("Agent starting...")
@@ -2020,7 +2020,7 @@ class HelixAgentEngine:
             except Exception as e:
                 logger.warning("_apply_file_prep failed: %s", e)
 
-            # ── Stream LLM response ──
+            # -- Stream LLM response --
             tc_dict = {}
             content_chunks = []
 
@@ -2107,7 +2107,7 @@ class HelixAgentEngine:
                     })
                     continue
 
-                # ── Handle terminate ──
+                # -- Handle terminate --
                 if tool_name == "terminate":
                     result = args.get("result", "Task complete.")
                     success = args.get("success", True)
@@ -2120,7 +2120,7 @@ class HelixAgentEngine:
                     await self.emit_status("Finished", done=True)
                     return self._format_output()
 
-                # ── Handle replan ──
+                # -- Handle replan --
                 if tool_name == "replan":
                     reason = args.get("reason", "Plan needs adjustment")
                     updated = args.get("updated_tasks", "")
@@ -2153,7 +2153,7 @@ class HelixAgentEngine:
                     await self.emit_status(f"[RPLN] Re-planning ({mode_label}): {reason}")
                     continue
 
-                # ── Handle complete_task ──
+                # -- Handle complete_task --
                 if tool_name == "complete_task":
                     result_json = await self._tool_complete_task(**args)
                     result_data = json.loads(result_json)
@@ -2169,7 +2169,7 @@ class HelixAgentEngine:
                         self._transition_to(self.PHASE_REVIEW)
                     continue
 
-                # ── Handle fail_task ──
+                # -- Handle fail_task --
                 if tool_name == "fail_task":
                     result_json = await self._tool_fail_task(**args)
                     result_data = json.loads(result_json)
@@ -2186,7 +2186,7 @@ class HelixAgentEngine:
                         self._transition_to(self.PHASE_REVIEW)
                     continue
 
-                # ── Handle fix_plan ──
+                # -- Handle fix_plan --
                 if tool_name == "fix_plan":
                     result_json = await self._tool_fix_plan(**args)
                     result_data = json.loads(result_json)
@@ -2205,7 +2205,7 @@ class HelixAgentEngine:
                         self._transition_to(self.PHASE_EXECUTE)
                     continue
 
-                # ── Handle confirm_plan ──
+                # -- Handle confirm_plan --
                 if tool_name == "confirm_plan":
                     plan_text = args.get("plan", content or "")
                     self.task_list = self._extract_task_list(plan_text or content or "")
@@ -2246,7 +2246,7 @@ class HelixAgentEngine:
                         await self.emit_output(f"\n[PLAN] Plan approved. Moving to execution.\n\n{task_summary}\n")
                         continue
 
-                # ── Duplicate detection ──
+                # -- Duplicate detection --
                 sig = f"{tool_name}:{json.dumps(args, sort_keys=True)}"
                 if recent_calls.count(sig) >= 2:
                     tool_result = f"Error: Identical call to `{tool_name}` repeated. Try a different approach."
@@ -2264,7 +2264,7 @@ class HelixAgentEngine:
                     truncation_limit = self._get_truncation_limit()
                     tool_result = smart_truncate(result_str, truncation_limit)
 
-                    # ── Consecutive tool-not-found tracking ──
+                    # -- Consecutive tool-not-found tracking --
                     if "not found in current phase" in tool_result:
                         self._consecutive_tool_misses[tool_name] = self._consecutive_tool_misses.get(tool_name, 0) + 1
                         if self._consecutive_tool_misses[tool_name] >= 3:
