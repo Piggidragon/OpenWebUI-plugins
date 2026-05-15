@@ -88,7 +88,7 @@ Pipelines are custom processing flows that run server-side in Open WebUI. Each p
 
 ---
 
-### `helix_agent.py` — Helix Agent (v4.4.0)
+### `helix_agent.py` — Helix Agent (v4.6.1)
 
 A single-model Plan → Execute → Review → Replan loop with per-phase tool control.
 
@@ -103,11 +103,13 @@ A single-model Plan → Execute → Review → Replan loop with per-phase tool c
 - **Native OWUI task list UI** — real-time task progress via `chat:message:tasks` events (pending, in_progress, completed, cancelled). No HTML hacks.
 - **Task finalization** — on termination, remaining tasks are marked completed so the task list UI dismisses cleanly.
 - **Plan confirmation** — optional modal popup (UserValves: `ENABLE_PLAN_APPROVAL`, `YOLO_MODE`).
-- **Silent mode** — strips tool call details, reasoning blocks, and intermediate status from output (UserValves: `SILENT_MODE`).
 - **Context window management** — adaptive history truncation preserving tool-call pair integrity.
 - **Iteration limit** — configurable max loop iterations with a Continue/Cancel dialog.
 - **System prompt refresh** — the LLM always sees up-to-date task state after mutations.
-- **Graceful shutdown** — handles `GeneratorExit`/`CancelledError` and saves state.
+- **DB-backed state persistence** — agent state is serialized to a JSON file attachment and synced to the OpenWebUI chat/message DB. Recovers from deep DB history scan across parent message chains.
+- **Robust file persistence** — tool-generated files are tracked, deduplicated, and synced to the DB with exponential backoff retry.
+- **RAG search** — built-in semantic search over attached large files.
+- **Graceful shutdown** — handles `GeneratorExit`/`CancelledError`, saves state, and syncs files before exiting.
 
 **Admin Valves (Valves):**
 | Valve | Default | Description |
@@ -126,9 +128,8 @@ A single-model Plan → Execute → Review → Replan loop with per-phase tool c
 **User Valves (UserValves):**
 | Valve | Default | Description |
 |-------|---------|-------------|
-| `ENABLE_PLAN_APPROVAL` | false | Show plan confirmation popup before execution. When off, plans are auto-approved without asking the user. |
+| `ENABLE_PLAN_APPROVAL` | true | Show plan confirmation popup before execution. When off, plans are auto-approved without asking the user. |
 | `YOLO_MODE` | false | Skip all user confirmations. Auto-approve plans and ignore iteration limits. |
-| `SILENT_MODE` | true | Suppress tool call details, reasoning blocks, and intermediate status. Show only plan approvals, final results, and errors. |
 
 ---
 

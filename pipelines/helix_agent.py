@@ -1,24 +1,30 @@
 """
 title: Helix Agent
 author: Piggidragon
-version: 4.6.0
+version: 4.6.1
 description: >
   Helix Agent — OpenWebUI-native agent loop with modular per-phase tool control.
 
   Architecture:
   - SINGLE model loop (Plan -> Execute -> Review -> Replan -> Execute...)
-  - Per-phase tool filtering via Valves -- only relevant tools exposed to the LLM
+  - Per-phase tool filtering via Valves — only relevant tools exposed to the LLM at each phase
   - Internal control tools (terminate, replan, fix_plan, complete_task, fail_task, confirm_plan, rag_search) always available
   - Uses OpenWebUI native tool infrastructure (get_tools, get_builtin_tools, get_terminal_tools)
-  - Replan as internal tool: updates task list and transitions to EXECUTE phase
   - Context window management with adaptive history truncation and tool-call pair integrity
+
+  State & Persistence:
+  - State persistence via JSON file attachments synced to the OpenWebUI chat DB
+  - Deep DB history recovery: recovers state from file attachments across the entire parent message chain
+  - Loop count is persisted and restored to track iteration lifetime across sessions
+  - Exponential backoff file sync for robust DB persistence under heavy load
+
+  Features:
   - Plan confirmation via custom JS UI (UserValves: ENABLE_PLAN_APPROVAL, YOLO_MODE)
   - Native OpenWebUI task progress UI via chat:message:tasks events, finalized on termination
   - System prompt refresh: task mutations (complete, fail, fix_plan) update the LLM's task state context
-   - State persistence via JSON file attachments synced to OpenWebUI chat DB
-   - Iteration limit with Continue/Cancel modal; graceful shutdown on CancelledError/GeneratorExit
-   - File handling: add_file_context + chat_completion_files_handler for native multimodal/text file injection
-   - RAG search built-in: agent can query attached large files via vector search
+  - Iteration limit with Continue/Cancel modal; graceful shutdown on CancelledError/GeneratorExit
+  - File handling: add_file_context + chat_completion_files_handler for native multimodal/text file injection
+  - RAG search built-in: agent can query attached large files via vector search
 requirements: open-webui>=0.9.1, chromadb, sentence-transformers, langchain-text-splitters
 """
 
