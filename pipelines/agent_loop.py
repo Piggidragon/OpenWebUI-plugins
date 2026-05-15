@@ -1,7 +1,7 @@
 """
 title: Agent Loop
 author: Piggidragon
-version: 4.2.0
+version: 4.2.1
 description: >
   OpenWebUI-native Agent Loop with modular per-phase tool control.
 
@@ -11,33 +11,13 @@ description: >
   - Internal control tools (terminate, replan, fix_plan, complete_task, fail_task, confirm_plan) always available
   - Uses OpenWebUI native tool infrastructure (get_tools, get_builtin_tools, get_terminal_tools)
   - Replan as internal tool: updates task list and transitions to EXECUTE phase
-  - Context window management with adaptive history truncation
+  - Context window management with adaptive history truncation and tool-call pair integrity
   - Plan confirmation via custom JS UI (UserValves: ENABLE_PLAN_APPROVAL, YOLO_MODE)
-  - Native OpenWebUI task list UI via chat:message:tasks events (pending, in_progress, completed, cancelled)
-
-  v4.2.0 changes:
-  - Native task list UI: emits chat:message:tasks events instead of HTML details tables
-  - Task list finalization: remaining tasks marked completed on termination so UI dismisses cleanly
-  - System prompt refresh: complete_task, fail_task, and fix_plan now rebuild the system prompt so the LLM sees updated task state
-  - Silent mode: strips [PLAN] lines in addition to tool call and reasoning noise
-
-  v4.0.0 changes:
-  - Added GeneratorExit/CancelledError handling for graceful shutdown
-  - Cancel option in plan confirmation UI
-  - Improved thinking/reasoning tag removal (unclosed tags, pipe blocks, prefixes)
-  - XML tool call rescue for hallucinated XML-format calls
-  - No-tool-call continuation: injects system prompt instead of terminating
-  - Native OWUI task list integration via task status emitter
-  - Iteration continuation UI (Continue/Cancel modal)
-  - File deduplication in tool results
-  - Compressed history preserves tool result previews
-  - Context window trimming preserves tool call pair integrity
-  - Soft replan reduces loop_count by 3 instead of resetting to 0
-  - fix_plan inserts at correct position, uses _extract_task_list
-  - State persistence via [AGENT_STATE] messages
-  - Silent mode for minimal output
-  - Consecutive tool-miss loop breaking
-  - LLM API retry on transient errors
+  - Native OpenWebUI task progress UI via chat:message:tasks events, finalized on termination
+  - System prompt refresh: task mutations (complete, fail, fix_plan) update the LLM's task state context
+  - State persistence via [AGENT_STATE] messages; restored on conversation continuation
+  - Silent mode: suppresses intermediate noise (tool_call details, reasoning, [PLAN]/[EXEC]/[RPLN]/[FIX] lines)
+  - Iteration limit with Continue/Cancel modal; graceful shutdown on CancelledError/GeneratorExit
 requirements: open-webui>=0.9.1
 """
 
