@@ -15,21 +15,19 @@ description: >
   - Plan confirmation via custom JS UI (UserValves: ENABLE_PLAN_APPROVAL, YOLO_MODE)
   - Native OpenWebUI task progress UI via chat:message:tasks events, finalized on termination
   - System prompt refresh: task mutations (complete, fail, fix_plan) update the LLM's task state context
-  - State persistence via [AGENT_STATE] messages; restored on conversation continuation
-  - Silent mode: suppresses intermediate noise (tool_call details, reasoning, [PLAN]/[EXEC]/[RPLN]/[FIX] lines)
-  - Iteration limit with Continue/Cancel modal; graceful shutdown on CancelledError/GeneratorExit
+   - State persistence via [AGENT_STATE] messages; restored on conversation continuation
+   - Iteration limit with Continue/Cancel modal; graceful shutdown on CancelledError/GeneratorExit
 requirements: open-webui>=0.9.1
 """
 
 import asyncio
-import html
 import inspect
 import json
 import logging
 import re
 import copy
 import uuid
-from typing import AsyncGenerator, Callable, Optional, Any, Set, List, Dict
+from typing import Callable, Set, List, Dict
 from pydantic import BaseModel, Field
 
 from fastapi import Request
@@ -363,17 +361,8 @@ class HelixAgentEngine:
         self._output_parts = []
         self.loop_count = 0
         self.goal = ""
-        self._stream_queue = None
-        self._turn_buffer: list[str] = []
-        self._flush_task: Optional[asyncio.Task] = None
-
-    @property
-    def is_silent(self):
-        return getattr(self.user_valves, "SILENT_MODE", False)
 
     def _format_output(self):
-        if not self.is_silent:
-            return "".join(self._output_parts)
         filtered = []
         for part in self._output_parts:
             s = part.strip()
@@ -444,33 +433,6 @@ class HelixAgentEngine:
 
     async def emit_output(self, text):
         self._output_parts.append(text)
-        if self.is_silent:
-            return
-        self._turn_buffer.append(text)
-        if self._flush_task and not self._flush_task.done():
-            self._flush_task.cancel()
-        self._flush_task = asyncio.create_task(self._schedule_flush(0.3))
-
-    async def _schedule_flush(self, delay: float):
-        try:
-            await asyncio.sleep(delay)
-            await self._flush_turn_buffer()
-        except asyncio.CancelledError:
-            pass
-
-    async def _flush_turn_buffer(self):
-        if not self._turn_buffer:
-            return
-        combined = "\n\n".join(self._turn_buffer)
-        # Ensure blank line padding so OpenWebUI's \n join never swallows <details>
-        if not combined.startswith("\n\n"):
-            combined = "\n\n" + combined
-        if not combined.endswith("\n\n"):
-            combined = combined + "\n\n"
-        self._turn_buffer.clear()
-        q = getattr(self, "_stream_queue", None)
-        if q is not None:
-            await q.put(combined)
 
     # ── Tool Resolution ──
 
@@ -1379,9 +1341,8 @@ class HelixAgentEngine:
             icon = phase_icons.get(self.phase, "[LOOP]")
             name = phase_name.get(self.phase, "Loop")
 
-            await self.emit_status(f"{icon} {name} -- step {self.loop_count}/{self.valves.MAX_ITERATIONS}")
-            if not self.is_silent:
-                await self.emit_output(f"\n### {icon} Loop {self.loop_count}\n")
+            await self.emit_status(f"Mode: {name}, Loop: {self.loop_count}/{self.valves.MAX_ITERATIONS}")
+
 
             self.history = self._manage_context_window(self.history)
             # Strip system messages (including [AGENT_STATE] bookkeeping) from LLM context
@@ -1406,7 +1367,6 @@ class HelixAgentEngine:
             # ── Stream LLM response ──
             tc_dict = {}
             content_chunks = []
-            reasoning_chunks = []
 
             async for event in stream_completion(self.request, completion_body, self.user):
                 etype = event.get("type")
@@ -1417,8 +1377,6 @@ class HelixAgentEngine:
                     return self._format_output()
                 elif etype == "content":
                     content_chunks.append(event.get("text", ""))
-                elif etype == "reasoning":
-                    reasoning_chunks.append(event.get("text", ""))
                 elif etype == "tool_calls":
                     for tc in event.get("data", []):
                         idx = tc.get("index", 0)
@@ -1434,13 +1392,6 @@ class HelixAgentEngine:
                             tc_dict[idx]["function"]["arguments"] += tc["function"]["arguments"]
 
             content = strip_thinking("".join(content_chunks).strip())
-
-            if reasoning_chunks:
-                reasoning_text = "".join(reasoning_chunks).strip()
-                if reasoning_text:
-                    await self.emit_output(
-                        f'\n\n\u003cdetails type="reasoning"\u003e\u003csummary\u003eThinking\u003c/summary\u003e{reasoning_text}\u003c/details\u003e\n\n'
-                    )
 
             if not tc_dict:
                 # Try XML tool call rescue for hallucinated <ToolCall> blocks
@@ -1462,12 +1413,7 @@ class HelixAgentEngine:
                         await self.emit_output(f"\n[WARN] No tool call produced. Re-prompting to continue.\n")
                         continue
                     if content:
-                        if not self.is_silent:
-                            await self.emit_output("\n\n---\n\n**Ergebnis**\n\n")
                         await self.emit_output(content)
-                        if not self.is_silent:
-                            await self.emit_output("\n\n---\n")
-                    await self.emit_task_update(finalize_tasks=True)
                     await self.emit_status("Done", done=True)
                     return self._format_output()
 
@@ -1664,11 +1610,6 @@ class HelixAgentEngine:
                     if "not found in current phase" in tool_result:
                         self._consecutive_tool_misses[tool_name] = self._consecutive_tool_misses.get(tool_name, 0) + 1
                         if self._consecutive_tool_misses[tool_name] >= 3:
-                            await self.emit_output(
-                                f"<details><summary>⚠️ Tool Loop Break</summary>"
-                                f"Tool `{tool_name}` unavailable after 3 consecutive attempts. Forcing replan."
-                                f"</details>"
-                            )
                             replan_result = await self._tool_replan(
                                 reason=f"Tool '{tool_name}' unavailable after 3 consecutive attempts",
                                 updated_tasks="",
@@ -1683,23 +1624,6 @@ class HelixAgentEngine:
                             break
                     else:
                         self._consecutive_tool_misses.clear()
-
-                # Render
-                args_preview = smart_truncate(json.dumps(args, ensure_ascii=False), 200)
-                result_preview = smart_truncate(tool_result, 600)
-                phase_tag = phase_icons.get(self.phase, "[LOOP]")
-                # Render OpenWebUI-konformer Tool-Call-Block
-                args_json = html.escape(json.dumps(args, ensure_ascii=False))
-                result_json = html.escape(json.dumps({"result": tool_result}, ensure_ascii=False))
-                detail_block = (
-                    f'\n\n\u003cdetails type="tool_calls" done="true" '
-                    f'id="{call_id}" name="{tool_name}" '
-                    f'arguments="{args_json}"\u003e\n'
-                    f'\u003csummary\u003e{tool_name}\u003c/summary\u003e\n'
-                    f'{result_json}\n'
-                    f'\u003c/details\u003e'
-                )
-                await self.emit_output(detail_block)
 
                 self.history.append({
                     "role": "tool",
@@ -1737,37 +1661,6 @@ class HelixAgentEngine:
             return f"\n[ERROR] Agent loop failed: {e}"
         finally:
             self._seen_file_ids.clear()
-
-    async def run_stream(self, user_msg, last_user_msg_raw, model):
-        """Run the Helix Agent loop and yield live text chunks to the caller.
-
-        In non-silent mode every emit_output() call is pushed into the
-        internal queue and yielded immediately so the chat sees the agent
-        working live.  The final return value of _run_impl is yielded only
-        in silent mode; otherwise it is already part of the stream.
-        """
-        self._stream_queue = asyncio.Queue()
-        loop_task = asyncio.create_task(
-            self._run_impl(user_msg, last_user_msg_raw, model)
-        )
-        try:
-            while not loop_task.done() or not self._stream_queue.empty():
-                try:
-                    chunk = await asyncio.wait_for(self._stream_queue.get(), timeout=0.1)
-                except asyncio.TimeoutError:
-                    continue
-                if chunk:
-                    yield chunk
-            result = await loop_task
-            if self.is_silent and result and result.strip():
-                yield result
-        except asyncio.CancelledError:
-            loop_task.cancel()
-            try:
-                await loop_task
-            except asyncio.CancelledError:
-                pass
-            raise
 
     def _extract_task_list(self, text):
         if not text:
@@ -1878,16 +1771,12 @@ class Pipe:
 
     class UserValves(BaseModel):
         ENABLE_PLAN_APPROVAL: bool = Field(
-            default=False,
+            default=True,
             description="Enable plan confirmation UI. When off, plans are auto-approved without asking the user.",
         )
         YOLO_MODE: bool = Field(
             default=False,
             description="Skip all user confirmations. Auto-approve plans and ignore iteration limits.",
-        )
-        SILENT_MODE: bool = Field(
-            default=True,
-            description="If True, show only plan approvals, final results, and errors. Hide tool call details, reasoning blocks, and intermediate status messages.",
         )
 
     def __init__(self):
@@ -1968,13 +1857,4 @@ class Pipe:
         # Restore state from previous [AGENT_STATE] messages in chat history
         engine._restore_state_from_messages(messages)
 
-        if engine.is_silent:
-            return await engine.run(user_msg, last_user_msg_raw, model)
-
-        async def _generator():
-            async for chunk in engine.run_stream(
-                user_msg, last_user_msg_raw, model
-            ):
-                yield chunk
-
-        return _generator()
+        return await engine.run(user_msg, last_user_msg_raw, model)
