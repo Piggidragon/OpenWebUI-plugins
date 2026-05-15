@@ -1,7 +1,7 @@
 """
 title: Agent Loop
 author: Piggidragon
-version: 4.2.1
+version: 4.4.0
 description: >
   OpenWebUI-native Agent Loop with modular per-phase tool control.
 
@@ -623,21 +623,14 @@ class AgentLoopEngine:
         elif phase == self.PHASE_REVIEW:
             allowlist = set(_comma_list(self.valves.REVIEW_TOOLS))
 
-        # Global denylist
-        denylist = set(_comma_list(self.valves.TOOLS_DENYLIST))
-
-        # If allowlist is empty -> allow ALL tools (except denylist and internal overrides)
-        # If allowlist has entries -> only those tools (plus internals, minus denylist)
+        # If allowlist is empty -> allow ALL tools
+        # If allowlist has entries -> only those tools (plus internals)
         self.phase_tools_dict = {}
 
         for name, tool in self.all_tools_dict.items():
-            # Internal tools are ALWAYS included regardless of allowlist/denylist
+            # Internal tools are ALWAYS included regardless of allowlist
             if name in self.INTERNAL_TOOLS:
                 self.phase_tools_dict[name] = tool
-                continue
-
-            # Global denylist wins over everything
-            if name in denylist:
                 continue
 
             # Allowlist filtering
@@ -645,7 +638,6 @@ class AgentLoopEngine:
                 if name in allowlist:
                     self.phase_tools_dict[name] = tool
             else:
-                # No allowlist -> allow all (except denylist, already checked)
                 self.phase_tools_dict[name] = tool
 
         # Build OpenAI-format tool specs
@@ -1814,15 +1806,6 @@ class Pipe:
             )
         )
 
-        TOOLS_DENYLIST: str = Field(
-            default="",
-            description=(
-                "Comma-separated tool names that are NEVER available in ANY phase. "
-                "Useful to permanently disable dangerous or irrelevant tools. "
-                "Example: execute_code, shell_command"
-            )
-        )
-
         PLAN_PROMPT: str = Field(
             default=DEFAULT_PLAN_PROMPT,
             description="System prompt for PLAN phase. Available placeholders: {tool_names}."
@@ -1846,7 +1829,7 @@ class Pipe:
             description="Skip all user confirmations. Auto-approve plans and ignore iteration limits.",
         )
         SILENT_MODE: bool = Field(
-            default=False,
+            default=True,
             description="If True, show only plan approvals, final results, and errors. Hide tool call details, reasoning blocks, and intermediate status messages.",
         )
 
