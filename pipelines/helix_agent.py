@@ -1,13 +1,13 @@
 """
 title: Helix Agent
 author: Piggidragon
-version: 4.6.1
+version: 4.6.3
 description: >
-  Helix Agent — OpenWebUI-native agent loop with modular per-phase tool control.
+  Helix Agent - OpenWebUI-native agent loop with modular per-phase tool control.
 
   Architecture:
   - SINGLE model loop (Plan -> Execute -> Review -> Replan -> Execute...)
-  - Per-phase tool filtering via Valves — only relevant tools exposed to the LLM at each phase
+  - Per-phase tool filtering via Valves - only relevant tools exposed to the LLM at each phase
   - Internal control tools (terminate, replan, fix_plan, complete_task, fail_task, confirm_plan, rag_search) always available
   - Uses OpenWebUI native tool infrastructure (get_tools, get_builtin_tools, get_terminal_tools)
   - Context window management with adaptive history truncation and tool-call pair integrity
@@ -132,7 +132,7 @@ Rules:
 - If a tool returns an error (timeout, file not found, syntax error, wrong path), analyze the error and retry with corrected parameters. You do NOT need to call fix_plan for trivial errors.
 - Only call fix_plan if the same task fails repeatedly (3+ attempts) or if the task design was wrong.
 - Only call replan(mode='soft') if the entire approach is wrong. Use replan(mode='hard') only for complete strategy replacement.
-- If you need to think step-by-step before acting, do so — reasoning will be captured in a collapsible block.
+- If you need to think step-by-step before acting, do so - reasoning will be captured in a collapsible block.
 - You MUST call complete_task(index) or fail_task(index, reason) after working on a task.
 - If a tool named `parallel_tools` is available, use it to call multiple independent tools at once for efficiency.
 - You may only use the tools listed above. Do NOT ask the user questions.
@@ -151,13 +151,13 @@ Task status markers: [done] = completed, [FAIL: reason] = failed with reason, [ 
 
 You MUST call exactly ONE of these tools:
 
-1. `terminate(final_answer)` — Everything is done and correct. Provide a concise final answer summarising what was accomplished.
-2. `fix_plan(reason, updated_tasks)` — Only minor fixes are needed (a task failed or needs a small correction). List just the new/corrected tasks.
-3. `replan(reason, updated_tasks, mode="soft")` — The overall strategy is broken and tasks need to be replaced entirely.
+1. `terminate(final_answer)` - Everything is done and correct. Provide a concise final answer summarising what was accomplished.
+2. `fix_plan(reason, updated_tasks)` - Only minor fixes are needed (a task failed or needs a small correction). List just the new/corrected tasks.
+3. `replan(reason, updated_tasks, mode="soft")` - The overall strategy is broken and tasks need to be replaced entirely.
 
 Rules:
 - If there are only minor issues with individual tasks, ALWAYS prefer `fix_plan` over `replan`. Only use `replan` if the overall strategy is broken.
-- Be honest — don't call `terminate` if something is missing or wrong.
+- Be honest - don't call `terminate` if something is missing or wrong.
 - If the result is good enough, call `terminate`. Don't gold-plate.
 - Provide a brief reasoning for your assessment before calling the final tool.
 - You may only use the tools listed above.
@@ -346,7 +346,7 @@ def _comma_list(val: str) -> List[str]:
 # ──────────────────────────────────────────────────────────────────
 
 class HelixAgentEngine:
-    """Helix Agent — single-model agent loop with per-phase tool filtering."""
+    """Helix Agent - single-model agent loop with per-phase tool filtering."""
 
     PHASE_PLAN = "plan"
     PHASE_EXECUTE = "execute"
@@ -1036,16 +1036,11 @@ class HelixAgentEngine:
     def _base_theme_js(self):
         return """
             const col = {
-                overlay: 'rgba(0,0,0,0.55)', panel: '#1e293b', border: '#334155',
-                text: '#f1f5f9', sub: '#94a3b8', input: '#0f172a', inputBorder: '#475569',
-                btn: '#334155', btnText: '#e2e8f0', btnBorder: '#475569',
-                btnPrimary: '#3b82f6', btnPrimaryText: '#ffffff',
+                overlay: 'rgba(0,0,0,0.62)', panel: '#1e1e2e', border: '#45475a',
+                text: '#cdd6f4', sub: '#a6adc8', input: '#313244', inputBorder: '#45475a',
+                btn: '#313244', btnText: '#cdd6f4', btnBorder: '#45475a',
+                btnPrimary: '#E8713A', btnPrimaryText: '#ffffff',
             };
-            try { const s = getComputedStyle(document.documentElement);
-              col.panel = s.getPropertyValue('--color-gray-900').trim() || col.panel;
-              col.text = s.getPropertyValue('--color-gray-50').trim() || col.text;
-              col.btnPrimary = s.getPropertyValue('--color-blue-500').trim() || col.btnPrimary;
-            } catch(e) {}
         """
 
     def _build_plan_approval_js(self, tasks: list, timeout_s: int = 600) -> str:
@@ -1055,95 +1050,233 @@ class HelixAgentEngine:
       return new Promise((resolve) => {{
     {self._base_theme_js()}
         let _timer;
+        const OVERLAY_ID = '__owui_helix_plan__';
+        const existing = document.getElementById(OVERLAY_ID);
+        if (existing) existing.remove();
+
+        // ── Overlay ──────────────────────────────────────────────────────────
         const overlay = document.createElement('div');
-        overlay.style.cssText = `position:fixed;inset:0;z-index:999999;background:${{col.overlay}};display:flex;align-items:center;justify-content:center;padding:20px;backdrop-filter:blur(4px);`;
+        overlay.id = OVERLAY_ID;
+        Object.assign(overlay.style, {{
+          position: 'fixed', inset: '0', zIndex: '999999',
+          background: col.overlay,
+          backdropFilter: 'blur(12px)', WebkitBackdropFilter: 'blur(12px)',
+          display: 'flex', alignItems: 'center', justifyContent: 'center',
+          fontFamily: "-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif",
+          opacity: '0', transition: 'opacity 0.18s ease',
+        }});
+
+        // ── Panel ──────────────────────────────────────────────────────────────
         const panel = document.createElement('div');
-        panel.style.cssText = `background:${{col.panel}};border:1px solid ${{col.border}};border-radius:20px;box-shadow:0 20px 60px rgba(0,0,0,0.3);color:${{col.text}};font-family:ui-sans-serif,system-ui,sans-serif;width:100%;max-width:520px;max-height:90vh;padding:32px;display:flex;flex-direction:column;gap:24px;`;
+        Object.assign(panel.style, {{
+          background: col.panel, border: '1px solid ' + col.border,
+          borderRadius: '16px', padding: '26px 26px 20px',
+          maxWidth: '520px', width: 'calc(100vw - 32px)',
+          maxHeight: '85vh', overflowY: 'auto',
+          boxShadow: '0 28px 80px rgba(0,0,0,0.65)',
+          display: 'flex', flexDirection: 'column', gap: '14px',
+          transform: 'scale(0.92)', opacity: '0',
+          transition: 'transform 0.22s cubic-bezier(0.34,1.56,0.64,1), opacity 0.18s ease',
+        }});
 
+        // ── Header row ─────────────────────────────────────────────────────────
         const header = document.createElement('div');
-        header.style.cssText = 'display:flex;align-items:center;gap:12px;flex-shrink:0;';
-        const icon = document.createElement('div'); icon.textContent = '\uD83D\uDCCB'; icon.style.cssText = 'font-size:24px;';
-        const title = document.createElement('div'); title.textContent = 'Review Proposed Plan'; title.style.cssText = `font-size:20px;font-weight:800;color:${{col.text}};letter-spacing:-0.4px;`;
-        header.appendChild(icon); header.appendChild(title); panel.appendChild(header);
+        Object.assign(header.style, {{ display: 'flex', alignItems: 'flex-start', gap: '12px' }});
 
+        const iconBlock = document.createElement('div');
+        iconBlock.textContent = '\uD83D\uDCCB';
+        Object.assign(iconBlock.style, {{ fontSize: '22px', flexShrink: '0', marginTop: '2px' }});
+
+        const titleText = document.createElement('p');
+        Object.assign(titleText.style, {{
+          margin: '0', color: col.text, fontSize: '16px',
+          fontWeight: '700', lineHeight: '1.4', flex: '1', wordBreak: 'break-word',
+        }});
+        titleText.textContent = 'Review Proposed Plan';
+
+        const badge = document.createElement('span');
+        Object.assign(badge.style, {{
+          flexShrink: '0', fontSize: '10px', fontWeight: '700',
+          letterSpacing: '0.07em', padding: '3px 9px', borderRadius: '99px',
+          background: col.btnPrimary + '26', color: col.btnPrimary,
+          marginTop: '2px', whiteSpace: 'nowrap',
+        }});
+        badge.textContent = 'PLAN REVIEW';
+
+        header.appendChild(iconBlock);
+        header.appendChild(titleText);
+        header.appendChild(badge);
+
+        // ── Scrollable task list ─────────────────────────────────────────────
         const scrollContainer = document.createElement('div');
-        scrollContainer.style.cssText = 'overflow-y:auto;flex:1;display:flex;flex-direction:column;gap:12px;padding-right:8px;';
+        Object.assign(scrollContainer.style, {{
+          overflowY: 'auto', flex: '1', display: 'flex', flexDirection: 'column', gap: '7px',
+          paddingRight: '4px',
+        }});
 
         const tasksData = {ts};
         tasksData.forEach((t, i) => {{
             const card = document.createElement('div');
-            card.style.cssText = `background:${{col.input}};border:1px solid ${{col.inputBorder}};border-radius:12px;padding:12px 16px;display:flex;gap:12px;align-items:flex-start;`;
+            Object.assign(card.style, {{
+              display: 'flex', alignItems: 'flex-start', gap: '12px',
+              background: col.input, border: '1.5px solid ' + col.inputBorder,
+              borderRadius: '10px', padding: '11px 13px',
+              minHeight: '48px', transition: 'background 0.12s, border-color 0.12s',
+            }});
 
-            const num = document.createElement('div');
-            num.textContent = i + 1;
-            num.style.cssText = `width:24px;height:24px;background:${{col.btnPrimary}};color:${{col.btnPrimaryText}};border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:bold;flex-shrink:0;margin-top:2px;`;
+            const num = document.createElement('span');
+            Object.assign(num.style, {{
+              flexShrink: '0', width: '26px', height: '26px',
+              borderRadius: '6px', background: col.btnPrimary,
+              display: 'flex', alignItems: 'center', justifyContent: 'center',
+              fontSize: '11px', fontWeight: '700', color: col.btnPrimaryText,
+              marginTop: '2px',
+            }});
+            num.textContent = String(i + 1);
 
             const content = document.createElement('div');
-            content.style.cssText = 'display:flex;flex-direction:column;gap:4px;';
-            const tid = document.createElement('div'); tid.textContent = t.task_id; tid.style.cssText = `font-size:11px;font-weight:bold;color:${{col.sub}};text-transform:uppercase;`;
-            const desc = document.createElement('div'); desc.textContent = t.description; desc.style.cssText = `font-size:14px;color:${{col.text}};line-height:1.4;`;
+            Object.assign(content.style, {{ display: 'flex', flexDirection: 'column', gap: '4px', flex: '1', minWidth: '0' }});
+            const tid = document.createElement('span');
+            Object.assign(tid.style, {{
+              fontSize: '11px', fontWeight: '700', color: col.sub,
+              textTransform: 'uppercase', letterSpacing: '0.05em',
+            }});
+            tid.textContent = t.task_id;
+            const desc = document.createElement('span');
+            Object.assign(desc.style, {{
+              fontSize: '14px', color: col.text, lineHeight: '1.5', wordBreak: 'break-word',
+            }});
+            desc.textContent = t.description;
 
-            content.appendChild(tid); content.appendChild(desc);
-            card.appendChild(num); card.appendChild(content);
+            content.appendChild(tid);
+            content.appendChild(desc);
+            card.appendChild(num);
+            card.appendChild(content);
             scrollContainer.appendChild(card);
         }});
-        panel.appendChild(scrollContainer);
 
+        // ── Feedback input ─────────────────────────────────────────────────────
         const inputContainer = document.createElement('div');
-        inputContainer.style.cssText = 'display:flex;flex-direction:column;gap:10px;flex-shrink:0;';
-        const inputLabel = document.createElement('div'); inputLabel.textContent = 'Feedback (optional):'; inputLabel.style.cssText = `font-size:12px;font-weight:700;color:${{col.sub}};text-transform:uppercase;letter-spacing:0.5px;`;
+        Object.assign(inputContainer.style, {{ display: 'flex', flexDirection: 'column', gap: '8px' }});
+        const inputLabel = document.createElement('div');
+        inputLabel.textContent = 'Feedback (optional):';
+        Object.assign(inputLabel.style, {{
+          fontSize: '11px', fontWeight: '700', color: col.sub,
+          textTransform: 'uppercase', letterSpacing: '0.06em',
+        }});
         const feedbackInput = document.createElement('textarea');
         feedbackInput.placeholder = 'e.g., "Add a step to check for X" or "Skip the second task"';
-        feedbackInput.style.cssText = `background:${{col.input}};border:1px solid ${{col.inputBorder}};color:${{col.text}};padding:14px;border-radius:14px;font-size:14px;outline:none;min-height:70px;resize:none;transition:border-color 0.2s;`;
-        feedbackInput.onfocus = () => feedbackInput.style.borderColor = 'var(--color-blue-500)';
-        feedbackInput.onblur = () => feedbackInput.style.borderColor = col.inputBorder;
-        inputContainer.appendChild(inputLabel); inputContainer.appendChild(feedbackInput); panel.appendChild(inputContainer);
+        Object.assign(feedbackInput.style, {{
+          background: col.input, border: '1.5px solid ' + col.inputBorder,
+          color: col.text, padding: '12px 14px',
+          borderRadius: '10px', fontSize: '14px', outline: 'none',
+          minHeight: '64px', resize: 'none',
+          fontFamily: 'inherit', boxSizing: 'border-box',
+          transition: 'border-color 0.15s',
+        }});
+        feedbackInput.addEventListener('focus', function() {{ feedbackInput.style.borderColor = col.btnPrimary; }});
+        feedbackInput.addEventListener('blur', function() {{ feedbackInput.style.borderColor = col.inputBorder; }});
+        inputContainer.appendChild(inputLabel);
+        inputContainer.appendChild(feedbackInput);
 
+        // ── Footer buttons ───────────────────────────────────────────────────
         const footer = document.createElement('div');
-        footer.style.cssText = 'display:flex;gap:12px;flex-shrink:0;';
+        Object.assign(footer.style, {{ display: 'flex', gap: '8px', justifyContent: 'flex-end', marginTop: '2px' }});
 
-        const makeBtn = (label, primary) => {{
-            const b = document.createElement('button');
-            b.textContent = label;
-            b.style.cssText = `flex:1;padding:14px 20px;border-radius:9999px;font-size:15px;font-weight:700;cursor:pointer;transition:all 0.2s;border:1px solid ${{primary ? 'transparent' : col.btnBorder}};background:${{primary ? col.btnPrimary : col.btn}};color:${{primary ? col.btnPrimaryText : col.btnText}};`;
-            b.onmouseenter = () => {{ b.style.opacity='0.9'; b.style.transform='translateY(-1px)'; }};
-            b.onmouseleave = () => {{ b.style.opacity='1'; b.style.transform='translateY(0)'; }};
-            return b;
-        }};
+        function makeBtn(label, primary) {{
+          const b = document.createElement('button');
+          b.textContent = label;
+          Object.assign(b.style, {{
+            padding: '10px 18px', borderRadius: '8px',
+            fontSize: '13px', fontWeight: '700',
+            cursor: 'pointer', fontFamily: 'inherit',
+            border: '1.5px solid ' + (primary ? 'transparent' : col.btnBorder),
+            background: primary ? col.btnPrimary : col.btn,
+            color: primary ? col.btnPrimaryText : col.btnText,
+            transition: 'opacity 0.12s, transform 0.1s, border-color 0.12s',
+          }});
+          b.addEventListener('mouseenter', function() {{ b.style.opacity = '0.9'; b.style.transform = 'translateY(-1px)'; }});
+          b.addEventListener('mouseleave', function() {{ b.style.opacity = '1'; b.style.transform = ''; }});
+          return b;
+        }}
 
         const acceptBtn = makeBtn('Accept Plan', true);
         const feedbackBtn = makeBtn('Send Feedback', false);
         const cancelBtn = makeBtn('Cancel', false);
-        cancelBtn.style.background = '#7f1d1d';
-        cancelBtn.style.color = '#fecaca';
-        cancelBtn.style.borderColor = '#991b1b';
+        Object.assign(cancelBtn.style, {{
+          background: '#313244', color: '#f38ba8', borderColor: '#f38ba8',
+        }});
+        cancelBtn.addEventListener('mouseenter', function() {{ cancelBtn.style.opacity = '0.85'; cancelBtn.style.transform = 'translateY(-1px)'; }});
+        cancelBtn.addEventListener('mouseleave', function() {{ cancelBtn.style.opacity = '1'; cancelBtn.style.transform = ''; }});
 
-        const cleanup = () => {{ overlay.remove(); }};
+        const cleanup = function() {{
+          panel.style.transform = 'scale(0.95)';
+          panel.style.opacity = '0';
+          overlay.style.opacity = '0';
+          setTimeout(function() {{
+            overlay.remove();
+            document.removeEventListener('keydown', onKey);
+          }}, 180);
+        }};
 
-        acceptBtn.onclick = () => {{ clearTimeout(_timer); cleanup(); resolve(JSON.stringify({{action:'accept'}})); }};
-        feedbackBtn.onclick = () => {{
+        acceptBtn.addEventListener('click', function() {{ clearTimeout(_timer); cleanup(); resolve(JSON.stringify({{action:'accept'}})); }});
+        feedbackBtn.addEventListener('click', function() {{
             const val = feedbackInput.value.trim();
             if (val) {{ clearTimeout(_timer); cleanup(); resolve(JSON.stringify({{action:'feedback', value: val}})); }}
-            else {{ acceptBtn.onclick(); }}
-        }};
-        cancelBtn.onclick = () => {{ clearTimeout(_timer); cleanup(); resolve(JSON.stringify({{action:'cancel'}})); }};
+            else {{ acceptBtn.click(); }}
+        }});
+        cancelBtn.addEventListener('click', function() {{ clearTimeout(_timer); cleanup(); resolve(JSON.stringify({{action:'cancel'}})); }});
 
-        footer.appendChild(acceptBtn); footer.appendChild(feedbackBtn); footer.appendChild(cancelBtn); panel.appendChild(footer);
+        footer.appendChild(cancelBtn);
+        footer.appendChild(feedbackBtn);
+        footer.appendChild(acceptBtn);
 
+        // ── Countdown ──────────────────────────────────────────────────────────
         const countdown = document.createElement('div');
-        countdown.style.cssText = `font-size:11px;color:${{col.sub}};text-align:center;margin-top:-12px;flex-shrink:0;`;
-        panel.appendChild(countdown);
+        countdown.textContent = '';
+        Object.assign(countdown.style, {{
+          fontSize: '11px', color: col.sub, textAlign: 'center', minHeight: '16px',
+        }});
 
-        overlay.appendChild(panel); document.body.appendChild(overlay);
+        // ── Global keyboard handler ────────────────────────────────────────────
+        function onKey(e) {{
+          if (e.key === 'Escape') {{
+            cancelBtn.click();
+            return;
+          }}
+          if (e.key === 'Enter' && e.metaKey) {{
+            acceptBtn.click();
+            return;
+          }}
+        }}
+        document.addEventListener('keydown', onKey);
+
+        // ── Assemble DOM ─────────────────────────────────────────────────────
+        panel.appendChild(header);
+        panel.appendChild(scrollContainer);
+        panel.appendChild(inputContainer);
+        panel.appendChild(footer);
+        panel.appendChild(countdown);
+        overlay.appendChild(panel);
+        document.body.appendChild(overlay);
         feedbackInput.focus();
 
+        // ── Entrance animation ───────────────────────────────────────────────
+        requestAnimationFrame(function() {{
+          requestAnimationFrame(function() {{
+            overlay.style.opacity = '1';
+            panel.style.transform = 'scale(1)';
+            panel.style.opacity = '1';
+          }});
+        }});
+
         let remaining = {timeout_s};
-        const updateCountdown = () => {{
-            countdown.textContent = remaining > 0 ? `Auto-accepting in ${{remaining}}s...` : '';
+        function updateCountdown() {{
+            countdown.textContent = remaining > 0 ? 'Auto-accepting in ' + remaining + 's…' : '';
             if (remaining <= 0) {{ cleanup(); resolve(JSON.stringify({{action:'accept'}})); }}
-        }};
+        }}
         updateCountdown();
-        _timer = setInterval(() => {{ remaining--; updateCountdown(); }}, 1000);
+        _timer = setInterval(function() {{ remaining--; updateCountdown(); }}, 1000);
       }});
     }})();"""
 
@@ -1155,53 +1288,160 @@ class HelixAgentEngine:
     return (function() {{
       return new Promise((resolve) => {{
     {self._base_theme_js()}
+        const OVERLAY_ID = '__owui_helix_limit__';
+        const existing = document.getElementById(OVERLAY_ID);
+        if (existing) existing.remove();
+
+        // ── Overlay ──────────────────────────────────────────────────────────
         const overlay = document.createElement('div');
-        overlay.style.cssText = `position:fixed;inset:0;z-index:999999;background:${{col.overlay}};display:flex;align-items:center;justify-content:center;padding:20px;backdrop-filter:blur(4px);`;
+        overlay.id = OVERLAY_ID;
+        Object.assign(overlay.style, {{
+          position: 'fixed', inset: '0', zIndex: '999999',
+          background: col.overlay,
+          backdropFilter: 'blur(12px)', WebkitBackdropFilter: 'blur(12px)',
+          display: 'flex', alignItems: 'center', justifyContent: 'center',
+          fontFamily: "-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif",
+          opacity: '0', transition: 'opacity 0.18s ease',
+        }});
+
+        // ── Panel ──────────────────────────────────────────────────────────────
         const panel = document.createElement('div');
-        panel.style.cssText = `background:${{col.panel}};border:1px solid ${{col.border}};border-radius:20px;box-shadow:0 20px 60px rgba(0,0,0,0.3);color:${{col.text}};font-family:ui-sans-serif,system-ui,sans-serif;width:100%;max-width:440px;padding:32px;display:flex;flex-direction:column;gap:20px;`;
+        Object.assign(panel.style, {{
+          background: col.panel, border: '1px solid ' + col.border,
+          borderRadius: '16px', padding: '26px 26px 20px',
+          maxWidth: '440px', width: 'calc(100vw - 32px)',
+          boxShadow: '0 28px 80px rgba(0,0,0,0.65)',
+          display: 'flex', flexDirection: 'column', gap: '14px',
+          transform: 'scale(0.92)', opacity: '0',
+          transition: 'transform 0.22s cubic-bezier(0.34,1.56,0.64,1), opacity 0.18s ease',
+        }});
 
+        // ── Header row ─────────────────────────────────────────────────────────
         const header = document.createElement('div');
-        header.style.cssText = 'display:flex;align-items:center;gap:12px;';
-        const icon = document.createElement('div'); icon.textContent = '⚠️'; icon.style.cssText = 'font-size:24px;';
-        const title = document.createElement('div'); title.textContent = 'Iteration Limit Reached'; title.style.cssText = `font-size:18px;font-weight:800;color:${{col.text}};`;
-        header.appendChild(icon); header.appendChild(title); panel.appendChild(header);
+        Object.assign(header.style, {{ display: 'flex', alignItems: 'flex-start', gap: '12px' }});
 
-        const msg = document.createElement('div');
-        msg.style.cssText = `font-size:14px;color:${{col.sub}};line-height:1.5;`;
+        const iconBlock = document.createElement('div');
+        iconBlock.textContent = '\u26A0\uFE0F';
+        Object.assign(iconBlock.style, {{ fontSize: '22px', flexShrink: '0', marginTop: '2px' }});
+
+        const titleText = document.createElement('p');
+        Object.assign(titleText.style, {{
+          margin: '0', color: col.text, fontSize: '16px',
+          fontWeight: '700', lineHeight: '1.4', flex: '1', wordBreak: 'break-word',
+        }});
+        titleText.textContent = 'Iteration Limit Reached';
+
+        const badge = document.createElement('span');
+        Object.assign(badge.style, {{
+          flexShrink: '0', fontSize: '10px', fontWeight: '700',
+          letterSpacing: '0.07em', padding: '3px 9px', borderRadius: '99px',
+          background: col.btnPrimary + '26', color: col.btnPrimary,
+          marginTop: '2px', whiteSpace: 'nowrap',
+        }});
+        badge.textContent = 'LIMIT';
+
+        header.appendChild(iconBlock);
+        header.appendChild(titleText);
+        header.appendChild(badge);
+
+        // ── Message ────────────────────────────────────────────────────────────
+        const msg = document.createElement('p');
+        Object.assign(msg.style, {{
+          margin: '0', color: col.sub, fontSize: '14px', lineHeight: '1.55', wordBreak: 'break-word',
+        }});
         msg.textContent = `The agent has used {current_iter} of {max_iter} iterations. Continue for more?`;
-        panel.appendChild(msg);
 
-        const countdown = document.createElement('div');
-        countdown.style.cssText = `font-size:11px;color:${{col.sub}};text-align:center;margin-top:-8px;`;
-        panel.appendChild(countdown);
-
+        // ── Footer buttons ───────────────────────────────────────────────────
         const footer = document.createElement('div');
-        footer.style.cssText = 'display:flex;gap:10px;';
-        const makeBtn = (label, primary) => {{
-            const b = document.createElement('button');
-            b.textContent = label;
-            b.style.cssText = `flex:1;padding:12px 18px;border-radius:9999px;font-size:14px;font-weight:700;cursor:pointer;border:1px solid ${{primary ? 'transparent' : col.btnBorder}};background:${{primary ? col.btnPrimary : col.btn}};color:${{primary ? col.btnPrimaryText : col.btnText}};`;
-            b.onmouseenter = () => {{ b.style.opacity='0.9'; }};
-            b.onmouseleave = () => {{ b.style.opacity='1'; }};
-            return b;
-        }};
+        Object.assign(footer.style, {{ display: 'flex', gap: '8px', justifyContent: 'flex-end', marginTop: '2px' }});
+
+        function makeBtn(label, primary) {{
+          const b = document.createElement('button');
+          b.textContent = label;
+          Object.assign(b.style, {{
+            padding: '10px 18px', borderRadius: '8px',
+            fontSize: '13px', fontWeight: '700',
+            cursor: 'pointer', fontFamily: 'inherit',
+            border: '1.5px solid ' + (primary ? 'transparent' : col.btnBorder),
+            background: primary ? col.btnPrimary : col.btn,
+            color: primary ? col.btnPrimaryText : col.btnText,
+            transition: 'opacity 0.12s, transform 0.1s, border-color 0.12s',
+          }});
+          b.addEventListener('mouseenter', function() {{ b.style.opacity = '0.9'; b.style.transform = 'translateY(-1px)'; }});
+          b.addEventListener('mouseleave', function() {{ b.style.opacity = '1'; b.style.transform = ''; }});
+          return b;
+        }}
+
         const continueBtn = makeBtn('Continue', true);
         const stopBtn = makeBtn('Stop', false);
-        const cleanup = () => {{ overlay.remove(); }};
-        let _timer;
-        continueBtn.onclick = () => {{ clearTimeout(_timer); cleanup(); resolve(JSON.stringify({{action:'continue'}})); }};
-        stopBtn.onclick = () => {{ clearTimeout(_timer); cleanup(); resolve(JSON.stringify({{action:'stop'}})); }};
-        footer.appendChild(continueBtn); footer.appendChild(stopBtn); panel.appendChild(footer);
+        stopBtn.style.background = '#313244';
+        stopBtn.style.color = '#f38ba8';
+        stopBtn.style.borderColor = '#f38ba8';
+        stopBtn.addEventListener('mouseenter', function() {{ stopBtn.style.opacity = '0.85'; stopBtn.style.transform = 'translateY(-1px)'; }});
+        stopBtn.addEventListener('mouseleave', function() {{ stopBtn.style.opacity = '1'; stopBtn.style.transform = ''; }});
 
-        overlay.appendChild(panel); document.body.appendChild(overlay);
+        const cleanup = function() {{
+          panel.style.transform = 'scale(0.95)';
+          panel.style.opacity = '0';
+          overlay.style.opacity = '0';
+          setTimeout(function() {{
+            overlay.remove();
+            document.removeEventListener('keydown', onKey);
+          }}, 180);
+        }};
+
+        let _timer;
+        continueBtn.addEventListener('click', function() {{ clearTimeout(_timer); cleanup(); resolve(JSON.stringify({{action:'continue'}})); }});
+        stopBtn.addEventListener('click', function() {{ clearTimeout(_timer); cleanup(); resolve(JSON.stringify({{action:'stop'}})); }});
+
+        footer.appendChild(stopBtn);
+        footer.appendChild(continueBtn);
+
+        // ── Countdown ──────────────────────────────────────────────────────────
+        const countdown = document.createElement('div');
+        countdown.textContent = '';
+        Object.assign(countdown.style, {{
+          fontSize: '11px', color: col.sub, textAlign: 'center', minHeight: '16px',
+        }});
+
+        // ── Global keyboard handler ────────────────────────────────────────────
+        function onKey(e) {{
+          if (e.key === 'Escape') {{
+            stopBtn.click();
+            return;
+          }}
+          if (e.key === 'Enter' || e.key === ' ') {{
+            e.preventDefault();
+            continueBtn.click();
+            return;
+          }}
+        }}
+        document.addEventListener('keydown', onKey);
+
+        // ── Assemble DOM ─────────────────────────────────────────────────────
+        panel.appendChild(header);
+        panel.appendChild(msg);
+        panel.appendChild(footer);
+        panel.appendChild(countdown);
+        overlay.appendChild(panel);
+        document.body.appendChild(overlay);
+
+        // ── Entrance animation ───────────────────────────────────────────────
+        requestAnimationFrame(function() {{
+          requestAnimationFrame(function() {{
+            overlay.style.opacity = '1';
+            panel.style.transform = 'scale(1)';
+            panel.style.opacity = '1';
+          }});
+        }});
 
         let remaining = {timeout_s};
-        const updateCountdown = () => {{
-            countdown.textContent = remaining > 0 ? `Auto-stopping in ${{remaining}}s...` : '';
+        function updateCountdown() {{
+            countdown.textContent = remaining > 0 ? 'Auto-stopping in ' + remaining + 's…' : '';
             if (remaining <= 0) {{ cleanup(); resolve(JSON.stringify({{action:'stop'}})); }}
-        }};
+        }}
         updateCountdown();
-        _timer = setInterval(() => {{ remaining--; updateCountdown(); }}, 1000);
+        _timer = setInterval(function() {{ remaining--; updateCountdown(); }}, 1000);
       }});
     }})();"""
 
@@ -1270,7 +1510,7 @@ class HelixAgentEngine:
         if not self.request or not self.user or not self.pipe_metadata:
             return msgs
 
-        # 1. add_file_context — injects text-file content into messages
+        # 1. add_file_context - injects text-file content into messages
         prep = copy.deepcopy(msgs)
         try:
             prep = await add_file_context(prep, self.chat_id, self.user)
@@ -1278,7 +1518,7 @@ class HelixAgentEngine:
         except Exception as e:
             logger.warning("add_file_context failed: %s", e)
 
-        # 2. chat_completion_files_handler — converts remaining attachments to multimodal blocks
+        # 2. chat_completion_files_handler - converts remaining attachments to multimodal blocks
         try:
             udump = self.user.model_dump() if hasattr(self.user, "model_dump") else {}
             extra = {
@@ -1645,7 +1885,7 @@ class HelixAgentEngine:
 
         summary_msg = {"role": "system", "content": "\n".join(summary_parts)}
 
-        # 4. Recent tail — safe extraction that preserves tool call pairs
+        # 4. Recent tail - safe extraction that preserves tool call pairs
         recent = self.history[-keep_last:] if len(self.history) > keep_last else self.history[len(preserved):]
 
         # If the cutoff split an assistant+tool_calls from its results, fix it
@@ -1670,42 +1910,50 @@ class HelixAgentEngine:
         # Attempt DB-backed state recovery at start of turn
         await self._recover_state_from_files(self.body if isinstance(self.body, dict) else {})
 
-        # After recovery, clamp loop_count so the iteration-limit modal
-        # doesn't fire immediately on re-entry (give a small buffer before hitting the limit)
-        if self.goal and self.task_list:
+        # After recovery, decide whether to continue the old session or start fresh.
+        # If every task is completed or failed, treat this as a brand-new request.
+        has_remaining_tasks = False
+        if self.task_list:
+            failed_names = {f["task"] for f in self.failed_tasks}
+            remaining = [
+                t for t in self.task_list
+                if t not in self.completed_tasks and t not in failed_names
+            ]
+            has_remaining_tasks = bool(remaining)
+
+        if self.goal and self.task_list and has_remaining_tasks:
+            # State was restored and there are still open tasks - continue execution
             max_allowed = max(0, self.valves.MAX_ITERATIONS - 5)
             if self.loop_count > max_allowed:
                 logger.info(f"Clamped loop_count from {self.loop_count} to {max_allowed} after state restore.")
                 self.loop_count = max_allowed
 
-        self.consecutive_json_errors = 0
-
-        if self.goal and self.task_list:
-            # State was restored from file attachment
             self.goal = f"{self.goal}; Updated: {user_msg}"
-            # Refresh the system prompt (phase may have changed)
             if self.history and self.history[0].get("role") == "system":
                 self.history[0]["content"] = self._build_system_prompt()
             else:
                 self.history.insert(0, {"role": "system", "content": self._build_system_prompt()})
             self.history.append({"role": "user", "content": user_msg})
-            # Filter tools for the restored phase
             self._filter_tools_for_phase(self.phase)
-            # Restore task list UI so it is visible immediately on re-entering the chat
             await self.emit_task_update()
         else:
-            # Fresh session: initialize everything from scratch
+            # Fresh session (or all old tasks are done): reset state and start from PLAN
+            if self.goal and self.task_list and not has_remaining_tasks:
+                logger.info("All tasks completed or failed; starting fresh session.")
             self.goal = user_msg
             self.phase = self.PHASE_PLAN
             self.task_list = []
             self.completed_tasks = []
             self.failed_tasks = []
+            self.loop_count = 0
             self._filter_tools_for_phase(self.PHASE_PLAN)
             system_prompt = self._build_system_prompt()
             self.history = [
                 {"role": "system", "content": system_prompt},
                 last_user_msg_raw if last_user_msg_raw else {"role": "user", "content": user_msg},
             ]
+
+        self.consecutive_json_errors = 0
 
         recent_calls = []
         self._output_parts = []
@@ -1807,7 +2055,7 @@ class HelixAgentEngine:
                 if xml_calls:
                     tc_dict = {tc["index"]: tc for tc in xml_calls}
                 else:
-                    # No tool calls and no XML rescue — check for unfinished tasks
+                    # No tool calls and no XML rescue - check for unfinished tasks
                     if content and self.task_list and len(self.completed_tasks) < len(self.task_list):
                         # Tasks remain: inject continuation prompt instead of terminating
                         self.history.append({
@@ -1816,7 +2064,7 @@ class HelixAgentEngine:
                         })
                         self.history.append({
                             "role": "user",
-                            "content": "SYSTEM: You produced text but did not call any tools. You have unfinished tasks. Continue working by calling the appropriate tool. Do NOT just describe what to do — call a tool.",
+                            "content": "SYSTEM: You produced text but did not call any tools. You have unfinished tasks. Continue working by calling the appropriate tool. Do NOT just describe what to do - call a tool.",
                         })
                         await self.emit_output(f"\n[WARN] No tool call produced. Re-prompting to continue.\n")
                         continue
@@ -1976,7 +2224,7 @@ class HelixAgentEngine:
                             "role": "user",
                             "content": f"SYSTEM: User provided feedback on the proposed plan: {feedback}. Please revise the plan and call confirm_plan again with the updated plan.",
                         })
-                        await self.emit_output(f"\n[PLAN] Plan rejected — user feedback: {feedback}\n")
+                        await self.emit_output(f"\n[PLAN] Plan rejected - user feedback: {feedback}\n")
                         await self.emit_status("[PLAN] Revising plan based on feedback...")
                         continue
                     elif result_data.get("action") == "cancel":
