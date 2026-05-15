@@ -447,10 +447,16 @@ class HelixAgentEngine:
                 return
             file_info = {"file_id": str(file_id), "name": filename}
 
-            # Update internal metadata
+            # Update internal metadata (prune old state files first)
             internal_files = self.metadata.get("__files__")
             if isinstance(internal_files, list):
+                internal_files[:] = [
+                    f for f in internal_files
+                    if not (isinstance(f, dict) and f.get("name", "").startswith("helix_state_"))
+                ]
                 internal_files.append(file_info)
+            else:
+                self.metadata["__files__"] = [file_info]
 
             # Direct DB binding
             if self.chat_id and self.message_id:
@@ -1657,6 +1663,15 @@ class HelixAgentEngine:
 
         # Attempt DB-backed state recovery at start of turn
         await self._recover_state_from_files(self.body if isinstance(self.body, dict) else {})
+
+        # After recovery, clamp loop_count so the iteration-limit modal
+        # doesn't fire immediately on re-entry (give a small buffer before hitting the limit)
+        if self.goal and self.task_list:
+            max_allowed = max(0, self.valves.MAX_ITERATIONS - 5)
+            if self.loop_count > max_allowed:
+                logger.info(f"Clamped loop_count from {self.loop_count} to {max_allowed} after state restore.")
+                self.loop_count = max_allowed
+
         self.consecutive_json_errors = 0
 
         if self.goal and self.task_list:
