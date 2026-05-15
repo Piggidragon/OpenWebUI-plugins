@@ -1781,105 +1781,90 @@ class AgentLoopEngine:
         return tasks
 
 
-# ──────────────────────────────────────────────────────────────────
-#  VALVES
-# ──────────────────────────────────────────────────────────────────
-
-class AgentValves(BaseModel):
-    AGENT_MODEL: str = Field(
-        default="",
-        description="Model ID for the agent loop. Leave blank to use the selected model. The model MUST support function calling (tool use). Examples: gpt-4o, claude-3.5-sonnet, gemini-2.0-flash."
-    )
-    MAX_ITERATIONS: int = Field(
-        default=24,
-        description="Maximum agent loop iterations before stopping."
-    )
-    MAX_TOOL_RESULT_CHARS: int = Field(
-        default=4200,
-        description="Max characters for tool results before truncation."
-    )
-    TOOL_TIMEOUT: int = Field(
-        default=90,
-        description="Timeout in seconds for individual tool execution. Set to 0 to disable."
-    )
-
-    # ── Per-phase tool allowlists (comma-separated tool names) ──
-    PLAN_TOOLS: str = Field(
-        default="",
-        description=(
-            "Comma-separated tool names allowed in PLAN phase. "
-            "Leave EMPTY to allow ALL tools. "
-            "Recommended: read-only tools like read_file, search_web, get_github_file_contents. "
-            "Example: confirm_plan, read_file, search_web"
-        )
-    )
-    EXECUTE_TOOLS: str = Field(
-        default="",
-        description=(
-            "Comma-separated tool names allowed in EXECUTE phase. "
-            "Leave EMPTY to allow ALL tools. "
-            "Example: github_access, file_write, web_search, read_file"
-        )
-    )
-    REVIEW_TOOLS: str = Field(
-        default="",
-        description=(
-            "Comma-separated tool names allowed in REVIEW phase. "
-            "Leave EMPTY to allow ALL tools. "
-            "Recommended: minimal or empty — review should primarily use internal tools (terminate, fix_plan, replan). "
-            "Example: read_file"
-        )
-    )
-
-    # ── Global denylist ──
-    TOOLS_DENYLIST: str = Field(
-        default="",
-        description=(
-            "Comma-separated tool names that are NEVER available in ANY phase. "
-            "Useful to permanently disable dangerous or irrelevant tools. "
-            "Example: execute_code, shell_command"
-        )
-    )
-
-    # ── Custom system prompt overrides ──
-    PLAN_PROMPT: str = Field(
-        default="",
-        description="Custom system prompt for PLAN phase. Leave empty for default. Available placeholders: {tool_names}."
-    )
-    EXECUTE_PROMPT: str = Field(
-        default="",
-        description="Custom system prompt for EXECUTE phase. Leave empty for default. Available placeholders: {tool_names}, {task_state}."
-    )
-    REVIEW_PROMPT: str = Field(
-        default="",
-        description="Custom system prompt for REVIEW phase. Leave empty for default. Available placeholders: {goal}, {task_state}, {tool_names}."
-    )
-
-
-class AgentUserValves(BaseModel):
-    ENABLE_PLAN_APPROVAL: bool = Field(
-        default=False,
-        description="Enable plan confirmation UI. When off, plans are auto-approved without asking the user.",
-    )
-    YOLO_MODE: bool = Field(
-        default=False,
-        description="Skip all user confirmations. Auto-approve plans and ignore iteration limits.",
-    )
-    SILENT_MODE: bool = Field(
-        default=False,
-        description="If True, show only plan approvals, final results, and errors. Hide tool call details, reasoning blocks, and intermediate status messages.",
-    )
-
-
-# ──────────────────────────────────────────────────────────────────
-#  PIPE
-# ──────────────────────────────────────────────────────────────────
-
 class Pipe:
+    class Valves(BaseModel):
+        AGENT_MODEL: str = Field(
+            default="",
+            description="Model ID for the agent loop. The model MUST support function calling (tool use). Examples: gpt-4o, claude-3.5-sonnet, gemini-2.0-flash."
+        )
+        MAX_ITERATIONS: int = Field(
+            default=24,
+            description="Maximum agent loop iterations before stopping."
+        )
+        MAX_TOOL_RESULT_CHARS: int = Field(
+            default=4200,
+            description="Max characters for tool results before truncation."
+        )
+        TOOL_TIMEOUT: int = Field(
+            default=90,
+            description="Timeout in seconds for individual tool execution. Set to 0 to disable."
+        )
+
+        PLAN_TOOLS: str = Field(
+            default="",
+            description=(
+                "Comma-separated tool names allowed in PLAN phase. "
+                "Leave EMPTY to allow ALL tools. "
+                "Recommended: read-only tools like read_file, search_web, get_github_file_contents."
+            )
+        )
+        EXECUTE_TOOLS: str = Field(
+            default="",
+            description=(
+                "Comma-separated tool names allowed in EXECUTE phase. "
+                "Leave EMPTY to allow ALL tools. "
+                "Example: github_access, file_write, web_search, read_file"
+            )
+        )
+        REVIEW_TOOLS: str = Field(
+            default="",
+            description=(
+                "Comma-separated tool names allowed in REVIEW phase. "
+                "Leave EMPTY to allow ALL tools. "
+                "Recommended: read-only tools like read_file, search_web, get_github_file_contents."
+            )
+        )
+
+        TOOLS_DENYLIST: str = Field(
+            default="",
+            description=(
+                "Comma-separated tool names that are NEVER available in ANY phase. "
+                "Useful to permanently disable dangerous or irrelevant tools. "
+                "Example: execute_code, shell_command"
+            )
+        )
+
+        PLAN_PROMPT: str = Field(
+            default="",
+            description="Custom system prompt for PLAN phase. Leave empty for default. Available placeholders: {tool_names}."
+        )
+        EXECUTE_PROMPT: str = Field(
+            default="",
+            description="Custom system prompt for EXECUTE phase. Leave empty for default. Available placeholders: {tool_names}, {task_state}."
+        )
+        REVIEW_PROMPT: str = Field(
+            default="",
+            description="Custom system prompt for REVIEW phase. Leave empty for default. Available placeholders: {goal}, {task_state}, {tool_names}."
+        )
+
+    class UserValves(BaseModel):
+        ENABLE_PLAN_APPROVAL: bool = Field(
+            default=False,
+            description="Enable plan confirmation UI. When off, plans are auto-approved without asking the user.",
+        )
+        YOLO_MODE: bool = Field(
+            default=False,
+            description="Skip all user confirmations. Auto-approve plans and ignore iteration limits.",
+        )
+        SILENT_MODE: bool = Field(
+            default=False,
+            description="If True, show only plan approvals, final results, and errors. Hide tool call details, reasoning blocks, and intermediate status messages.",
+        )
+
     def __init__(self):
         self.type = "manifold"
-        self.valves = AgentValves()
-        self.user_valves = AgentUserValves()
+        self.valves = self.Valves()
+        self.user_valves = self.UserValves()
 
     def pipes(self):
         model_suffix = f" ({self.valves.AGENT_MODEL})" if self.valves.AGENT_MODEL else ""
@@ -1912,11 +1897,13 @@ class Pipe:
             else getattr(__user__, "valves", None)
         )
         if user_valves_raw and isinstance(user_valves_raw, dict):
-            user_valves = AgentUserValves(**user_valves_raw)
-        elif user_valves_raw and isinstance(user_valves_raw, AgentUserValves):
+            user_valves = self.UserValves(**user_valves_raw)
+        elif user_valves_raw and isinstance(user_valves_raw, self.UserValves):
             user_valves = user_valves_raw
-        else:
+        elif hasattr(self, "user_valves") and self.user_valves:
             user_valves = self.user_valves
+        else:
+            user_valves = self.UserValves()
 
         model = self.valves.AGENT_MODEL or body.get("model", "")
 
