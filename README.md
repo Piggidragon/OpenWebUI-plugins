@@ -38,9 +38,12 @@ Full read/write access to GitHub repositories, issues, pull requests and workflo
 |-------|---------|----------|
 | `ENABLE_CONTENT` | on | Read access to repos, files, branches, commits |
 | `ENABLE_CONTENT_WRITE` | on | Create branches, create/write/rename/delete files and directories |
-| `ENABLE_ISSUES` | on | Read, create, update, close issues; add/list/update/delete comments |
-| `ENABLE_PULL_REQUESTS` | on | Read, create, update PRs, request reviewers, diff |
-| `ENABLE_WORKFLOWS` | on | List, trigger, cancel workflow runs |
+| `ENABLE_ISSUES` | on | List, search, get issues |
+| `ENABLE_ISSUES_WRITE` | on | Create, update, close, reopen issues |
+| `ENABLE_PULL_REQUESTS` | on | List, get PRs, get PR files, get PR diff |
+| `ENABLE_PULL_REQUESTS_WRITE` | on | Create PRs, request reviewers, update PRs |
+| `ENABLE_WORKFLOWS` | on | List/get workflows, list/get workflow runs, view run logs |
+| `ENABLE_WORKFLOWS_WRITE` | on | Trigger workflow dispatch, cancel/rerun workflow runs |
 
 **Workflow rule:**
 ```

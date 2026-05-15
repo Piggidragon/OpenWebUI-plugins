@@ -6,7 +6,7 @@ description: >
   branches, commits, and GitHub Actions workflows — directly from OpenWebUI.
   Uses the GitHub REST API with your Personal Access Token.
   Enforces a branch→file→PR workflow; no direct writes to main.
-version: 1.4.0
+version: 2.1.0
 """
 
 import base64
@@ -29,7 +29,7 @@ class Tools:
         )
         ENABLE_CONTENT: bool = Field(
             default=True,
-            description="Enable tools: list repos, read files, search code",
+            description="Enable tools: list repos, read files, search code, list branches/commits, compare branches",
         )
         ENABLE_CONTENT_WRITE: bool = Field(
             default=True,
@@ -37,15 +37,27 @@ class Tools:
         )
         ENABLE_ISSUES: bool = Field(
             default=True,
-            description="Enable tools: list, create, update, close issues; add/list/update/delete comments on issues and PRs",
+            description="Enable tools: list, search, get issues",
+        )
+        ENABLE_ISSUES_WRITE: bool = Field(
+            default=True,
+            description="Enable tools: create, update, close, reopen issues",
         )
         ENABLE_PULL_REQUESTS: bool = Field(
             default=True,
-            description="Enable tools: list, create, update PRs, request reviewers, diff (NO merge)",
+            description="Enable tools: list, get PRs, get PR files, get PR diff",
+        )
+        ENABLE_PULL_REQUESTS_WRITE: bool = Field(
+            default=True,
+            description="Enable tools: create PRs, request reviewers, update PRs",
         )
         ENABLE_WORKFLOWS: bool = Field(
             default=True,
-            description="Enable tools: list workflows/runs, view logs, trigger, cancel, rerun",
+            description="Enable tools: list/get workflows, list/get workflow runs, view run logs",
+        )
+        ENABLE_WORKFLOWS_WRITE: bool = Field(
+            default=True,
+            description="Enable tools: trigger workflow dispatch, cancel/rerun workflow runs",
         )
 
     def __init__(self):
@@ -75,6 +87,18 @@ class Tools:
     def _guard(self, flag: bool, name: str) -> None:
         if not flag:
             raise ValueError(f"{name} is disabled in your User Valves.")
+
+    def _guard_comments_read(self, uv: "Tools.UserValves") -> None:
+        if not uv.ENABLE_ISSUES and not uv.ENABLE_PULL_REQUESTS:
+            raise ValueError(
+                "Issues and Pull Requests are both disabled in your User Valves."
+            )
+
+    def _guard_comments_write(self, uv: "Tools.UserValves") -> None:
+        if not uv.ENABLE_ISSUES_WRITE and not uv.ENABLE_PULL_REQUESTS_WRITE:
+            raise ValueError(
+                "Issues Write and Pull Requests Write are both disabled in your User Valves."
+            )
 
     # ═══════════════════════════════════════════════════════════════
     #  CONTENT – Reading
@@ -797,7 +821,7 @@ class Tools:
             )
 
     # ═══════════════════════════════════════════════════════════════
-    #  ISSUES
+    #  ISSUES – Reading (ENABLE_ISSUES) / Writing (ENABLE_ISSUES_WRITE)
     # ═══════════════════════════════════════════════════════════════
 
     async def github_list_issues(
@@ -910,7 +934,7 @@ class Tools:
         :param assignees: Comma-separated GitHub usernames (optional)
         """
         uv = self._get_valves(__user__)
-        self._guard(uv.ENABLE_ISSUES, "Issues")
+        self._guard(uv.ENABLE_ISSUES_WRITE, "Issues Write")
         url = f"https://api.github.com/repos/{repo}/issues"
         payload: dict = {"title": title, "body": body}
         if labels:
@@ -948,7 +972,7 @@ class Tools:
         :param assignees: Comma-separated usernames (replaces existing; omit to keep)
         """
         uv = self._get_valves(__user__)
-        self._guard(uv.ENABLE_ISSUES, "Issues")
+        self._guard(uv.ENABLE_ISSUES_WRITE, "Issues Write")
         url = f"https://api.github.com/repos/{repo}/issues/{issue_number}"
         payload: dict = {}
         if title:
@@ -998,7 +1022,7 @@ class Tools:
         )
 
     # ═══════════════════════════════════════════════════════════════
-    #  COMMENTS (Issues & Pull Requests)
+    #  COMMENTS (Issues & PRs) – Read (ENABLE_ISSUES OR ENABLE_PULL_REQUESTS) / Write (ENABLE_ISSUES_WRITE OR ENABLE_PULL_REQUESTS_WRITE)
     # ═══════════════════════════════════════════════════════════════
 
     async def github_add_comment(
@@ -1013,8 +1037,7 @@ class Tools:
         :param body: Comment text (GitHub markdown)
         """
         uv = self._get_valves(__user__)
-        if not uv.ENABLE_ISSUES and not uv.ENABLE_PULL_REQUESTS:
-            raise ValueError("Issues and Pull Requests are both disabled in your User Valves.")
+        self._guard_comments_write(uv)
         url = f"https://api.github.com/repos/{repo}/issues/{number}/comments"
         async with httpx.AsyncClient() as c:
             r = await c.post(url, headers=self._auth(uv), json={"body": body})
@@ -1033,8 +1056,7 @@ class Tools:
         :param number: Issue or PR number
         """
         uv = self._get_valves(__user__)
-        if not uv.ENABLE_ISSUES and not uv.ENABLE_PULL_REQUESTS:
-            raise ValueError("Issues and Pull Requests are both disabled in your User Valves.")
+        self._guard_comments_read(uv)
         url = f"https://api.github.com/repos/{repo}/issues/{number}/comments?per_page=20"
         async with httpx.AsyncClient() as c:
             r = await c.get(url, headers=self._auth(uv))
@@ -1065,8 +1087,7 @@ class Tools:
         :param body: New comment text (GitHub markdown)
         """
         uv = self._get_valves(__user__)
-        if not uv.ENABLE_ISSUES and not uv.ENABLE_PULL_REQUESTS:
-            raise ValueError("Issues and Pull Requests are both disabled in your User Valves.")
+        self._guard_comments_write(uv)
         url = f"https://api.github.com/repos/{repo}/issues/comments/{comment_id}"
         async with httpx.AsyncClient() as c:
             r = await c.patch(url, headers=self._auth(uv), json={"body": body})
@@ -1085,8 +1106,7 @@ class Tools:
         :param comment_id: Comment ID to delete
         """
         uv = self._get_valves(__user__)
-        if not uv.ENABLE_ISSUES and not uv.ENABLE_PULL_REQUESTS:
-            raise ValueError("Issues and Pull Requests are both disabled in your User Valves.")
+        self._guard_comments_write(uv)
         url = f"https://api.github.com/repos/{repo}/issues/comments/{comment_id}"
         async with httpx.AsyncClient() as c:
             r = await c.delete(url, headers=self._auth(uv))
@@ -1094,7 +1114,7 @@ class Tools:
             return f"Comment **{comment_id}** deleted."
 
     # ═══════════════════════════════════════════════════════════════
-    #  PULL REQUESTS
+    #  PULL REQUESTS – Reading (ENABLE_PULL_REQUESTS) / Writing (ENABLE_PULL_REQUESTS_WRITE)
     # ═══════════════════════════════════════════════════════════════
 
     async def github_list_pull_requests(
@@ -1197,7 +1217,7 @@ class Tools:
         :param draft: Create as draft PR (default: False)
         """
         uv = self._get_valves(__user__)
-        self._guard(uv.ENABLE_PULL_REQUESTS, "Pull Requests")
+        self._guard(uv.ENABLE_PULL_REQUESTS_WRITE, "Pull Requests Write")
         url = f"https://api.github.com/repos/{repo}/pulls"
         payload = {
             "title": title,
@@ -1232,7 +1252,7 @@ class Tools:
         :param team_reviewers: Comma-separated team slugs (optional)
         """
         uv = self._get_valves(__user__)
-        self._guard(uv.ENABLE_PULL_REQUESTS, "Pull Requests")
+        self._guard(uv.ENABLE_PULL_REQUESTS_WRITE, "Pull Requests Write")
         url = (
             f"https://api.github.com/repos/{repo}/pulls/{pr_number}/requested_reviewers"
         )
@@ -1277,7 +1297,7 @@ class Tools:
         :param base: New target branch (omit to keep current)
         """
         uv = self._get_valves(__user__)
-        self._guard(uv.ENABLE_PULL_REQUESTS, "Pull Requests")
+        self._guard(uv.ENABLE_PULL_REQUESTS_WRITE, "Pull Requests Write")
         url = f"https://api.github.com/repos/{repo}/pulls/{pr_number}"
         payload: dict = {}
         if title:
@@ -1335,7 +1355,7 @@ class Tools:
 
 
     # ═══════════════════════════════════════════════════════════════
-    #  WORKFLOWS (GitHub Actions)
+    #  WORKFLOWS (GitHub Actions) – Reading (ENABLE_WORKFLOWS) / Writing (ENABLE_WORKFLOWS_WRITE)
     # ═══════════════════════════════════════════════════════════════
 
     async def github_list_workflows(self, repo: str, __user__: Optional[dict] = None) -> str:
@@ -1508,7 +1528,7 @@ class Tools:
         :param inputs: JSON object of workflow inputs (default: '{}'), e.g. '{"env":"staging"}'
         """
         uv = self._get_valves(__user__)
-        self._guard(uv.ENABLE_WORKFLOWS, "Workflows")
+        self._guard(uv.ENABLE_WORKFLOWS_WRITE, "Workflows Write")
         url = f"https://api.github.com/repos/{repo}/actions/workflows/{workflow_id}/dispatches"
         try:
             parsed_inputs = json.loads(inputs)
@@ -1532,7 +1552,7 @@ class Tools:
         :param run_id: Run ID to cancel
         """
         uv = self._get_valves(__user__)
-        self._guard(uv.ENABLE_WORKFLOWS, "Workflows")
+        self._guard(uv.ENABLE_WORKFLOWS_WRITE, "Workflows Write")
         url = f"https://api.github.com/repos/{repo}/actions/runs/{run_id}/cancel"
         async with httpx.AsyncClient() as c:
             r = await c.post(url, headers=self._auth(uv))
@@ -1551,7 +1571,7 @@ class Tools:
         :param run_id: Run ID to rerun
         """
         uv = self._get_valves(__user__)
-        self._guard(uv.ENABLE_WORKFLOWS, "Workflows")
+        self._guard(uv.ENABLE_WORKFLOWS_WRITE, "Workflows Write")
         url = f"https://api.github.com/repos/{repo}/actions/runs/{run_id}/rerun"
         async with httpx.AsyncClient() as c:
             r = await c.post(url, headers=self._auth(uv))
