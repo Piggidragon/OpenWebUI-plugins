@@ -1,7 +1,7 @@
 """
 title: Helix Agent
 author: Piggidragon
-version: 0.20.1
+version: 0.20.3
 description: >
   Helix Agent — OpenWebUI-native agent loop with modular per-phase tool control.
 
@@ -80,8 +80,7 @@ except Exception:
 # ──────────────────────────────────────────────────────────────────
 
 DEFAULT_PLAN_PROMPT = """\
-You are in PLAN mode. Your job is to understand the user's request, gather context, \
-and create a clear task plan.
+You are in PLAN mode. Your job is to understand the user's request and create a clear, actionable task plan.
 
 PHASE: PLAN
 
@@ -89,7 +88,7 @@ Available tools: {tool_names}
 
 What to do:
 1. Analyse the user's request thoroughly.
-2. Read relevant files, search the web, query knowledge -- use any tools to gather context.
+2. Use your available tools to understand the scope (read files, search knowledge, etc.), but do NOT perform the actual task yet (e.g., do not write files, push code, or execute actions).
 3. Create a numbered task list that covers the entire goal.
 4. Each task should be a clear, actionable step.
 5. After creating the plan, call confirm_plan with the plan text to present it for review.
@@ -105,14 +104,15 @@ When calling confirm_plan, provide the plan parameter as a numbered list with on
 Alternatively, you may provide the plan as JSON: {{"tasks": ["task 1", "task 2", "task 3"]}}
 
 Rules:
-- Be thorough -- read files before planning changes.
+- Focus purely on planning — do NOT attempt to perform the task or execute actions.
+- You may use available tools to gather context and inspect files or code relevant to the goal.
 - Break complex tasks into small, verifiable steps.
 - If the request is simple (1-2 tasks), still list them explicitly.
 - Call exactly ONE tool per step.
 - When done planning, call confirm_plan with the plan for confirmation.
 - If the request is inappropriate or impossible, call terminate with a brief explanation.
 - NEVER call replan in PLAN mode.
-- If a tool returns an error during planning (e.g., file not found), try an alternative tool or note the limitation in your plan. Do not call fix_plan for planning-stage errors.
+- If a tool returns an error during planning (e.g., file not found), note the limitation in your plan. Do not call fix_plan for planning-stage errors.
 - If the user rejects your plan with feedback, revise the plan based on their feedback and call confirm_plan again with the updated plan. Do NOT repeat the same plan unchanged.
 - If the user cancels the plan, acknowledge it and stop.
 - You may only use the tools listed above.
@@ -426,6 +426,7 @@ class HelixAgentEngine:
         self.goal = ""
         self._skill_prompt = ""
         self._mcp_clients: Dict[str, Any] = {}
+        self._extra_grace = 0
 
     def _format_output(self):
         filtered = []
@@ -466,6 +467,7 @@ class HelixAgentEngine:
                 "failed": self.failed_tasks,
                 "phase": self.phase,
                 "loop_count": self.loop_count,
+                "extra_grace": self._extra_grace,
             }
             filename = f"helix_state_{self.chat_id}.json"
             content = json.dumps(state_data, ensure_ascii=False).encode("utf-8")
@@ -530,13 +532,18 @@ class HelixAgentEngine:
             return
 
         state_file = None
-        # 1. Look in current message attachments
+        # 1. Look in current message attachments (body files)
         current_files = body.get("files") or body.get("__files__")
-        if current_files:
-            for f in reversed(current_files):
-                name = f.get("name", f.get("filename", ""))
-                if "helix_state" in name and name.endswith(".json"):
-                    state_file = f
+        # Also scan self.metadata files since they persist across turns
+        metadata_files = self.metadata.get("__files__") or self.metadata.get("files")
+        for file_list in (current_files, metadata_files):
+            if file_list:
+                for f in reversed(file_list):
+                    name = f.get("name", f.get("filename", ""))
+                    if "helix_state" in name and name.endswith(".json"):
+                        state_file = f
+                        break
+                if state_file:
                     break
 
         # 2. Deep DB history scan
@@ -591,6 +598,7 @@ class HelixAgentEngine:
             self.phase = data.get("phase", self.PHASE_PLAN)
             self.goal = data.get("goal", self.goal)
             self.loop_count = data.get("loop_count", 0)
+            self._extra_grace = data.get("extra_grace", 0)
             logger.info("Helix state recovered from file attachment.")
         except Exception as e:
             logger.warning(f"State recovery from file failed: {e}")
@@ -1175,8 +1183,8 @@ class HelixAgentEngine:
             self.completed_tasks = []
             self.failed_tasks = []
             self.consecutive_json_errors = 0
-            # Grant 3 extra iterations without fully resetting the safety counter
-            self.loop_count = max(0, self.loop_count - 3)
+            # Grant 3 extra iterations without rewinding the persistent counter
+            self._extra_grace += 3
             self.history = self._compress_history()
         else:
             # Hard replan: replace task list entirely, full history reset
@@ -1197,7 +1205,7 @@ class HelixAgentEngine:
                 {"role": "user", "content": self.goal},
             ]
 
-        if self.phase != self.PHASE_EXECUTE:
+        if self.phase in (self.PHASE_REVIEW, self.PHASE_OUTPUT):
             self._transition_to(self.PHASE_EXECUTE)
 
         await self._save_state_to_file()
@@ -1277,8 +1285,9 @@ class HelixAgentEngine:
             return json.dumps({"action": "accept"})
 
         if not self.event_call:
-            return json.dumps({"action": "accept"})
+            return json.dumps({"action": "error", "error": "Plan confirmation required but unavailable (no event_call channel)."})
 
+        # Task list extraction is deferred to the accept branch in _run_impl
         tasks = self._extract_task_list(plan_text)
         tasks_data = [{"task_id": f"T{i+1}", "description": t} for i, t in enumerate(tasks)]
         if not tasks_data:
@@ -1289,13 +1298,13 @@ class HelixAgentEngine:
             raw = await self.event_call({"type": "execute", "data": {"code": js}})
         except Exception as e:
             logger.error(f"Plan approval event_call failed: {e}")
-            return json.dumps({"action": "accept"})
+            return json.dumps({"action": "error", "error": f"Plan confirmation failed: {e}"})
 
         raw_str = raw if isinstance(raw, str) else (raw.get("result") or raw.get("value") or "{}") if raw else "{}"
         try:
-            res = json.loads(raw_str) if isinstance(raw_str, str) and raw_str.startswith("{") else {"action": "accept"}
+            res = json.loads(raw_str) if isinstance(raw_str, str) and raw_str.startswith("{") else {"action": "error", "error": "Malformed confirmation response."}
         except (json.JSONDecodeError, AttributeError):
-            res = {"action": "accept"}
+            res = {"action": "error", "error": "Malformed confirmation response."}
 
         return json.dumps(res)
 
@@ -1601,8 +1610,8 @@ class HelixAgentEngine:
 
         let remaining = {timeout_s};
         const updateCountdown = () => {{
-            countdown.textContent = remaining > 0 ? `Auto-accepting in ${{remaining}}s...` : '';
-            if (remaining <= 0) {{ cleanup(); resolve(JSON.stringify({{action:'accept'}})); }}
+            countdown.textContent = remaining > 0 ? `Auto-stopping in ${{remaining}}s...` : '';
+            if (remaining <= 0) {{ cleanup(); resolve(JSON.stringify({{action:'timeout'}})); }}
         }};
         updateCountdown();
         _timer = setInterval(() => {{ remaining--; updateCountdown(); }}, 1000);
@@ -2225,12 +2234,13 @@ class HelixAgentEngine:
                 if self.history and self.history[0].get("role") == "system":
                     self.history[0]["content"] = self._build_system_prompt()
 
-            if self.loop_count >= self.valves.MAX_ITERATIONS:
-                await self.emit_output(f"\n[WARN] Max iterations ({self.valves.MAX_ITERATIONS}) reached.")
+            effective_max = self.valves.MAX_ITERATIONS + self._extra_grace
+            if self.loop_count >= effective_max:
+                await self.emit_output(f"\n[WARN] Max iterations ({effective_max}) reached.")
                 should_continue = False
                 if self.event_call and not (self.user_valves and getattr(self.user_valves, "YOLO_MODE", False)):
                     try:
-                        js = self._build_iteration_limit_js(self.loop_count, self.valves.MAX_ITERATIONS)
+                        js = self._build_iteration_limit_js(self.loop_count, effective_max)
                         raw = await self.event_call({"type": "execute", "data": {"code": js}})
                         raw_str = raw if isinstance(raw, str) else (raw.get("result") or raw.get("value") or "{}") if raw else "{}"
                         try:
@@ -2241,7 +2251,7 @@ class HelixAgentEngine:
                     except Exception as e:
                         logger.warning(f"Iteration limit dialog failed: {e}")
                 if should_continue:
-                    self.loop_count = 0
+                    self._extra_grace += self.valves.MAX_ITERATIONS
                     await self.emit_status("Continuing after iteration limit...")
                     continue
                 await self.emit_task_update(finalize_tasks=True)
@@ -2266,7 +2276,8 @@ class HelixAgentEngine:
             icon = phase_icons.get(self.phase, "[LOOP]")
             name = phase_name.get(self.phase, "Loop")
 
-            await self.emit_status(f"Mode: {name}, Loop: {self.loop_count}/{self.valves.MAX_ITERATIONS}")
+            effective_max = self.valves.MAX_ITERATIONS + self._extra_grace
+            await self.emit_status(f"Mode: {name}, Loop: {self.loop_count}/{effective_max}")
 
 
             self.history = self._manage_context_window(self.history)
@@ -2328,6 +2339,18 @@ class HelixAgentEngine:
                     tc_dict = {tc["index"]: tc for tc in xml_calls}
                 else:
                     # No tool calls and no XML rescue
+                    # PLAN phase: enforce that the model must call confirm_plan.
+                    if self.phase == self.PHASE_PLAN:
+                        self.history.append({
+                            "role": "assistant",
+                            "content": content or "",
+                        })
+                        self.history.append({
+                            "role": "user",
+                            "content": "SYSTEM: You produced text but did not call any tools. You MUST call the confirm_plan tool with the plan to proceed. Do NOT output the plan as text—call the tool.",
+                        })
+                        await self.emit_output(f"\n[WARN] No tool call produced in PLAN phase. Re-prompting to enforce confirm_plan.\n")
+                        continue
                     # OUTPUT phase: never emit text in Turn 1, always proceed to Turn 2
                     if self.phase == self.PHASE_OUTPUT:
                         if self._output_turn == 1:
@@ -2540,12 +2563,27 @@ class HelixAgentEngine:
 
                 # ── Handle confirm_plan ──
                 if tool_name == "confirm_plan":
-                    plan_text = args.get("plan", content or "")
-                    self.task_list = self._extract_task_list(plan_text or content or "")
                     result_json = await self._tool_confirm_plan(**args)
                     result_data = json.loads(result_json)
+                    action = result_data.get("action", "")
 
-                    if result_data.get("action") == "feedback":
+                    # Error / timeout → stop immediately
+                    if action in ("error", "timeout"):
+                        error_msg = result_data.get("error", "Plan confirmation failed.")
+                        await self.emit_output(f"\n[PLAN] **Plan confirmation error:** {error_msg}\n")
+                        await self.emit_task_update(finalize_tasks=True)
+                        await self.emit_status("Plan confirmation error", done=True)
+                        return self._format_output()
+
+                    # Cancel → stop immediately
+                    if action == "cancel":
+                        await self.emit_output("\nThe plan was cancelled by the user. The agent will not proceed.\n")
+                        await self.emit_task_update(finalize_tasks=True)
+                        await self.emit_status("Plan cancelled", done=True)
+                        return self._format_output()
+
+                    # Feedback → stay in PLAN, revise
+                    if action == "feedback":
                         feedback = result_data.get("value", "")
                         self.history.append({
                             "role": "tool",
@@ -2560,24 +2598,22 @@ class HelixAgentEngine:
                         await self.emit_output(f"\n[PLAN] Plan rejected — user feedback: {feedback}\n")
                         await self.emit_status("[PLAN] Revising plan based on feedback...")
                         continue
-                    elif result_data.get("action") == "cancel":
-                        await self.emit_output("\nThe plan was cancelled by the user. The agent will not proceed.\n")
-                        await self.emit_task_update(finalize_tasks=True)
-                        await self.emit_status("Plan cancelled", done=True)
-                        return self._format_output()
-                    else:
-                        self._transition_to(self.PHASE_EXECUTE)
-                        await self._save_state_to_file()
-                        await self.emit_task_update()
-                        self.history.append({
-                            "role": "tool",
-                            "content": result_json,
-                            "tool_call_id": call_id,
-                            "name": tool_name,
-                        })
-                        task_summary = "\n".join(f"  {i+1}. {t}" for i, t in enumerate(self.task_list))
-                        await self.emit_output(f"\n[PLAN] Plan approved. Moving to execution.\n\n{task_summary}\n")
-                        continue
+
+                    # Accept (or unknown safe fallback) → extract tasks, transition
+                    plan_text = args.get("plan", content or "")
+                    self.task_list = self._extract_task_list(plan_text or content or "")
+                    self._transition_to(self.PHASE_EXECUTE)
+                    await self._save_state_to_file()
+                    await self.emit_task_update()
+                    self.history.append({
+                        "role": "tool",
+                        "content": result_json,
+                        "tool_call_id": call_id,
+                        "name": tool_name,
+                    })
+                    task_summary = "\n".join(f"  {i+1}. {t}" for i, t in enumerate(self.task_list))
+                    await self.emit_output(f"\n[PLAN] Plan approved. Moving to execution.\n\n{task_summary}\n")
+                    continue
 
                 # ── Handle run_tools_parallel ──
                 if tool_name == "run_tools_parallel":
