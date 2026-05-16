@@ -1,7 +1,7 @@
 """
 title: Helix Agent
 author: Piggidragon
-version: 4.8.0
+version: 4.8.2
 description: >
   Helix Agent - OpenWebUI-native agent loop with modular per-phase tool control.
 
@@ -104,6 +104,8 @@ Rules:
 - If the user cancels the plan, acknowledge it and stop.
 - You may use the ask_user tool to ask the user a multiple-choice question if you need clarification before planning.
 - You may only use the tools listed above.
+- ABSOLUTELY CRITICAL: You MUST call confirm_plan to finish PLAN mode. Do NOT answer the user directly. Do NOT generate story text, code, or any output intended for the user. Only call tools.
+- If you have already asked clarification questions, stop asking and call confirm_plan with your best plan now.
 """
 
 DEFAULT_EXECUTE_PROMPT = """\
@@ -194,6 +196,7 @@ Rules:
 - NEVER call terminate in QUICK REPLAN mode.
 - You may use the ask_user tool to ask the user a multiple-choice question if you need clarification.
 - You may only use the tools listed above.
+- ABSOLUTELY CRITICAL: You MUST call confirm_plan to finish QUICK REPLAN mode. Do NOT answer the user directly. Do NOT generate story text, code, or any other output. Only call tools.
 """
 
 
@@ -423,6 +426,7 @@ class HelixAgentEngine:
         self._output_parts = []
         self.loop_count = 0
         self.goal = ""
+        self._plan_questions_asked = 0  # Track ask_user calls in PLAN/REPLAN_SKIP phases
 
     def _format_output(self):
         filtered = []
@@ -843,7 +847,8 @@ class HelixAgentEngine:
         elif phase == self.PHASE_REVIEW:
             allowlist = set(_comma_list(self.valves.REVIEW_TOOLS))
         elif phase == self.PHASE_REPLAN_SKIP:
-            allowlist = set(_comma_list(self.valves.REPLAN_SKIP_TOOLS))
+            # QUICK REPLAN uses the same tool allowlist as PLAN
+            allowlist = set(_comma_list(self.valves.PLAN_TOOLS))
 
         # If allowlist is empty -> allow ALL tools
         # If allowlist has entries -> only those tools (plus internals)
@@ -1107,6 +1112,14 @@ class HelixAgentEngine:
 
     async def _tool_ask_user(self, question: str, options: list, allow_custom: bool = True, **kwargs):
         """Interactive user question tool. Only available during PLAN and REPLAN_SKIP phases."""
+        if self.phase in (self.PHASE_PLAN, self.PHASE_REPLAN_SKIP):
+            self._plan_questions_asked += 1
+            if self._plan_questions_asked >= self.valves.MAX_PLAN_QUESTIONS:
+                return (
+                    "CRITICAL: You have reached the maximum number of clarification questions "
+                    f"({self.valves.MAX_PLAN_QUESTIONS}). You must NOT ask more questions. "
+                    "Call confirm_plan with your best plan NOW."
+                )
         if not self.event_call:
             return "Error: interactive input not available in this context."
 
@@ -2090,6 +2103,9 @@ return (function() {{
         """Transition to a new phase: update tools, system prompt, state."""
         self.phase = phase
         self._consecutive_tool_misses.clear()
+        # Reset question counter when entering planning phases
+        if phase in (self.PHASE_PLAN, self.PHASE_REPLAN_SKIP):
+            self._plan_questions_asked = 0
         # Rebuild filtered tools for new phase
         self._filter_tools_for_phase(phase)
 
@@ -2281,6 +2297,7 @@ return (function() {{
             self.completed_tasks = []
             self.failed_tasks = []
             self.loop_count = 0
+            self._plan_questions_asked = 0
             self._filter_tools_for_phase(self.PHASE_PLAN)
             system_prompt = self._build_system_prompt()
             self.history = [
@@ -2395,29 +2412,45 @@ return (function() {{
 
             content = strip_thinking("".join(content_chunks).strip())
 
-            if not tc_dict:
-                # Try XML tool call rescue for hallucinated <ToolCall> blocks
-                xml_calls = extract_xml_tool_calls(content or "")
-                if xml_calls:
-                    tc_dict = {tc["index"]: tc for tc in xml_calls}
-                else:
-                    # No tool calls and no XML rescue - check for unfinished tasks
-                    if content and self.task_list and len(self.completed_tasks) < len(self.task_list):
-                        # Tasks remain: inject continuation prompt instead of terminating
-                        self.history.append({
-                            "role": "assistant",
-                            "content": content,
-                        })
-                        self.history.append({
-                            "role": "user",
-                            "content": "SYSTEM: You produced text but did not call any tools. You have unfinished tasks. Continue working by calling the appropriate tool. Do NOT just describe what to do - call a tool.",
-                        })
-                        await self.emit_output(f"\n[WARN] No tool call produced. Re-prompting to continue.\n")
-                        continue
-                    if content:
-                        await self.emit_output(content)
-                    await self.emit_status("Done", done=True)
-                    return self._format_output()
+                if not tc_dict:
+                    # Try XML tool call rescue for hallucinated <ToolCall> blocks
+                    xml_calls = extract_xml_tool_calls(content or "")
+                    if xml_calls:
+                        tc_dict = {tc["index"]: tc for tc in xml_calls}
+                    else:
+                        # No tool calls and no XML rescue - check for unfinished tasks
+                        if content and self.task_list and len(self.completed_tasks) < len(self.task_list):
+                            # Tasks remain: inject continuation prompt instead of terminating
+                            self.history.append({
+                                "role": "assistant",
+                                "content": content,
+                            })
+                            self.history.append({
+                                "role": "user",
+                                "content": "SYSTEM: You produced text but did not call any tools. You have unfinished tasks. Continue working by calling the appropriate tool. Do NOT just describe what to do - call a tool.",
+                            })
+                            await self.emit_output(f"\n[WARN] No tool call produced. Re-prompting to continue.\n")
+                            continue
+
+                        # CRITICAL FIX: In PLAN or QUICK REPLAN phases, never return content directly.
+                        # The loop must continue until confirm_plan is called.
+                        if self.phase in (self.PHASE_PLAN, self.PHASE_REPLAN_SKIP):
+                            if content:
+                                self.history.append({
+                                    "role": "assistant",
+                                    "content": content,
+                                })
+                            self.history.append({
+                                "role": "user",
+                                "content": "SYSTEM: You are still in PLAN mode. Do NOT answer the user directly. You MUST call confirm_plan with a numbered task list to move to execution. If you have asked enough questions, just formulate your best plan and call confirm_plan now.",
+                            })
+                            await self.emit_output(f"\n[WARN] PLAN phase: produced content without confirm_plan. Re-prompting...\n")
+                            continue
+
+                        if content:
+                            await self.emit_output(content)
+                        await self.emit_status("Done", done=True)
+                        return self._format_output()
 
             tool_calls_list = list(tc_dict.values())
             self.history.append({
@@ -2786,9 +2819,9 @@ class Pipe:
             default=DEFAULT_REPLAN_SKIP_PROMPT,
             description="System prompt for QUICK REPLAN phase. Available placeholders: {goal}, {tool_names}."
         )
-        REPLAN_SKIP_TOOLS: str = Field(
-            default="",
-            description="Comma-separated tool names allowed in QUICK REPLAN phase. Leave EMPTY to allow ALL tools."
+        MAX_PLAN_QUESTIONS: int = Field(
+            default=3,
+            description="Maximum number of ask_user calls allowed in PLAN and QUICK REPLAN phases before the agent is forced to call confirm_plan. Set to 0 to disable user questions entirely.",
         )
 
     class UserValves(BaseModel):
