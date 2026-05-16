@@ -1,7 +1,7 @@
 """
 title: Helix Agent
 author: Piggidragon
-version: 0.18.0
+version: 0.19.1
 description: >
   Helix Agent — OpenWebUI-native agent loop with modular per-phase tool control.
 
@@ -152,7 +152,7 @@ Rules:
 """
 
 DEFAULT_REVIEW_PROMPT = """\
-You are in REVIEW mode. Your ONLY job is to pick one of three actions.
+You are in REVIEW mode. Your ONLY job is to pick one of these actions.
 
 PHASE: REVIEW
 Original goal: {goal}
@@ -164,16 +164,36 @@ Task status markers: [done] = completed, [FAIL: reason] = failed with reason, [ 
 
 You MUST call exactly ONE of these tools:
 
-1. `terminate(final_answer)` — Everything is done and correct. Provide a concise final answer summarising what was accomplished.
+1. `proceed_to_output()` — Everything is done and correct. Move to the OUTPUT phase to generate the polished final answer.
 2. `fix_plan(reason, updated_tasks)` — Only minor fixes are needed (a task failed or needs a small correction). List just the new/corrected tasks.
 3. `replan(reason, updated_tasks, mode="soft")` — The overall strategy is broken and tasks need to be replaced entirely.
 
 Rules:
 - If there are only minor issues with individual tasks, ALWAYS prefer `fix_plan` over `replan`. Only use `replan` if the overall strategy is broken.
-- Be honest — don't call `terminate` if something is missing or wrong.
-- If the result is good enough, call `terminate`. Don't gold-plate.
+- Be honest — don't call `proceed_to_output` if something is missing or wrong.
+- If the result is good enough, call `proceed_to_output`. Don't gold-plate.
 - Provide a brief reasoning for your assessment before calling the final tool.
 - You may only use the tools listed above.
+"""
+
+DEFAULT_OUTPUT_PROMPT = """\
+You are in OUTPUT mode. Your ONLY job is to produce the final, polished answer for the user.
+
+PHASE: OUTPUT
+Original goal: {goal}
+Available tools: {tool_names}
+
+{task_state}
+
+What to do:
+1. Produce the final answer. Summarise what was accomplished clearly.
+2. Use rendering or output-specific tools (e.g. show_map, diagram rendering, visualisations) if they help present the result.
+3. When done, call terminate with the final answer.
+
+Rules:
+- This is the FINAL phase. Do NOT call replan, fix_plan, complete_task, or fail_task here.
+- You may only use the tools listed above.
+- Do NOT ask the user questions.
 """
 
 
@@ -364,11 +384,19 @@ class HelixAgentEngine:
     PHASE_PLAN = "plan"
     PHASE_EXECUTE = "execute"
     PHASE_REVIEW = "review"
+    PHASE_OUTPUT = "output"
 
     MAX_HISTORY_MESSAGES = 50
 
     # Internal tools that are ALWAYS available regardless of phase filters
-    INTERNAL_TOOLS = {"terminate", "replan", "complete_task", "fail_task", "confirm_plan", "fix_plan", "rag_search"}
+    INTERNAL_TOOLS = {"terminate", "replan", "complete_task", "fail_task", "confirm_plan", "fix_plan", "rag_search", "proceed_to_output"}
+
+    PHASE_INTERNAL_TOOLS = {
+        PHASE_PLAN:    {"replan", "complete_task", "fail_task", "confirm_plan", "fix_plan", "rag_search"},
+        PHASE_EXECUTE: {"terminate", "replan", "complete_task", "fail_task", "fix_plan", "rag_search"},
+        PHASE_REVIEW:  {"proceed_to_output", "replan", "fix_plan", "rag_search"},
+        PHASE_OUTPUT:  {"terminate", "rag_search"},
+    }
 
     def __init__(self, request, user, body, event_emitter, event_call, metadata, valves, user_valves=None):
         self.request = request
@@ -774,6 +802,20 @@ class HelixAgentEngine:
             "callable": self._tool_fix_plan,
             "type": "function",
         }
+        self.all_tools_dict["proceed_to_output"] = {
+            "spec": {
+                "name": "proceed_to_output",
+                "description": "Move from REVIEW to OUTPUT phase to generate the polished final answer. Call this when everything is done and correct.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "notes": {"type": "string", "description": "Optional brief notes about the review decision."},
+                    },
+                },
+            },
+            "callable": self._tool_proceed_to_output,
+            "type": "function",
+        }
         self.all_tools_dict["rag_search"] = {
             "spec": {
                 "name": "rag_search",
@@ -1042,18 +1084,24 @@ class HelixAgentEngine:
             allowlist = set(_comma_list(self.valves.EXECUTE_TOOLS))
         elif phase == self.PHASE_REVIEW:
             allowlist = set(_comma_list(self.valves.REVIEW_TOOLS))
+        elif phase == self.PHASE_OUTPUT:
+            allowlist = set(_comma_list(self.valves.OUTPUT_TOOLS))
+
+        # Phase-specific internal tools (only show relevant ones per phase)
+        phase_internal_tools = self.PHASE_INTERNAL_TOOLS.get(phase, self.INTERNAL_TOOLS)
 
         # If allowlist is empty -> allow ALL tools
-        # If allowlist has entries -> only those tools (plus internals)
+        # If allowlist has entries -> only those tools (plus phase-internal ones)
         self.phase_tools_dict = {}
 
         for name, tool in self.all_tools_dict.items():
-            # Internal tools are ALWAYS included regardless of allowlist
+            # Internal tools are included ONLY if in phase_internal_tools
             if name in self.INTERNAL_TOOLS:
-                self.phase_tools_dict[name] = tool
+                if name in phase_internal_tools:
+                    self.phase_tools_dict[name] = tool
                 continue
 
-            # Allowlist filtering
+            # Allowlist filtering for non-internal tools
             if allowlist:
                 if name in allowlist:
                     self.phase_tools_dict[name] = tool
@@ -1175,6 +1223,15 @@ class HelixAgentEngine:
         self.history[0]["content"] = self._build_system_prompt()
         await self.emit_task_update()
         return json.dumps({"fix_plan": True, "inserted_tasks": new_tasks, "reason": reason})
+
+    async def _tool_proceed_to_output(self, **kwargs):
+        """Transition from REVIEW to OUTPUT phase."""
+        if self.phase == self.PHASE_REVIEW:
+            self._transition_to(self.PHASE_OUTPUT)
+            await self._save_state_to_file()
+            await self.emit_task_update()
+            return json.dumps({"proceed_to_output": True})
+        return json.dumps({"proceed_to_output": False, "error": f"Cannot proceed to output from {self.phase} phase"})
 
     async def _tool_confirm_plan(self, **kwargs):
         plan_text = kwargs.get("plan", "")
@@ -1768,6 +1825,8 @@ class HelixAgentEngine:
                 base = (self.valves.EXECUTE_PROMPT or DEFAULT_EXECUTE_PROMPT).format(tool_names=tool_names, task_state=task_state)
             elif self.phase == self.PHASE_REVIEW:
                 base = (self.valves.REVIEW_PROMPT or DEFAULT_REVIEW_PROMPT).format(goal=self.goal, task_state=task_state, tool_names=tool_names)
+            elif self.phase == self.PHASE_OUTPUT:
+                base = (self.valves.OUTPUT_PROMPT or DEFAULT_OUTPUT_PROMPT).format(goal=self.goal, task_state=task_state, tool_names=tool_names)
             else:
                 base = DEFAULT_PLAN_PROMPT.format(tool_names=tool_names)
         except (KeyError, IndexError, ValueError):
@@ -1778,6 +1837,8 @@ class HelixAgentEngine:
                 base = DEFAULT_EXECUTE_PROMPT.format(tool_names=tool_names, task_state=task_state)
             elif self.phase == self.PHASE_REVIEW:
                 base = DEFAULT_REVIEW_PROMPT.format(goal=self.goal, task_state=task_state, tool_names=tool_names)
+            elif self.phase == self.PHASE_OUTPUT:
+                base = DEFAULT_OUTPUT_PROMPT.format(goal=self.goal, task_state=task_state, tool_names=tool_names)
             else:
                 base = DEFAULT_PLAN_PROMPT.format(tool_names=tool_names)
 
@@ -2002,11 +2063,13 @@ class HelixAgentEngine:
                 self.PHASE_PLAN: "[PLAN]",
                 self.PHASE_EXECUTE: "[EXEC]",
                 self.PHASE_REVIEW: "[REVU]",
+                self.PHASE_OUTPUT: "[OUT]",
             }
             phase_name = {
                 self.PHASE_PLAN: "Plan",
                 self.PHASE_EXECUTE: "Execute",
                 self.PHASE_REVIEW: "Review",
+                self.PHASE_OUTPUT: "Output",
             }
             icon = phase_icons.get(self.phase, "[LOOP]")
             name = phase_name.get(self.phase, "Loop")
@@ -2199,6 +2262,23 @@ class HelixAgentEngine:
                         self._transition_to(self.PHASE_REVIEW)
                     continue
 
+                # ── Handle proceed_to_output ──
+                if tool_name == "proceed_to_output":
+                    result_json = await self._tool_proceed_to_output(**args)
+                    result_data = json.loads(result_json)
+                    if result_data.get("proceed_to_output"):
+                        await self.emit_output(f"\n[OUT] **Proceeding to output generation...**\n")
+                        await self.emit_status("[OUT] Moving to output phase...")
+                    else:
+                        await self.emit_output(f"\n[OUT] **Output transition failed:** {result_data.get('error', 'Unknown error')}\n")
+                    self.history.append({
+                        "role": "tool",
+                        "content": result_json,
+                        "tool_call_id": call_id,
+                        "name": tool_name,
+                    })
+                    continue
+
                 # ── Handle fix_plan ──
                 if tool_name == "fix_plan":
                     result_json = await self._tool_fix_plan(**args)
@@ -2214,7 +2294,7 @@ class HelixAgentEngine:
                         "tool_call_id": call_id,
                         "name": tool_name,
                     })
-                    if self.phase == self.PHASE_REVIEW:
+                    if self.phase in (self.PHASE_REVIEW, self.PHASE_OUTPUT):
                         self._transition_to(self.PHASE_EXECUTE)
                     continue
 
@@ -2451,7 +2531,22 @@ class Pipe:
             description=(
                 "Comma-separated tool names allowed in REVIEW phase. "
                 "Leave EMPTY to allow ALL tools. "
-                "Default is a read-only / review-safe set."
+                "Default is a read-only / review-safe set + command execution."
+            )
+        )
+        OUTPUT_TOOLS: str = Field(
+            default=(
+                "show_map, run_tools_parallel, get_weather_forecast, render_visualization, "
+                "list_files, read_file, display_file, grep_search, glob_search, "
+                "list_processes, get_process_status, get_current_timestamp, calculate_timestamp, "
+                "list_knowledge_bases, search_knowledge_bases, query_knowledge_bases, "
+                "search_knowledge_files, query_knowledge_files, view_knowledge_file, "
+                "search_chats, view_chat, search_notes, view_note, view_skill, create_tasks"
+            ),
+            description=(
+                "Comma-separated tool names allowed in OUTPUT phase. "
+                "Leave EMPTY to allow ALL tools. "
+                "Default includes rendering/output tools and read-only helpers."
             )
         )
 
@@ -2466,6 +2561,10 @@ class Pipe:
         REVIEW_PROMPT: str = Field(
             default=DEFAULT_REVIEW_PROMPT,
             description="System prompt for REVIEW phase. Available placeholders: {goal}, {task_state}, {tool_names}."
+        )
+        OUTPUT_PROMPT: str = Field(
+            default=DEFAULT_OUTPUT_PROMPT,
+            description="System prompt for OUTPUT phase. Available placeholders: {goal}, {task_state}, {tool_names}."
         )
 
     class UserValves(BaseModel):
