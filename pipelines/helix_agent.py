@@ -8,7 +8,7 @@ description: >
   Architecture:
   - SINGLE model loop (Plan -> Execute -> Review -> Replan -> Execute...)
   - Per-phase tool filtering via Valves — only relevant tools exposed to the LLM at each phase
-  - Internal control tools (terminate, replan, fix_plan, complete_task, fail_task, confirm_plan, rag_search) always available
+  - Internal control tools (terminate, replan, fix_plan, complete_task, fail_task, confirm_plan) always available
   - Uses OpenWebUI native tool infrastructure (get_tools, get_builtin_tools, get_terminal_tools)
   - Context window management with adaptive history truncation and tool-call pair integrity
 
@@ -24,10 +24,10 @@ description: >
   - System prompt refresh: task mutations (complete, fail, fix_plan) update the LLM's task state context
   - Iteration limit with Continue/Cancel modal; graceful shutdown on CancelledError/GeneratorExit
   - File handling: add_file_context + chat_completion_files_handler for native multimodal/text file injection
-  - RAG search built-in: agent can query attached large files via vector search
+  - Knowledge bases: native OpenWebUI vector search via model metadata
   - MCP support: resolves and calls MCP server tools via OpenWebUI's MCPClient
   - Skills support: resolves user skills from model metadata and injects them into the system prompt
-requirements: open-webui>=0.9.1, chromadb, sentence-transformers, langchain-text-splitters
+requirements: open-webui>=0.9.1
 """
 
 import asyncio
@@ -419,14 +419,14 @@ class HelixAgentEngine:
     MAX_REPLAN_SKIP_LOOPS = 3  # Safety net: max loops in quick replan phase
 
     # Internal tools that are ALWAYS available regardless of phase filters
-    INTERNAL_TOOLS = {"terminate", "replan", "complete_task", "fail_task", "confirm_plan", "fix_plan", "rag_search", "proceed_to_output", "early_finish", "run_tools_parallel"}
+    INTERNAL_TOOLS = {"terminate", "replan", "complete_task", "fail_task", "confirm_plan", "fix_plan", "proceed_to_output", "early_finish", "run_tools_parallel"}
 
     PHASE_INTERNAL_TOOLS = {
-        PHASE_PLAN:       {"terminate", "replan", "complete_task", "fail_task", "confirm_plan", "fix_plan", "rag_search"},
-        PHASE_EXECUTE:    {"replan", "complete_task", "fail_task", "fix_plan", "rag_search", "early_finish", "run_tools_parallel"},
-        PHASE_REVIEW:     {"proceed_to_output", "replan", "fix_plan", "rag_search"},
-        PHASE_OUTPUT:     {"rag_search"},
-        PHASE_REPLAN_SKIP:{"confirm_plan", "rag_search", "ask_user"},  # Quick replan has minimal internal tools
+        PHASE_PLAN:       {"terminate", "replan", "complete_task", "fail_task", "confirm_plan", "fix_plan"},
+        PHASE_EXECUTE:    {"replan", "complete_task", "fail_task", "fix_plan", "early_finish", "run_tools_parallel"},
+        PHASE_REVIEW:     {"proceed_to_output", "replan", "fix_plan"},
+        PHASE_OUTPUT:     set(),
+        PHASE_REPLAN_SKIP:{"confirm_plan", "ask_user"},  # Quick replan has minimal internal tools
     }
 
     def __init__(self, request, user, body, event_emitter, event_call, metadata, valves, user_valves=None, incoming_tools=None):
@@ -469,6 +469,24 @@ class HelixAgentEngine:
         self._incoming_tools = list(incoming_tools) if incoming_tools else []
         self._incoming_tool_names = set()
         self._builtin_tools_names = set()
+
+        # Cache model_knowledge from workspace model metadata for native vector search
+        self._model_knowledge = self._resolve_model_knowledge()
+
+    def _resolve_model_knowledge(self):
+        """Extract knowledge base config from the workspace model metadata."""
+        if not self.request or not self.body:
+            return None
+        try:
+            app_models = getattr(self.request.app.state, "MODELS", {})
+            model_info = app_models.get(self.body.get("model", ""), {})
+            if not model_info:
+                return None
+            info_block = model_info.get("info", model_info)
+            meta = info_block.get("meta", {}) if isinstance(info_block, dict) else {}
+            return meta.get("knowledge") or meta.get("model_knowledge")
+        except Exception:
+            return None
 
     def _format_output(self):
         filtered = []
@@ -900,23 +918,6 @@ class HelixAgentEngine:
                 },
             },
             "callable": self._tool_early_finish,
-            "type": "function",
-        }
-        self.all_tools_dict["rag_search"] = {
-            "spec": {
-                "name": "rag_search",
-                "description": "Semantic search inside an attached file using RAG (Retrieval-Augmented Generation). Use this when the attached file is too large to inline. Returns the most relevant chunks.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "file_id": {"type": "string", "description": "The file ID or name of the attached document to search."},
-                        "query": {"type": "string", "description": "The search query describing what you are looking for in the document."},
-                        "top_k": {"type": "integer", "default": 5, "description": "Number of top relevant chunks to return."},
-                    },
-                    "required": ["file_id", "query"],
-                },
-            },
-            "callable": self._tool_rag_search,
             "type": "function",
         }
         self.all_tools_dict["run_tools_parallel"] = {
@@ -1469,93 +1470,6 @@ class HelixAgentEngine:
         elif rtype == "skip":
             return json.dumps({"type": "skip", "response": "User skipped the question.", "skipped": True})
         return json.dumps({"type": "unknown", "response": f"User response: {raw_str}", "skipped": False})
-
-    async def _tool_rag_search(self, file_id: str, query: str, top_k: int = 5, **kwargs):
-        """RAG search: chunk, embed (if needed) and retrieve top_k chunks."""
-        try:
-            from chromadb import PersistentClient
-            from sentence_transformers import SentenceTransformer
-            from langchain_text_splitters import RecursiveCharacterTextSplitter
-        except ImportError as imp_err:
-            return json.dumps({"error": f"RAG dependencies missing: {imp_err}"})
-
-        if not file_id or not query:
-            return json.dumps({"error": "file_id and query are required"})
-
-        # Resolve upload dir & read file bytes
-        upload_dirs = [
-            getattr(self.request.app.state, "UPLOAD_DIR", None),
-            "/app/backend/data/uploads",
-            "/app/data/uploads",
-            "/data/uploads",
-            "./data/uploads",
-            "data/uploads",
-        ]
-        file_path = None
-        for d in upload_dirs:
-            if d:
-                p = os.path.join(d, file_id)
-                if os.path.isfile(p):
-                    file_path = p
-                    break
-
-        if not file_path:
-            return json.dumps({"error": f"File {file_id} not found on disk"})
-
-        try:
-            with open(file_path, "r", encoding="utf-8", errors="replace") as fh:
-                text = fh.read()
-        except Exception as read_err:
-            return json.dumps({"error": f"Could not read {file_id}: {read_err}"})
-
-        # Persistent vector DB path
-        db_path = os.environ.get("HELIX_RAG_DB", "/app/backend/data/helix_rag_db")
-        os.makedirs(db_path, exist_ok=True)
-
-        try:
-            client = PersistentClient(path=db_path)
-            collection = client.get_or_create_collection(file_id)
-            embedder = SentenceTransformer("all-MiniLM-L6-v2")
-
-            # Check if already embedded
-            existing = collection.count()
-            if existing == 0:
-                splitter = RecursiveCharacterTextSplitter(
-                    chunk_size=1000,
-                    chunk_overlap=200,
-                )
-                chunks = splitter.split_text(text)
-                if not chunks:
-                    return json.dumps({"error": "No extractable text in file"})
-
-                embeddings = embedder.encode(chunks).tolist()
-                collection.add(
-                    ids=[f"{file_id}-{i}" for i in range(len(chunks))],
-                    embeddings=embeddings,
-                    documents=chunks,
-                    metadatas=[{"source": file_id}] * len(chunks),
-                )
-
-            query_embedding = embedder.encode([query]).tolist()
-            results = collection.query(
-                query_embeddings=query_embedding,
-                n_results=top_k,
-            )
-
-            chunks = results.get("documents", [[]])[0]
-            if not chunks:
-                return json.dumps({"result": "No relevant chunks found."})
-
-            context = "\n\n".join(
-                f'<source id="{i+1}">{chunk}</source>' for i, chunk in enumerate(chunks)
-            )
-            return json.dumps({
-                "result": f"Use the following context:\n{context}\n\nQuestion: {query}",
-                "chunks": chunks,
-            })
-        except Exception as rag_err:
-            logger.error("RAG search failed: %s", rag_err)
-            return json.dumps({"error": f"RAG search failed: {rag_err}"})
 
     # ── Parallel Tool Execution ──
 
@@ -2804,6 +2718,62 @@ class HelixAgentEngine:
         # Attempt DB-backed state recovery at start of turn
         await self._recover_state_from_files(self.body if isinstance(self.body, dict) else {})
 
+        # ── Attachment size guard ──
+        max_size_mb = getattr(self.valves, "MAX_ATTACHMENT_SIZE_MB", 5)
+        if max_size_mb > 0 and self.request:
+            max_bytes = max_size_mb * 1024 * 1024
+            incoming_files = list(self.metadata.get("__files__") or [])
+            if self.body and isinstance(self.body, dict):
+                body_files = self.body.get("files") or self.body.get("__files__")
+                if body_files:
+                    seen = {f.get("id") or f.get("file_id") for f in incoming_files if isinstance(f, dict)}
+                    for f in body_files:
+                        if isinstance(f, dict):
+                            fid = f.get("id") or f.get("file_id")
+                            if fid and fid not in seen:
+                                incoming_files.append(f)
+                                seen.add(fid)
+            oversized = []
+            for file_info in incoming_files:
+                if not isinstance(file_info, dict):
+                    continue
+                file_size = None
+                if HAS_DB_PERSISTENCE:
+                    fid = file_info.get("file_id") or file_info.get("id")
+                    if fid:
+                        try:
+                            file_obj = await Files.get_file_by_id(fid)
+                            if file_obj:
+                                fpath = getattr(file_obj, "path", None)
+                                if fpath and os.path.exists(fpath):
+                                    file_size = os.path.getsize(fpath)
+                        except Exception:
+                            pass
+                if file_size is None:
+                    upload_dir = getattr(self.request.app.state, "UPLOAD_DIR", None)
+                    fname = file_info.get("name") or file_info.get("filename") or file_info.get("file_id") or file_info.get("id")
+                    if upload_dir and fname:
+                        fpath = os.path.join(upload_dir, fname)
+                        if os.path.exists(fpath):
+                            file_size = os.path.getsize(fpath)
+                if file_size and file_size > max_bytes:
+                    oversized.append((file_info.get("name", "unknown"), file_size))
+            if oversized:
+                items = "\n".join(f"- `{name}` ({size / (1024*1024):.1f} MB)" for name, size in oversized)
+                err = (
+                    f"**Error: File(s) too large ({max_size_mb} MB max)**\n\n"
+                    f"The following attached file(s) exceed the maximum allowed size ({max_size_mb} MB):\n"
+                    f"{items}\n\n"
+                    f"**Please upload large documents to a Knowledge Base instead.**\n"
+                    f"1. Go to your Workspace/Knowledge settings\n"
+                    f"2. Create or select a Knowledge Base\n"
+                    f"3. Upload the file there\n"
+                    f"4. Link the Knowledge Base to this model\n"
+                    f"5. Try again"
+                )
+                await self.emit_status("File too large", done=True)
+                return err
+
         # After recovery, decide whether to continue the old session or start fresh.
         # If every task is completed or failed, treat this as a brand-new request.
         has_remaining_tasks = False
@@ -2965,6 +2935,14 @@ class HelixAgentEngine:
             # In OUTPUT phase turn 2, remove tools to force pure text output
             if self.phase == self.PHASE_OUTPUT and self._output_turn >= 2:
                 completion_body["tools"] = None
+
+            # Inject model knowledge for native OpenWebUI vector search
+            mk = getattr(self, "_model_knowledge", None)
+            if mk:
+                completion_body.setdefault("metadata", {})
+                if isinstance(completion_body.get("metadata"), dict):
+                    completion_body["metadata"]["knowledge"] = mk
+                    completion_body["metadata"]["__model_knowledge__"] = mk
 
             # Apply OpenWebUI file context prep (add_file_context + chat_completion_files_handler)
             try:
@@ -3501,6 +3479,10 @@ class Pipe:
         MAX_CONSECUTIVE_ERRORS: int = Field(
             default=3,
             description="Number of consecutive errors that triggers a hard stop when ENABLE_HARD_STOP_ON_ERRORS is True."
+        )
+        MAX_ATTACHMENT_SIZE_MB: int = Field(
+            default=5,
+            description="Maximum allowed size of individual attached files in megabytes. Files larger than this will trigger an error at the start of the conversation, suggesting the user upload them to a Knowledge Base instead. Set to 0 to disable the size check."
         )
 
         PLAN_TOOLS: str = Field(
