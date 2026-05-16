@@ -1,7 +1,7 @@
 """
 title: Helix Agent
 author: Piggidragon
-version: 0.21.0
+version: 0.21.2
 description: >
   Helix Agent — OpenWebUI-native agent loop with modular per-phase tool control.
 
@@ -464,6 +464,7 @@ class HelixAgentEngine:
         self._skill_prompt = ""
         self._mcp_clients: Dict[str, Any] = {}
         self._extra_grace = 0
+        self.consecutive_json_errors = 0
         self._plan_questions_asked = 0  # Counter for ask_user calls in PLAN/REPLAN_SKIP
 
     def _format_output(self):
@@ -1600,8 +1601,9 @@ class HelixAgentEngine:
                 missing.append(c["name"])
         if missing:
             available = ", ".join(sorted(self.phase_tools_dict.keys())[:20])
+            phase_name = self.phase
             return json.dumps({
-                "error": f"Tools not available in current phase: {', '.join(missing)}. Available: {available}",
+                "error": f"[{phase_name}] The following tools are NOT available in this phase: {', '.join(missing)}. Available tools in this phase: {available}. Please only use tools listed for the current phase.",
             })
 
         # Emit status for each parallel sub-call
@@ -2426,7 +2428,7 @@ class HelixAgentEngine:
         target = self.phase_tools_dict.get(tool_name)
         if not target:
             available = list(self.phase_tools_dict.keys())
-            return f"Tool '{tool_name}' not found in current phase. Available: {', '.join(available[:20])}", []
+            return f"Tool '{tool_name}' not found in current phase ({self.phase}). Available: {', '.join(available[:20])}", []
 
         spec_params = target.get("spec", {}).get("parameters", {}).get("properties", {})
         allowed_keys = set(spec_params.keys())
@@ -2973,15 +2975,18 @@ class HelixAgentEngine:
                     self.consecutive_json_errors = 0
                 except json.JSONDecodeError:
                     self.consecutive_json_errors += 1
-                    if self.consecutive_json_errors >= 3:
-                        await self.emit_output("\n[ERROR] JSON parse failed 3 times. Stopping.")
+                    max_errors = self.valves.MAX_CONSECUTIVE_ERRORS
+                    should_stop = getattr(self.valves, "ENABLE_HARD_STOP_ON_ERRORS", False) and self.consecutive_json_errors >= max_errors
+                    error_detail = f"Error: Invalid JSON in tool arguments for '{tool_name}'. The arguments provided were: {raw_args}. Please ensure they are a valid JSON object with exactly the keys expected by this tool."
+                    if should_stop:
+                        await self.emit_output(f"\n[ERROR] JSON parse failed {max_errors} times. Stopping.\n")
                         await self.emit_task_update(finalize_tasks=True)
                         await self.emit_status("JSON error", done=True)
                         return self._format_output()
                     args = {}
                     self.history.append({
                         "role": "tool",
-                        "content": "Error: Invalid JSON in tool arguments.",
+                        "content": error_detail,
                         "tool_call_id": call_id,
                         "name": tool_name,
                     })
@@ -3238,19 +3243,23 @@ class HelixAgentEngine:
                     # ── Consecutive tool-not-found tracking ──
                     if "not found in current phase" in tool_result:
                         self._consecutive_tool_misses[tool_name] = self._consecutive_tool_misses.get(tool_name, 0) + 1
-                        if self._consecutive_tool_misses[tool_name] >= 3:
-                            replan_result = await self._tool_replan(
-                                reason=f"Tool '{tool_name}' unavailable after 3 consecutive attempts",
-                                updated_tasks="",
-                                mode="soft",
-                            )
-                            self.history.append({
-                                "role": "tool",
-                                "content": replan_result,
-                                "tool_call_id": call_id,
-                                "name": "replan",
-                            })
-                            break
+                        miss_count = self._consecutive_tool_misses[tool_name]
+                        max_errors = self.valves.MAX_CONSECUTIVE_ERRORS
+                        available_tools = ", ".join(sorted(self.phase_tools_dict.keys())[:30])
+                        warning_msg = (
+                            f"[WARN] Tool '{tool_name}' is not available in the current phase ({self.phase}). "
+                            f"Attempt {miss_count}. Available tools: {available_tools}. "
+                            f"Please check the tool name and use only tools listed for this phase."
+                        )
+                        should_stop = getattr(self.valves, "ENABLE_HARD_STOP_ON_ERRORS", False) and miss_count >= max_errors
+                        if should_stop:
+                            await self.emit_output(f"\n[ERROR] Tool '{tool_name}' unavailable {max_errors} times. Stopping.\n")
+                            await self.emit_task_update(finalize_tasks=True)
+                            await self.emit_status("Tool unavailable", done=True)
+                            return self._format_output()
+                        # Append a strong warning that the model will see in its next turn,
+                        # replacing the generic error with a more informative one.
+                        tool_result = warning_msg
                     else:
                         self._consecutive_tool_misses.clear()
 
@@ -3385,6 +3394,14 @@ class Pipe:
             default=90,
             description="Timeout in seconds for individual tool execution. Set to 0 to disable."
         )
+        ENABLE_HARD_STOP_ON_ERRORS: bool = Field(
+            default=False,
+            description="If True, the agent will hard-stop (return final output) after MAX_CONSECUTIVE_ERRORS consecutive tool call failures (e.g., JSON parse errors, unavailable tools). If False, the model receives the error in its history and is free to self-correct."
+        )
+        MAX_CONSECUTIVE_ERRORS: int = Field(
+            default=3,
+            description="Number of consecutive errors that triggers a hard stop when ENABLE_HARD_STOP_ON_ERRORS is True."
+        )
 
         PLAN_TOOLS: str = Field(
             default=(
@@ -3476,6 +3493,10 @@ class Pipe:
         SKIP_PLAN_ON_RESUME: bool = Field(
             default=True,
             description="When the previous session is finished, skip the full PLAN phase for a new user request and jump straight to a Quick Replan. Set to False to always start fresh with full PLAN phase.",
+        )
+        MAX_PLAN_QUESTIONS: int = Field(
+            default=3,
+            description="Maximum number of clarification questions (ask_user) the agent may ask per planning phase before it is forced to finalise the plan.",
         )
 
     def __init__(self):
