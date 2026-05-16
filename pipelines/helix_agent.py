@@ -1,7 +1,7 @@
 """
 title: Helix Agent
 author: Piggidragon
-version: 4.6.1
+version: 0.18.0
 description: >
   Helix Agent — OpenWebUI-native agent loop with modular per-phase tool control.
 
@@ -25,6 +25,8 @@ description: >
   - Iteration limit with Continue/Cancel modal; graceful shutdown on CancelledError/GeneratorExit
   - File handling: add_file_context + chat_completion_files_handler for native multimodal/text file injection
   - RAG search built-in: agent can query attached large files via vector search
+  - MCP support: resolves and calls MCP server tools via OpenWebUI's MCPClient
+  - Skills support: resolves user skills from model metadata and injects them into the system prompt
 requirements: open-webui>=0.9.1, chromadb, sentence-transformers, langchain-text-splitters
 """
 
@@ -37,7 +39,7 @@ import os
 import re
 import copy
 import uuid
-from typing import Callable, Set, List, Dict
+from typing import Callable, Set, List, Dict, Any
 from pydantic import BaseModel, Field
 
 from fastapi import Request
@@ -48,7 +50,18 @@ from open_webui.utils.middleware import (
     process_tool_result,
     add_file_context,
     chat_completion_files_handler,
+    get_system_oauth_token,
 )
+from open_webui.utils.mcp.client import MCPClient
+from open_webui.utils.access_control import has_connection_access
+from open_webui.utils.misc import is_string_allowed
+from open_webui.utils.headers import include_user_info_headers
+from open_webui.env import (
+    ENABLE_FORWARD_USER_INFO_HEADERS,
+    FORWARD_SESSION_INFO_HEADER_CHAT_ID,
+    FORWARD_SESSION_INFO_HEADER_MESSAGE_ID,
+)
+from open_webui.models.skills import Skills
 
 logger = logging.getLogger(__name__)
 
@@ -388,6 +401,8 @@ class HelixAgentEngine:
         self._output_parts = []
         self.loop_count = 0
         self.goal = ""
+        self._skill_prompt = ""
+        self._mcp_clients: Dict[str, Any] = {}
 
     def _format_output(self):
         filtered = []
@@ -603,6 +618,11 @@ class HelixAgentEngine:
 
         self.all_tools_dict = {}
 
+        # 0. Resolve skills from model metadata (injected into system prompt later)
+        model_info = self.app_models.get(self.body.get("model", ""), {})
+        skill_ids, skill_prompt = await self._resolve_model_skills(model_info)
+        self._skill_prompt = skill_prompt
+
         # 1. External tools (DB + OpenAPI)
         unique_ids = list(dict.fromkeys(tid for tid in tool_ids if tid))
         if unique_ids:
@@ -613,10 +633,24 @@ class HelixAgentEngine:
             except Exception as e:
                 logger.error(f"get_tools failed: {e}")
 
-        # 2. Built-in tools
-        model_info = self.app_models.get(self.body.get("model", ""), {})
+        # 2. MCP tools (from server:mcp: / mcp: prefixed IDs)
+        try:
+            mcp_tools = await self._resolve_mcp_tools(unique_ids, extra_params)
+            if mcp_tools:
+                self.all_tools_dict.update(mcp_tools)
+                # Track clients for later cleanup
+                for name, tool in mcp_tools.items():
+                    client = tool.get("client")
+                    if client and hasattr(client, "disconnect"):
+                        self._mcp_clients[name] = client
+        except Exception as e:
+            logger.error(f"MCP tool resolution failed: {e}")
+
+        # 3. Built-in tools (pass skill_ids so view_skill is available)
+        if skill_ids:
+            extra_params["__skill_ids__"] = skill_ids
         features = self._get_model_features(model_info)
-        if features:
+        if features or extra_params.get("__skill_ids__"):
             try:
                 builtin = await get_builtin_tools(self.request, extra_params, features=features, model=model_info)
                 if builtin:
@@ -624,7 +658,7 @@ class HelixAgentEngine:
             except Exception as e:
                 logger.error(f"get_builtin_tools failed: {e}")
 
-        # 3. Terminal tools
+        # 4. Terminal tools
         terminal_id = self.pipe_metadata.get("terminal_id")
         if terminal_id:
             try:
@@ -638,7 +672,7 @@ class HelixAgentEngine:
             except Exception as e:
                 logger.error(f"get_terminal_tools failed: {e}")
 
-        # 4. Add internal control tools (always available, stored in all_tools_dict too)
+        # 5. Add internal control tools (always available, stored in all_tools_dict too)
         self._add_internal_tools()
 
         return self.all_tools_dict
@@ -768,6 +802,232 @@ class HelixAgentEngine:
                 for fk, fv in block["features"].items():
                     features[fk] = bool(fv)
         return features
+
+    # ── Skills & MCP Helpers ──
+
+    async def _resolve_model_skills(self, model_info: dict) -> tuple[list[str], str]:
+        """Resolve skillIds from model metadata and fetch user skills from DB."""
+        skill_ids: list[str] = []
+        skill_prompt = ""
+        if not model_info:
+            return skill_ids, skill_prompt
+
+        meta = model_info.get("info", {}).get("meta", {})
+        if not meta:
+            meta = model_info
+        model_skill_ids = meta.get("skillIds", [])
+        if not model_skill_ids:
+            return skill_ids, skill_prompt
+
+        try:
+            user_id = None
+            if hasattr(self.user, "id"):
+                user_id = self.user.id
+            elif isinstance(self.user, dict):
+                user_id = self.user.get("id")
+            if not user_id:
+                return skill_ids, skill_prompt
+
+            user_skills = await Skills.get_skills_by_user_id(user_id, "read")
+            accessible = {s.id: s for s in user_skills if s.is_active}
+            available = []
+            for sid in model_skill_ids:
+                sk = accessible.get(sid)
+                if sk:
+                    available.append(sk)
+                    skill_ids.append(sid)
+
+            if available:
+                descriptions = ""
+                for sk in available:
+                    descriptions += f"<skill>\n<name>{sk.name}</name>\n<description>{sk.description or ''}</description>\n</skill>\n"
+                skill_prompt = (
+                    f"<available_skills>\n{descriptions}</available_skills>\n\n"
+                    "You have access to the above skills. ONLY use them when they are directly useful for the current task or context. Do not invoke a skill unless it provides clear value for what the user is asking."
+                )
+        except Exception as e:
+            logger.error(f"Error resolving skills: {e}")
+
+        return skill_ids, skill_prompt
+
+    async def _resolve_mcp_tools(self, tool_ids: list[str], extra_params: dict) -> dict[str, Any]:
+        """Resolve MCP server tools from tool_ids, mirroring planner_v3 logic."""
+        out: dict[str, Any] = {}
+        if not tool_ids or not self.request or not self.user:
+            return out
+
+        oauth_token = None
+        try:
+            oauth_token = await get_system_oauth_token(self.request, self.user)
+        except Exception:
+            pass
+
+        resolved_servers = set()
+        for tool_id in tool_ids:
+            if not isinstance(tool_id, str):
+                continue
+
+            server_id = None
+            if tool_id.startswith("server:mcp:"):
+                server_id = tool_id[len("server:mcp:"):]
+            elif tool_id.startswith("mcp:"):
+                server_id = tool_id[len("mcp:"):]
+                mcp_connections = getattr(
+                    self.request.app.state.config, "TOOL_SERVER_CONNECTIONS", []
+                )
+                for server_connection in mcp_connections:
+                    if server_connection.get("type", "") == "mcp":
+                        sid = server_connection.get("info", {}).get("id")
+                        if sid and (tool_id == sid or tool_id.startswith(f"{sid}_")):
+                            server_id = sid
+                            break
+
+            if not server_id:
+                continue
+            if server_id in resolved_servers:
+                continue
+            resolved_servers.add(server_id)
+
+            try:
+                mcp_server_connection = None
+                for conn in self.request.app.state.config.TOOL_SERVER_CONNECTIONS:
+                    if (
+                        conn.get("type", "") == "mcp"
+                        and conn.get("info", {}).get("id") == server_id
+                    ):
+                        mcp_server_connection = conn
+                        break
+
+                if not mcp_server_connection:
+                    logger.error("MCP server %s not found in connections", server_id)
+                    continue
+
+                if not await has_connection_access(self.user, mcp_server_connection):
+                    logger.warning("Access denied to MCP server %s", server_id)
+                    continue
+
+                auth_type = mcp_server_connection.get("auth_type", "")
+                headers: dict[str, str] = {}
+                if auth_type == "bearer":
+                    headers["Authorization"] = f"Bearer {mcp_server_connection.get('key', '')}"
+                elif auth_type == "none":
+                    pass
+                elif auth_type == "session":
+                    tok = getattr(getattr(self.request, "state", None), "token", None)
+                    creds = getattr(tok, "credentials", None) if tok else None
+                    if creds:
+                        headers["Authorization"] = f"Bearer {creds}"
+                elif auth_type == "system_oauth":
+                    if oauth_token:
+                        headers["Authorization"] = f"Bearer {oauth_token.get('access_token', '')}"
+                elif auth_type == "oauth_2.1":
+                    try:
+                        splits = server_id.split(":")
+                        sid = splits[-1] if len(splits) > 1 else server_id
+                        mgr = getattr(self.request.app.state, "oauth_client_manager", None)
+                        if mgr:
+                            ot = await mgr.get_oauth_token(
+                                getattr(self.user, "id", ""), f"mcp:{sid}"
+                            )
+                            if ot:
+                                headers["Authorization"] = f"Bearer {ot.get('access_token', '')}"
+                    except Exception as e:
+                        logger.error("OAuth token for MCP: %s", e)
+
+                connection_headers = mcp_server_connection.get("headers")
+                if connection_headers and isinstance(connection_headers, dict):
+                    headers.update(connection_headers)
+
+                if ENABLE_FORWARD_USER_INFO_HEADERS and self.user:
+                    headers = include_user_info_headers(headers, self.user)
+                    cid = self.chat_id
+                    if cid:
+                        headers[FORWARD_SESSION_INFO_HEADER_CHAT_ID] = cid
+                    mid = self.message_id
+                    if mid:
+                        headers[FORWARD_SESSION_INFO_HEADER_MESSAGE_ID] = mid
+
+                client = MCPClient()
+                await client.connect(
+                    url=mcp_server_connection.get("url", ""),
+                    headers=headers if headers else None,
+                )
+
+                if not hasattr(client, "_call_lock"):
+                    client._call_lock = asyncio.Lock()
+
+                function_name_filter_list = mcp_server_connection.get("config", {}).get(
+                    "function_name_filter_list", ""
+                )
+                if isinstance(function_name_filter_list, str):
+                    function_name_filter_list = function_name_filter_list.split(",")
+
+                async with client._call_lock:
+                    tool_specs = await client.list_tool_specs()
+
+                def make_tool_function(mcp_client, function_name, sid):
+                    async def tool_function(**kwargs):
+                        try:
+                            logger.debug(
+                                "[MCP] Calling '%s' on server '%s' with args: %s",
+                                function_name, sid, kwargs,
+                            )
+                            async with mcp_client._call_lock:
+                                result = await mcp_client.call_tool(
+                                    function_name, function_args=kwargs
+                                )
+                            if hasattr(result, "content") and result.content:
+                                texts = []
+                                for c in result.content:
+                                    if hasattr(c, "text") and c.text:
+                                        texts.append(c.text)
+                                    elif hasattr(c, "image"):
+                                        texts.append(
+                                            f"[Image Content: {c.image[:50]}...]"
+                                            if isinstance(c.image, str)
+                                            else "[Image Content]"
+                                        )
+                                    else:
+                                        texts.append(str(c))
+                                return "\n".join(texts)
+                            if hasattr(result, "isError") and result.isError:
+                                return f"MCP Error from {sid}: {result}"
+                            return str(result)
+                        except Exception as e:
+                            logger.error(
+                                "Failed to call MCP tool '%s' on '%s': %s",
+                                function_name, sid, e, exc_info=True,
+                            )
+                            return f"Error calling MCP tool: {e}"
+
+                    return tool_function
+
+                for tool_spec in tool_specs:
+                    if function_name_filter_list:
+                        if not is_string_allowed(tool_spec["name"], function_name_filter_list):
+                            continue
+                    tool_function = make_tool_function(client, tool_spec["name"], server_id)
+                    prefixed_name = f'{server_id}_{tool_spec["name"]}'
+                    out[prefixed_name] = {
+                        "spec": {**tool_spec, "name": prefixed_name},
+                        "callable": tool_function,
+                        "type": "mcp",
+                        "client": client,
+                        "direct": False,
+                    }
+            except Exception as e:
+                logger.debug("MCP tool load failed for %s: %s", tool_id, e)
+                if self.event_emitter:
+                    try:
+                        await self.event_emitter({
+                            "type": "chat:message:error",
+                            "data": {"error": {"content": f"Failed to connect to MCP server '{server_id}'"}},
+                        })
+                    except Exception:
+                        pass
+                continue
+
+        return out
 
     # ── Phase-aware Tool Filtering ──
 
@@ -1500,30 +1760,31 @@ class HelixAgentEngine:
         tool_names = ", ".join(sorted(self.phase_tools_dict.keys()))
         task_state = self._build_task_state()
 
-        # Pick base prompt from Valves or fallback to default
+        base = ""
         try:
             if self.phase == self.PHASE_PLAN:
-                base = self.valves.PLAN_PROMPT or DEFAULT_PLAN_PROMPT
-                return base.format(tool_names=tool_names)
-
+                base = (self.valves.PLAN_PROMPT or DEFAULT_PLAN_PROMPT).format(tool_names=tool_names)
             elif self.phase == self.PHASE_EXECUTE:
-                base = self.valves.EXECUTE_PROMPT or DEFAULT_EXECUTE_PROMPT
-                return base.format(tool_names=tool_names, task_state=task_state)
-
+                base = (self.valves.EXECUTE_PROMPT or DEFAULT_EXECUTE_PROMPT).format(tool_names=tool_names, task_state=task_state)
             elif self.phase == self.PHASE_REVIEW:
-                base = self.valves.REVIEW_PROMPT or DEFAULT_REVIEW_PROMPT
-                return base.format(goal=self.goal, task_state=task_state, tool_names=tool_names)
-
-            return DEFAULT_PLAN_PROMPT.format(tool_names=tool_names)
+                base = (self.valves.REVIEW_PROMPT or DEFAULT_REVIEW_PROMPT).format(goal=self.goal, task_state=task_state, tool_names=tool_names)
+            else:
+                base = DEFAULT_PLAN_PROMPT.format(tool_names=tool_names)
         except (KeyError, IndexError, ValueError):
             # User-provided prompt may have stray braces; fall back to default
             if self.phase == self.PHASE_PLAN:
-                return DEFAULT_PLAN_PROMPT.format(tool_names=tool_names)
+                base = DEFAULT_PLAN_PROMPT.format(tool_names=tool_names)
             elif self.phase == self.PHASE_EXECUTE:
-                return DEFAULT_EXECUTE_PROMPT.format(tool_names=tool_names, task_state=task_state)
+                base = DEFAULT_EXECUTE_PROMPT.format(tool_names=tool_names, task_state=task_state)
             elif self.phase == self.PHASE_REVIEW:
-                return DEFAULT_REVIEW_PROMPT.format(goal=self.goal, task_state=task_state, tool_names=tool_names)
-            return DEFAULT_PLAN_PROMPT.format(tool_names=tool_names)
+                base = DEFAULT_REVIEW_PROMPT.format(goal=self.goal, task_state=task_state, tool_names=tool_names)
+            else:
+                base = DEFAULT_PLAN_PROMPT.format(tool_names=tool_names)
+
+        # Prepend skill prompt if resolved (available in all phases)
+        if self._skill_prompt:
+            base = f"{self._skill_prompt}\n\n{base}"
+        return base
 
     # ── Phase Transitions ──
 
@@ -2046,14 +2307,23 @@ class HelixAgentEngine:
             if self.phase == self.PHASE_EXECUTE and self.completed_tasks and len(self.completed_tasks) >= len(self.task_list):
                 self._transition_to(self.PHASE_REVIEW)
 
+    async def _disconnect_mcp_clients(self):
+        """Gracefully disconnect any MCP clients opened during tool resolution."""
+        if not self._mcp_clients:
+            return
+        for name, client in list(self._mcp_clients.items()):
+            try:
+                if hasattr(client, "disconnect"):
+                    await asyncio.wait_for(client.disconnect(), timeout=3.0)
+            except Exception:
+                pass
+        self._mcp_clients.clear()
+
     async def run(self, user_msg, last_user_msg_raw, model):
         try:
             result = await self._run_impl(user_msg, last_user_msg_raw, model)
             return result
         except GeneratorExit:
-            # NOTE: GeneratorExit can only be raised if pipe() becomes an async generator.
-            # Currently pipe() returns a string, so this catch will not be triggered by
-            # OpenWebUI's normal cancellation mechanism. CancelledError handles asyncio cancellation.
             logger.info("Agent loop cancelled by user (GeneratorExit).")
             await self._save_state_to_file()
             await self.emit_task_update(finalize_tasks=True)
@@ -2070,9 +2340,8 @@ class HelixAgentEngine:
             await self.emit_task_update(finalize_tasks=True)
             return f"\n[ERROR] Agent loop failed: {e}"
         finally:
-            # Final immediate DB sync
+            await self._disconnect_mcp_clients()
             await self._sync_produced_files_to_db()
-            # Fire-and-forget delayed sync with backoff to survive heavy DB load
             if HAS_DB_PERSISTENCE and self.chat_id and self.message_id:
                 snapshot = list(self.produced_files)
                 asyncio.get_running_loop().create_task(
@@ -2152,27 +2421,37 @@ class Pipe:
         )
 
         PLAN_TOOLS: str = Field(
-            default="",
+            default=(
+                "read_file, calculate_timestamp, fetch_url, get_current_timestamp, "
+                "glob_search, grep_search, list_files, list_knowledge_bases, "
+                "query_knowledge_bases, query_knowledge_files, search_knowledge_bases, search_knowledge_files, search_notes, "
+                "search_papers, search_web, view_chat, view_knowledge_file, view_note, view_skill"
+            ),
             description=(
                 "Comma-separated tool names allowed in PLAN phase. "
                 "Leave EMPTY to allow ALL tools. "
-                "Recommended: read-only tools like read_file, search_web, get_github_file_contents."
+                "Default is a read-only / research-safe set."
             )
         )
         EXECUTE_TOOLS: str = Field(
             default="",
             description=(
                 "Comma-separated tool names allowed in EXECUTE phase. "
-                "Leave EMPTY to allow ALL tools. "
-                "Example: github_access, file_write, web_search, read_file"
+                "Leave EMPTY to allow ALL tools."
             )
         )
         REVIEW_TOOLS: str = Field(
-            default="",
+            default=(
+                "read_file, calculate_timestamp, fetch_url, get_current_timestamp, get_process_status, run_command, "
+                "glob_search, grep_search, list_files, list_knowledge_bases, list_processes, "
+                "query_knowledge_bases, query_knowledge_files, "
+                "search_chats, search_knowledge_bases, search_knowledge_files, search_notes, search_web, "
+                "view_chat, view_knowledge_file, view_note, view_skill"
+            ),
             description=(
                 "Comma-separated tool names allowed in REVIEW phase. "
                 "Leave EMPTY to allow ALL tools. "
-                "Recommended: read-only tools like read_file, search_web, get_github_file_contents."
+                "Default is a read-only / review-safe set."
             )
         )
 
