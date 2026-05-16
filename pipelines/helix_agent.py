@@ -1,13 +1,13 @@
 """
 title: Helix Agent
 author: Piggidragon
-version: 4.8.2
+version: 0.19.2
 description: >
-  Helix Agent - OpenWebUI-native agent loop with modular per-phase tool control.
+  Helix Agent — OpenWebUI-native agent loop with modular per-phase tool control.
 
   Architecture:
   - SINGLE model loop (Plan -> Execute -> Review -> Replan -> Execute...)
-  - Per-phase tool filtering via Valves - only relevant tools exposed to the LLM at each phase
+  - Per-phase tool filtering via Valves — only relevant tools exposed to the LLM at each phase
   - Internal control tools (terminate, replan, fix_plan, complete_task, fail_task, confirm_plan, rag_search) always available
   - Uses OpenWebUI native tool infrastructure (get_tools, get_builtin_tools, get_terminal_tools)
   - Context window management with adaptive history truncation and tool-call pair integrity
@@ -25,6 +25,8 @@ description: >
   - Iteration limit with Continue/Cancel modal; graceful shutdown on CancelledError/GeneratorExit
   - File handling: add_file_context + chat_completion_files_handler for native multimodal/text file injection
   - RAG search built-in: agent can query attached large files via vector search
+  - MCP support: resolves and calls MCP server tools via OpenWebUI's MCPClient
+  - Skills support: resolves user skills from model metadata and injects them into the system prompt
 requirements: open-webui>=0.9.1, chromadb, sentence-transformers, langchain-text-splitters
 """
 
@@ -37,7 +39,7 @@ import os
 import re
 import copy
 import uuid
-from typing import Callable, Set, List, Dict
+from typing import Callable, Set, List, Dict, Any
 from pydantic import BaseModel, Field
 
 from fastapi import Request
@@ -48,7 +50,18 @@ from open_webui.utils.middleware import (
     process_tool_result,
     add_file_context,
     chat_completion_files_handler,
+    get_system_oauth_token,
 )
+from open_webui.utils.mcp.client import MCPClient
+from open_webui.utils.access_control import has_connection_access
+from open_webui.utils.misc import is_string_allowed
+from open_webui.utils.headers import include_user_info_headers
+from open_webui.env import (
+    ENABLE_FORWARD_USER_INFO_HEADERS,
+    FORWARD_SESSION_INFO_HEADER_CHAT_ID,
+    FORWARD_SESSION_INFO_HEADER_MESSAGE_ID,
+)
+from open_webui.models.skills import Skills
 
 logger = logging.getLogger(__name__)
 
@@ -62,9 +75,9 @@ try:
 except Exception:
     HAS_DB_PERSISTENCE = False
 
-# ------------------------------------------------------------------
+# ──────────────────────────────────────────────────────────────────
 #  DEFAULT PROMPTS (overridable via Valves)
-# ------------------------------------------------------------------
+# ──────────────────────────────────────────────────────────────────
 
 DEFAULT_PLAN_PROMPT = """\
 You are in PLAN mode. Your job is to understand the user's request, gather context, \
@@ -97,15 +110,12 @@ Rules:
 - If the request is simple (1-2 tasks), still list them explicitly.
 - Call exactly ONE tool per step.
 - When done planning, call confirm_plan with the plan for confirmation.
-- NEVER call terminate in PLAN mode -- the user must confirm first.
+- If the request is inappropriate or impossible, call terminate with a brief explanation.
 - NEVER call replan in PLAN mode.
 - If a tool returns an error during planning (e.g., file not found), try an alternative tool or note the limitation in your plan. Do not call fix_plan for planning-stage errors.
 - If the user rejects your plan with feedback, revise the plan based on their feedback and call confirm_plan again with the updated plan. Do NOT repeat the same plan unchanged.
 - If the user cancels the plan, acknowledge it and stop.
-- You may use the ask_user tool to ask the user a multiple-choice question if you need clarification before planning.
 - You may only use the tools listed above.
-- ABSOLUTELY CRITICAL: You MUST call confirm_plan to finish PLAN mode. Do NOT answer the user directly. Do NOT generate story text, code, or any output intended for the user. Only call tools.
-- If you have already asked clarification questions, stop asking and call confirm_plan with your best plan now.
 """
 
 DEFAULT_EXECUTE_PROMPT = """\
@@ -131,18 +141,18 @@ File paths: Create a project folder under `/home/userxy/agent/` named after the 
 Rules:
 - Call exactly ONE tool per step.
 - NEVER repeat identical failed tool calls (duplicate detection is active).
-- When all tasks are done, call terminate with a summary.
-- If a tool returns an error (timeout, file not found, syntax error, wrong path), analyze the error and retry with corrected parameters. You do NOT need to call fix_plan for trivial errors.
+- When all tasks are done, the system will move to review automatically. You may also call early_finish(reason) if you believe you're done early.
+- If a tool returns an error, analyze it and retry with corrected parameters. You do NOT need to call fix_plan for trivial errors.
 - Only call fix_plan if the same task fails repeatedly (3+ attempts) or if the task design was wrong.
 - Only call replan(mode='soft') if the entire approach is wrong. Use replan(mode='hard') only for complete strategy replacement.
-- If you need to think step-by-step before acting, do so - reasoning will be captured in a collapsible block.
+- If you need to think step-by-step before acting, do so — reasoning will be captured in a collapsible block.
 - You MUST call complete_task(index) or fail_task(index, reason) after working on a task.
 - If a tool named `parallel_tools` is available, use it to call multiple independent tools at once for efficiency.
 - You may only use the tools listed above. Do NOT ask the user questions.
 """
 
 DEFAULT_REVIEW_PROMPT = """\
-You are in REVIEW mode. Your ONLY job is to pick one of three actions.
+You are in REVIEW mode. Your ONLY job is to pick one of these actions.
 
 PHASE: REVIEW
 Original goal: {goal}
@@ -154,55 +164,36 @@ Task status markers: [done] = completed, [FAIL: reason] = failed with reason, [ 
 
 You MUST call exactly ONE of these tools:
 
-1. `terminate(final_answer)` - Everything is done and correct. Provide a concise final answer summarising what was accomplished.
-2. `fix_plan(reason, updated_tasks)` - Only minor fixes are needed (a task failed or needs a small correction). List just the new/corrected tasks.
-3. `replan(reason, updated_tasks, mode="soft")` - The overall strategy is broken and tasks need to be replaced entirely.
+1. `proceed_to_output()` — Everything is done and correct. Move to the OUTPUT phase to generate the polished final answer.
+2. `fix_plan(reason, updated_tasks)` — Only minor fixes are needed (a task failed or needs a small correction). List just the new/corrected tasks.
+3. `replan(reason, updated_tasks, mode="soft")` — The overall strategy is broken and tasks need to be replaced entirely.
 
 Rules:
 - If there are only minor issues with individual tasks, ALWAYS prefer `fix_plan` over `replan`. Only use `replan` if the overall strategy is broken.
-- Be honest - don't call `terminate` if something is missing or wrong.
-- If the result is good enough, call `terminate`. Don't gold-plate.
+- Be honest — don't call `proceed_to_output` if something is missing or wrong.
+- If the result is good enough, call `proceed_to_output`. Don't gold-plate.
 - Provide a brief reasoning for your assessment before calling the final tool.
 - You may only use the tools listed above.
 """
 
-DEFAULT_REPLAN_SKIP_PROMPT = """\
-You are in QUICK REPLAN mode. The previous session has finished. The user has a new follow-up request.
+DEFAULT_OUTPUT_PROMPT = """\
+You are in OUTPUT mode — COLLECTION. Gather missing context and render visualisations if needed. Do not produce any answer text yet.
 
-PHASE: QUICK REPLAN
+Goal: {goal}
 
-Available tools: {tool_names}
+{task_state}
+"""
 
-Recent context (previous goal):
-{goal}
+DEFAULT_OUTPUT_FINAL_PROMPT = """\
+Write the final answer.
 
-What to do:
-1. Review the previous goal and the user's new request.
-2. Create a minimal, focused task plan (1-3 tasks) that addresses the new request in the context of what was already done.
-3. Call confirm_plan with the updated plan.
-
-Plan format for confirm_plan:
-When calling confirm_plan, provide the plan parameter as a numbered list with one task per line:
-1. First task description
-2. Second task description
-
-Alternatively, you may provide the plan as JSON: {{"tasks": ["task 1", "task 2"]}}
-
-Rules:
-- Keep the plan short and actionable. 1-3 tasks maximum.
-- Re-use previous context where relevant.
-- Call exactly ONE tool per step.
-- When done, call confirm_plan to move to execution.
-- NEVER call terminate in QUICK REPLAN mode.
-- You may use the ask_user tool to ask the user a multiple-choice question if you need clarification.
-- You may only use the tools listed above.
-- ABSOLUTELY CRITICAL: You MUST call confirm_plan to finish QUICK REPLAN mode. Do NOT answer the user directly. Do NOT generate story text, code, or any other output. Only call tools.
+Goal: {goal}
 """
 
 
-# ------------------------------------------------------------------
+# ──────────────────────────────────────────────────────────────────
 #  SSE STREAM PARSER
-# ------------------------------------------------------------------
+# ──────────────────────────────────────────────────────────────────
 
 async def stream_completion(request, body, user):
     """Stream OWUI completion, yielding structured events. Retries once on transient errors."""
@@ -301,9 +292,9 @@ async def stream_completion(request, body, user):
                 yield {"type": "content", "text": msg["content"]}
 
 
-# ------------------------------------------------------------------
+# ──────────────────────────────────────────────────────────────────
 #  HELPERS
-# ------------------------------------------------------------------
+# ──────────────────────────────────────────────────────────────────
 
 def smart_truncate(text, max_chars):
     if not text or len(text) <= max_chars:
@@ -377,23 +368,29 @@ def _comma_list(val: str) -> List[str]:
     return [x.strip() for x in val.split(",") if x.strip()]
 
 
-# ------------------------------------------------------------------
+# ──────────────────────────────────────────────────────────────────
 #  AGENT LOOP ENGINE
-# ------------------------------------------------------------------
+# ──────────────────────────────────────────────────────────────────
 
 class HelixAgentEngine:
-    """Helix Agent - single-model agent loop with per-phase tool filtering."""
+    """Helix Agent — single-model agent loop with per-phase tool filtering."""
 
     PHASE_PLAN = "plan"
     PHASE_EXECUTE = "execute"
     PHASE_REVIEW = "review"
-    PHASE_REPLAN_SKIP = "replan_skip"
+    PHASE_OUTPUT = "output"
 
     MAX_HISTORY_MESSAGES = 50
-    MAX_REPLAN_SKIP_LOOPS = 3
 
     # Internal tools that are ALWAYS available regardless of phase filters
-    INTERNAL_TOOLS = {"terminate", "replan", "complete_task", "fail_task", "confirm_plan", "fix_plan", "rag_search"}
+    INTERNAL_TOOLS = {"terminate", "replan", "complete_task", "fail_task", "confirm_plan", "fix_plan", "rag_search", "proceed_to_output", "early_finish"}
+
+    PHASE_INTERNAL_TOOLS = {
+        PHASE_PLAN:    {"terminate", "replan", "complete_task", "fail_task", "confirm_plan", "fix_plan", "rag_search"},
+        PHASE_EXECUTE: {"replan", "complete_task", "fail_task", "fix_plan", "rag_search", "early_finish"},
+        PHASE_REVIEW:  {"proceed_to_output", "replan", "fix_plan", "rag_search"},
+        PHASE_OUTPUT:  {"rag_search"},
+    }
 
     def __init__(self, request, user, body, event_emitter, event_call, metadata, valves, user_valves=None):
         self.request = request
@@ -422,11 +419,13 @@ class HelixAgentEngine:
         self.produced_files = []
         self._files_lock = asyncio.Lock()
         self._consecutive_tool_misses: Dict[str, int] = {}
+        self._output_turn = 0
         self._seen_file_ids: Set[str] = set()
         self._output_parts = []
         self.loop_count = 0
         self.goal = ""
-        self._plan_questions_asked = 0  # Track ask_user calls in PLAN/REPLAN_SKIP phases
+        self._skill_prompt = ""
+        self._mcp_clients: Dict[str, Any] = {}
 
     def _format_output(self):
         filtered = []
@@ -453,7 +452,7 @@ class HelixAgentEngine:
             filtered.append(part)
         return "".join(filtered)
 
-    # -- State Persistence (DB + File Attachments) --
+    # ── State Persistence (DB + File Attachments) ──
 
     async def _save_state_to_file(self) -> None:
         """Serialize agent state to a JSON file and bind it to the chat DB."""
@@ -642,6 +641,11 @@ class HelixAgentEngine:
 
         self.all_tools_dict = {}
 
+        # 0. Resolve skills from model metadata (injected into system prompt later)
+        model_info = self.app_models.get(self.body.get("model", ""), {})
+        skill_ids, skill_prompt = await self._resolve_model_skills(model_info)
+        self._skill_prompt = skill_prompt
+
         # 1. External tools (DB + OpenAPI)
         unique_ids = list(dict.fromkeys(tid for tid in tool_ids if tid))
         if unique_ids:
@@ -652,10 +656,24 @@ class HelixAgentEngine:
             except Exception as e:
                 logger.error(f"get_tools failed: {e}")
 
-        # 2. Built-in tools
-        model_info = self.app_models.get(self.body.get("model", ""), {})
+        # 2. MCP tools (from server:mcp: / mcp: prefixed IDs)
+        try:
+            mcp_tools = await self._resolve_mcp_tools(unique_ids, extra_params)
+            if mcp_tools:
+                self.all_tools_dict.update(mcp_tools)
+                # Track clients for later cleanup
+                for name, tool in mcp_tools.items():
+                    client = tool.get("client")
+                    if client and hasattr(client, "disconnect"):
+                        self._mcp_clients[name] = client
+        except Exception as e:
+            logger.error(f"MCP tool resolution failed: {e}")
+
+        # 3. Built-in tools (pass skill_ids so view_skill is available)
+        if skill_ids:
+            extra_params["__skill_ids__"] = skill_ids
         features = self._get_model_features(model_info)
-        if features:
+        if features or extra_params.get("__skill_ids__"):
             try:
                 builtin = await get_builtin_tools(self.request, extra_params, features=features, model=model_info)
                 if builtin:
@@ -663,7 +681,7 @@ class HelixAgentEngine:
             except Exception as e:
                 logger.error(f"get_builtin_tools failed: {e}")
 
-        # 3. Terminal tools
+        # 4. Terminal tools
         terminal_id = self.pipe_metadata.get("terminal_id")
         if terminal_id:
             try:
@@ -677,7 +695,7 @@ class HelixAgentEngine:
             except Exception as e:
                 logger.error(f"get_terminal_tools failed: {e}")
 
-        # 4. Add internal control tools (always available, stored in all_tools_dict too)
+        # 5. Add internal control tools (always available, stored in all_tools_dict too)
         self._add_internal_tools()
 
         return self.all_tools_dict
@@ -779,6 +797,35 @@ class HelixAgentEngine:
             "callable": self._tool_fix_plan,
             "type": "function",
         }
+        self.all_tools_dict["proceed_to_output"] = {
+            "spec": {
+                "name": "proceed_to_output",
+                "description": "Move from REVIEW to OUTPUT phase to generate the polished final answer. Call this when everything is done and correct.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "notes": {"type": "string", "description": "Optional brief notes about the review decision."},
+                    },
+                },
+            },
+            "callable": self._tool_proceed_to_output,
+            "type": "function",
+        }
+        self.all_tools_dict["early_finish"] = {
+            "spec": {
+                "name": "early_finish",
+                "description": "Signal that the current work is complete enough to move to the next phase. Only available in EXECUTE phase.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "reason": {"type": "string", "description": "Brief reason why you're finishing early"},
+                    },
+                    "required": ["reason"],
+                },
+            },
+            "callable": self._tool_early_finish,
+            "type": "function",
+        }
         self.all_tools_dict["rag_search"] = {
             "spec": {
                 "name": "rag_search",
@@ -796,31 +843,6 @@ class HelixAgentEngine:
             "callable": self._tool_rag_search,
             "type": "function",
         }
-        self.all_tools_dict["ask_user"] = {
-            "spec": {
-                "name": "ask_user",
-                "description": "Ask the user an interactive single-choice question with optional free-text input. Use this when you need clarification or a decision during planning. Only available during PLAN and QUICK REPLAN phases.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "question": {"type": "string", "description": "The question to ask the user."},
-                        "options": {
-                            "type": "array",
-                            "items": {"type": "string"},
-                            "description": "List of 2-6 options for the user to pick from.",
-                        },
-                        "allow_custom": {
-                            "type": "boolean",
-                            "default": True,
-                            "description": "If true, the user can type a custom answer instead of picking an option.",
-                        },
-                    },
-                    "required": ["question", "options"],
-                },
-            },
-            "callable": self._tool_ask_user,
-            "type": "function",
-        }
 
     def _get_model_features(self, model_info):
         info = model_info.get("info", {}) or {}
@@ -833,7 +855,233 @@ class HelixAgentEngine:
                     features[fk] = bool(fv)
         return features
 
-    # -- Phase-aware Tool Filtering --
+    # ── Skills & MCP Helpers ──
+
+    async def _resolve_model_skills(self, model_info: dict) -> tuple[list[str], str]:
+        """Resolve skillIds from model metadata and fetch user skills from DB."""
+        skill_ids: list[str] = []
+        skill_prompt = ""
+        if not model_info:
+            return skill_ids, skill_prompt
+
+        meta = model_info.get("info", {}).get("meta", {})
+        if not meta:
+            meta = model_info
+        model_skill_ids = meta.get("skillIds", [])
+        if not model_skill_ids:
+            return skill_ids, skill_prompt
+
+        try:
+            user_id = None
+            if hasattr(self.user, "id"):
+                user_id = self.user.id
+            elif isinstance(self.user, dict):
+                user_id = self.user.get("id")
+            if not user_id:
+                return skill_ids, skill_prompt
+
+            user_skills = await Skills.get_skills_by_user_id(user_id, "read")
+            accessible = {s.id: s for s in user_skills if s.is_active}
+            available = []
+            for sid in model_skill_ids:
+                sk = accessible.get(sid)
+                if sk:
+                    available.append(sk)
+                    skill_ids.append(sid)
+
+            if available:
+                descriptions = ""
+                for sk in available:
+                    descriptions += f"<skill>\n<name>{sk.name}</name>\n<description>{sk.description or ''}</description>\n</skill>\n"
+                skill_prompt = (
+                    f"<available_skills>\n{descriptions}</available_skills>\n\n"
+                    "You have access to the above skills. ONLY use them when they are directly useful for the current task or context. Do not invoke a skill unless it provides clear value for what the user is asking."
+                )
+        except Exception as e:
+            logger.error(f"Error resolving skills: {e}")
+
+        return skill_ids, skill_prompt
+
+    async def _resolve_mcp_tools(self, tool_ids: list[str], extra_params: dict) -> dict[str, Any]:
+        """Resolve MCP server tools from tool_ids, mirroring planner_v3 logic."""
+        out: dict[str, Any] = {}
+        if not tool_ids or not self.request or not self.user:
+            return out
+
+        oauth_token = None
+        try:
+            oauth_token = await get_system_oauth_token(self.request, self.user)
+        except Exception:
+            pass
+
+        resolved_servers = set()
+        for tool_id in tool_ids:
+            if not isinstance(tool_id, str):
+                continue
+
+            server_id = None
+            if tool_id.startswith("server:mcp:"):
+                server_id = tool_id[len("server:mcp:"):]
+            elif tool_id.startswith("mcp:"):
+                server_id = tool_id[len("mcp:"):]
+                mcp_connections = getattr(
+                    self.request.app.state.config, "TOOL_SERVER_CONNECTIONS", []
+                )
+                for server_connection in mcp_connections:
+                    if server_connection.get("type", "") == "mcp":
+                        sid = server_connection.get("info", {}).get("id")
+                        if sid and (tool_id == sid or tool_id.startswith(f"{sid}_")):
+                            server_id = sid
+                            break
+
+            if not server_id:
+                continue
+            if server_id in resolved_servers:
+                continue
+            resolved_servers.add(server_id)
+
+            try:
+                mcp_server_connection = None
+                for conn in self.request.app.state.config.TOOL_SERVER_CONNECTIONS:
+                    if (
+                        conn.get("type", "") == "mcp"
+                        and conn.get("info", {}).get("id") == server_id
+                    ):
+                        mcp_server_connection = conn
+                        break
+
+                if not mcp_server_connection:
+                    logger.error("MCP server %s not found in connections", server_id)
+                    continue
+
+                if not await has_connection_access(self.user, mcp_server_connection):
+                    logger.warning("Access denied to MCP server %s", server_id)
+                    continue
+
+                auth_type = mcp_server_connection.get("auth_type", "")
+                headers: dict[str, str] = {}
+                if auth_type == "bearer":
+                    headers["Authorization"] = f"Bearer {mcp_server_connection.get('key', '')}"
+                elif auth_type == "none":
+                    pass
+                elif auth_type == "session":
+                    tok = getattr(getattr(self.request, "state", None), "token", None)
+                    creds = getattr(tok, "credentials", None) if tok else None
+                    if creds:
+                        headers["Authorization"] = f"Bearer {creds}"
+                elif auth_type == "system_oauth":
+                    if oauth_token:
+                        headers["Authorization"] = f"Bearer {oauth_token.get('access_token', '')}"
+                elif auth_type == "oauth_2.1":
+                    try:
+                        splits = server_id.split(":")
+                        sid = splits[-1] if len(splits) > 1 else server_id
+                        mgr = getattr(self.request.app.state, "oauth_client_manager", None)
+                        if mgr:
+                            ot = await mgr.get_oauth_token(
+                                getattr(self.user, "id", ""), f"mcp:{sid}"
+                            )
+                            if ot:
+                                headers["Authorization"] = f"Bearer {ot.get('access_token', '')}"
+                    except Exception as e:
+                        logger.error("OAuth token for MCP: %s", e)
+
+                connection_headers = mcp_server_connection.get("headers")
+                if connection_headers and isinstance(connection_headers, dict):
+                    headers.update(connection_headers)
+
+                if ENABLE_FORWARD_USER_INFO_HEADERS and self.user:
+                    headers = include_user_info_headers(headers, self.user)
+                    cid = self.chat_id
+                    if cid:
+                        headers[FORWARD_SESSION_INFO_HEADER_CHAT_ID] = cid
+                    mid = self.message_id
+                    if mid:
+                        headers[FORWARD_SESSION_INFO_HEADER_MESSAGE_ID] = mid
+
+                client = MCPClient()
+                await client.connect(
+                    url=mcp_server_connection.get("url", ""),
+                    headers=headers if headers else None,
+                )
+
+                if not hasattr(client, "_call_lock"):
+                    client._call_lock = asyncio.Lock()
+
+                function_name_filter_list = mcp_server_connection.get("config", {}).get(
+                    "function_name_filter_list", ""
+                )
+                if isinstance(function_name_filter_list, str):
+                    function_name_filter_list = function_name_filter_list.split(",")
+
+                async with client._call_lock:
+                    tool_specs = await client.list_tool_specs()
+
+                def make_tool_function(mcp_client, function_name, sid):
+                    async def tool_function(**kwargs):
+                        try:
+                            logger.debug(
+                                "[MCP] Calling '%s' on server '%s' with args: %s",
+                                function_name, sid, kwargs,
+                            )
+                            async with mcp_client._call_lock:
+                                result = await mcp_client.call_tool(
+                                    function_name, function_args=kwargs
+                                )
+                            if hasattr(result, "content") and result.content:
+                                texts = []
+                                for c in result.content:
+                                    if hasattr(c, "text") and c.text:
+                                        texts.append(c.text)
+                                    elif hasattr(c, "image"):
+                                        texts.append(
+                                            f"[Image Content: {c.image[:50]}...]"
+                                            if isinstance(c.image, str)
+                                            else "[Image Content]"
+                                        )
+                                    else:
+                                        texts.append(str(c))
+                                return "\n".join(texts)
+                            if hasattr(result, "isError") and result.isError:
+                                return f"MCP Error from {sid}: {result}"
+                            return str(result)
+                        except Exception as e:
+                            logger.error(
+                                "Failed to call MCP tool '%s' on '%s': %s",
+                                function_name, sid, e, exc_info=True,
+                            )
+                            return f"Error calling MCP tool: {e}"
+
+                    return tool_function
+
+                for tool_spec in tool_specs:
+                    if function_name_filter_list:
+                        if not is_string_allowed(tool_spec["name"], function_name_filter_list):
+                            continue
+                    tool_function = make_tool_function(client, tool_spec["name"], server_id)
+                    prefixed_name = f'{server_id}_{tool_spec["name"]}'
+                    out[prefixed_name] = {
+                        "spec": {**tool_spec, "name": prefixed_name},
+                        "callable": tool_function,
+                        "type": "mcp",
+                        "client": client,
+                        "direct": False,
+                    }
+            except Exception as e:
+                logger.debug("MCP tool load failed for %s: %s", tool_id, e)
+                if self.event_emitter:
+                    try:
+                        await self.event_emitter({
+                            "type": "chat:message:error",
+                            "data": {"error": {"content": f"Failed to connect to MCP server '{server_id}'"}},
+                        })
+                    except Exception:
+                        pass
+                continue
+
+        return out
+
+    # ── Phase-aware Tool Filtering ──
 
     def _filter_tools_for_phase(self, phase: str):
         """Build phase_tools_dict from all_tools_dict based on Valves config."""
@@ -846,27 +1094,24 @@ class HelixAgentEngine:
             allowlist = set(_comma_list(self.valves.EXECUTE_TOOLS))
         elif phase == self.PHASE_REVIEW:
             allowlist = set(_comma_list(self.valves.REVIEW_TOOLS))
-        elif phase == self.PHASE_REPLAN_SKIP:
-            # QUICK REPLAN uses the same tool allowlist as PLAN
-            allowlist = set(_comma_list(self.valves.PLAN_TOOLS))
+        elif phase == self.PHASE_OUTPUT:
+            allowlist = set(_comma_list(self.valves.OUTPUT_TOOLS))
+
+        # Phase-specific internal tools (only show relevant ones per phase)
+        phase_internal_tools = self.PHASE_INTERNAL_TOOLS.get(phase, self.INTERNAL_TOOLS)
 
         # If allowlist is empty -> allow ALL tools
-        # If allowlist has entries -> only those tools (plus internals)
+        # If allowlist has entries -> only those tools (plus phase-internal ones)
         self.phase_tools_dict = {}
 
         for name, tool in self.all_tools_dict.items():
-            # Internal tools are ALWAYS included regardless of allowlist
+            # Internal tools are included ONLY if in phase_internal_tools
             if name in self.INTERNAL_TOOLS:
-                self.phase_tools_dict[name] = tool
-                continue
-
-            # ask_user is only available in PLAN and REPLAN_SKIP phases
-            if name == "ask_user":
-                if phase in (self.PHASE_PLAN, self.PHASE_REPLAN_SKIP):
+                if name in phase_internal_tools:
                     self.phase_tools_dict[name] = tool
                 continue
 
-            # Allowlist filtering
+            # Allowlist filtering for non-internal tools
             if allowlist:
                 if name in allowlist:
                     self.phase_tools_dict[name] = tool
@@ -880,7 +1125,7 @@ class HelixAgentEngine:
             if isinstance(t, dict) and "spec" in t
         ]
 
-    # -- Internal Tools --
+    # ── Internal Tools ──
 
     async def _tool_terminate(self, **kwargs):
         return json.dumps({"terminated": True, "result": kwargs.get("result", ""), "success": kwargs.get("success", True)})
@@ -989,6 +1234,15 @@ class HelixAgentEngine:
         await self.emit_task_update()
         return json.dumps({"fix_plan": True, "inserted_tasks": new_tasks, "reason": reason})
 
+    async def _tool_proceed_to_output(self, **kwargs):
+        """Transition from REVIEW to OUTPUT phase."""
+        if self.phase == self.PHASE_REVIEW:
+            self._transition_to(self.PHASE_OUTPUT)
+            await self._save_state_to_file()
+            await self.emit_task_update()
+            return json.dumps({"proceed_to_output": True})
+        return json.dumps({"proceed_to_output": False, "error": f"Cannot proceed to output from {self.phase} phase"})
+
     async def _tool_confirm_plan(self, **kwargs):
         plan_text = kwargs.get("plan", "")
         uv = self.user_valves
@@ -997,10 +1251,6 @@ class HelixAgentEngine:
             return json.dumps({"action": "accept"})
 
         if not self.event_call:
-            return json.dumps({"action": "accept"})
-
-        # Auto-accept when in QUICK REPLAN phase to keep the skip flow fast
-        if self.phase == self.PHASE_REPLAN_SKIP:
             return json.dumps({"action": "accept"})
 
         tasks = self._extract_task_list(plan_text)
@@ -1022,6 +1272,15 @@ class HelixAgentEngine:
             res = {"action": "accept"}
 
         return json.dumps(res)
+
+    async def _tool_early_finish(self, reason: str, **kwargs):
+        """Signal early completion and move to REVIEW from EXECUTE."""
+        if self.phase == self.PHASE_EXECUTE:
+            self._transition_to(self.PHASE_REVIEW)
+            await self._save_state_to_file()
+            await self.emit_task_update()
+            return json.dumps({"early_finish": True, "phase": "review", "reason": reason})
+        return json.dumps({"early_finish": False, "error": f"Cannot early_finish from {self.phase}"})
 
     async def _tool_rag_search(self, file_id: str, query: str, top_k: int = 5, **kwargs):
         """RAG search: chunk, embed (if needed) and retrieve top_k chunks."""
@@ -1110,263 +1369,19 @@ class HelixAgentEngine:
             logger.error("RAG search failed: %s", rag_err)
             return json.dumps({"error": f"RAG search failed: {rag_err}"})
 
-    async def _tool_ask_user(self, question: str, options: list, allow_custom: bool = True, **kwargs):
-        """Interactive user question tool. Only available during PLAN and REPLAN_SKIP phases."""
-        if self.phase in (self.PHASE_PLAN, self.PHASE_REPLAN_SKIP):
-            self._plan_questions_asked += 1
-            if self._plan_questions_asked >= self.valves.MAX_PLAN_QUESTIONS:
-                return (
-                    "CRITICAL: You have reached the maximum number of clarification questions "
-                    f"({self.valves.MAX_PLAN_QUESTIONS}). You must NOT ask more questions. "
-                    "Call confirm_plan with your best plan NOW."
-                )
-        if not self.event_call:
-            return "Error: interactive input not available in this context."
-
-        if not options or not isinstance(options, list):
-            return "Error: provide at least one option."
-
-        opts = [str(o) for o in options[:8]]  # max 8 options
-        if not opts:
-            return "Error: options list is empty."
-
-        js = self._build_ask_user_js(question=question, options=opts, allow_custom=allow_custom)
-        try:
-            raw = await self.event_call({"type": "execute", "data": {"code": js}})
-        except Exception as e:
-            logger.error(f"ask_user event_call failed: {e}")
-            return f"Error getting user input: {e}"
-
-        raw_str = raw if isinstance(raw, str) else (raw.get("result") or raw.get("value") or "{}") if raw else "{}"
-        try:
-            parsed = json.loads(raw_str) if isinstance(raw_str, str) and raw_str.startswith("{") else {}
-        except (json.JSONDecodeError, AttributeError):
-            parsed = {}
-
-        rtype = parsed.get("type")
-        if rtype == "select":
-            return f"User selected: {parsed.get('value', '')}"
-        elif rtype == "custom":
-            return f"User answered: {parsed.get('value', '')}"
-        elif rtype == "skip":
-            return "User skipped the question."
-        return f"User response: {raw_str}"
-
-    def _build_ask_user_js(self, question: str, options: list[str], allow_custom: bool = True) -> str:
-        q_safe = json.dumps(question)
-        opts_safe = json.dumps(options)
-        custom_js = "true" if allow_custom else "false"
-        return f"""
-return (function() {{
-  return new Promise((resolve) => {{
-    {self._base_theme_js()}
-    const question    = {q_safe};
-    const options     = {opts_safe};
-    const allowCustom = {custom_js};
-    const OVERLAY_ID  = '__owui_helix_ask_user__';
-
-    const existing = document.getElementById(OVERLAY_ID);
-    if (existing) existing.remove();
-
-    function finish(payload) {{
-      panel.style.transform   = 'scale(0.95)';
-      panel.style.opacity     = '0';
-      overlay.style.opacity   = '0';
-      setTimeout(() => {{
-        overlay.remove();
-        document.removeEventListener('keydown', onKey);
-        resolve(JSON.stringify(payload));
-      }}, 180);
-    }}
-
-    const overlay = document.createElement('div');
-    overlay.id = OVERLAY_ID;
-    Object.assign(overlay.style, {{
-      position: 'fixed', inset: '0', zIndex: '999999',
-      background: col.overlay,
-      backdropFilter: 'blur(12px)', WebkitBackdropFilter: 'blur(12px)',
-      display: 'flex', alignItems: 'center', justifyContent: 'center',
-      fontFamily: "-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif",
-      opacity: '0', transition: 'opacity 0.18s ease',
-    }});
-
-    const panel = document.createElement('div');
-    Object.assign(panel.style, {{
-      background: col.panel, border: '1px solid ' + col.border,
-      borderRadius: '16px', padding: '26px 26px 20px',
-      maxWidth: '520px', width: 'calc(100vw - 32px)',
-      maxHeight: '85vh', overflowY: 'auto',
-      boxShadow: '0 28px 80px rgba(0,0,0,0.65)',
-      display: 'flex', flexDirection: 'column', gap: '14px',
-      transform: 'scale(0.92)', opacity: '0',
-      transition: 'transform 0.22s cubic-bezier(0.34,1.56,0.64,1), opacity 0.18s ease',
-    }});
-
-    const header = document.createElement('div');
-    Object.assign(header.style, {{ display: 'flex', alignItems: 'flex-start', gap: '12px' }});
-
-    const questionEl = document.createElement('p');
-    Object.assign(questionEl.style, {{
-      margin: '0', color: col.text, fontSize: '15px',
-      fontWeight: '600', lineHeight: '1.55', flex: '1', wordBreak: 'break-word',
-    }});
-    questionEl.textContent = question;
-
-    const badge = document.createElement('span');
-    Object.assign(badge.style, {{
-      flexShrink: '0', fontSize: '10px', fontWeight: '700',
-      letterSpacing: '0.07em', padding: '3px 9px', borderRadius: '99px',
-      background: col.btnPrimary + '26', color: col.btnPrimary,
-      marginTop: '2px', whiteSpace: 'nowrap',
-    }});
-    badge.textContent = 'CHOOSE ONE';
-
-    header.appendChild(questionEl);
-    header.appendChild(badge);
-
-    const optContainer = document.createElement('div');
-    Object.assign(optContainer.style, {{
-      display: 'flex', flexDirection: 'column', gap: '7px',
-    }});
-
-    options.forEach(function(opt, i) {{
-      const btn = document.createElement('button');
-      Object.assign(btn.style, {{
-        display: 'flex', alignItems: 'center', gap: '11px',
-        background: col.btn, border: '1.5px solid ' + col.btnBorder,
-        borderRadius: '10px', padding: '11px 13px',
-        cursor: 'pointer', textAlign: 'left', width: '100%',
-        minHeight: '48px', outline: 'none', fontFamily: 'inherit', boxSizing: 'border-box',
-        transition: 'background 0.12s, border-color 0.12s, transform 0.1s',
-      }});
-
-      const textBlock = document.createElement('div');
-      Object.assign(textBlock.style, {{ flex: '1', minWidth: '0' }});
-      const optLabel = document.createElement('span');
-      Object.assign(optLabel.style, {{
-        display: 'block', color: col.text, fontSize: '14px',
-        fontWeight: '500', wordBreak: 'break-word',
-      }});
-      optLabel.textContent = opt;
-      textBlock.appendChild(optLabel);
-      btn.appendChild(textBlock);
-
-      btn.addEventListener('mouseenter', function() {{
-        if (btn.dataset.selected !== '1') {{
-          btn.style.background  = '#3c3c52';
-          btn.style.borderColor = col.btnPrimary + '77';
-          btn.style.transform   = 'translateY(-1px)';
-        }}
-      }});
-      btn.addEventListener('mouseleave', function() {{
-        if (btn.dataset.selected !== '1') {{
-          btn.style.background = col.btn;
-          btn.style.borderColor = col.btnBorder;
-        }}
-        btn.style.transform = '';
-      }});
-
-      btn.addEventListener('click', function() {{
-        finish({{ type: 'select', index: i, value: opt }});
-      }});
-
-      optContainer.appendChild(btn);
-    }});
-
-    if (allowCustom) {{
-      const customRow = document.createElement('div');
-      Object.assign(customRow.style, {{ display: 'flex', gap: '7px', alignItems: 'stretch' }});
-
-      const customInput = document.createElement('input');
-      customInput.type = 'text';
-      customInput.placeholder = 'Or type a custom answer\u2026';
-      Object.assign(customInput.style, {{
-        flex: '1', background: col.input, border: '1.5px solid ' + col.inputBorder,
-        borderRadius: '8px', padding: '10px 12px', color: col.text,
-        fontSize: '14px', minHeight: '44px', outline: 'none',
-        fontFamily: 'inherit', transition: 'border-color 0.12s',
-        boxSizing: 'border-box',
-      }});
-      customInput.addEventListener('focus', function() {{ customInput.style.borderColor = col.btnPrimary; }});
-      customInput.addEventListener('blur', function() {{ customInput.style.borderColor = customInput.value ? col.btnPrimary : col.inputBorder; }});
-      customInput.addEventListener('keydown', function(e) {{
-        if (e.key === 'Enter' && customInput.value.trim()) {{
-          e.stopPropagation();
-          finish({{ type: 'custom', value: customInput.value.trim() }});
-        }}
-      }});
-
-      const sendBtn = document.createElement('button');
-      sendBtn.title = 'Submit custom answer (Enter)';
-      Object.assign(sendBtn.style, {{
-        background: col.btnPrimary, border: 'none', borderRadius: '8px',
-        padding: '10px 16px', cursor: 'pointer', fontSize: '16px',
-        color: col.btnPrimaryText, fontWeight: '700', minHeight: '44px',
-        flexShrink: '0', transition: 'opacity 0.12s, transform 0.1s',
-        fontFamily: 'inherit',
-      }});
-      sendBtn.textContent = '\u21b5';
-      sendBtn.addEventListener('mouseenter', function() {{ sendBtn.style.transform = 'scale(1.08)'; }});
-      sendBtn.addEventListener('mouseleave', function() {{ sendBtn.style.transform = ''; }});
-      sendBtn.addEventListener('click', function() {{
-        if (customInput.value.trim()) {{
-          finish({{ type: 'custom', value: customInput.value.trim() }});
-        }}
-      }});
-
-      customRow.appendChild(customInput);
-      customRow.appendChild(sendBtn);
-      optContainer.appendChild(customRow);
-    }}
-
-    const footer = document.createElement('div');
-    Object.assign(footer.style, {{
-      display: 'flex', gap: '8px', justifyContent: 'flex-end', marginTop: '2px',
-    }});
-
-    const skipBtn = document.createElement('button');
-    skipBtn.textContent = 'Skip';
-    Object.assign(skipBtn.style, {{
-      background: 'transparent', border: '1.5px solid ' + col.btnBorder,
-      borderRadius: '8px', padding: '9px 18px', color: '#6c7086',
-      fontSize: '13px', cursor: 'pointer', fontFamily: 'inherit',
-      transition: 'border-color 0.12s, color 0.12s',
-    }});
-    skipBtn.addEventListener('mouseenter', function() {{ skipBtn.style.borderColor = '#9399b2'; skipBtn.style.color = col.text; }});
-    skipBtn.addEventListener('mouseleave', function() {{ skipBtn.style.borderColor = col.btnBorder; skipBtn.style.color = '#6c7086'; }});
-    skipBtn.addEventListener('click', function() {{ finish({{ type: 'skip' }}); }});
-    footer.appendChild(skipBtn);
-
-    function onKey(e) {{
-      if (e.key === 'Escape') {{ skipBtn.click(); return; }}
-    }}
-    document.addEventListener('keydown', onKey);
-
-    panel.appendChild(header);
-    panel.appendChild(optContainer);
-    panel.appendChild(footer);
-    overlay.appendChild(panel);
-    document.body.appendChild(overlay);
-
-    requestAnimationFrame(function() {{
-      requestAnimationFrame(function() {{
-        overlay.style.opacity = '1';
-        panel.style.transform = 'scale(1)';
-        panel.style.opacity   = '1';
-      }});
-    }});
-  }});
-}})()
-"""
-
     def _base_theme_js(self):
         return """
             const col = {
-                overlay: 'rgba(0,0,0,0.62)', panel: '#1e1e2e', border: '#45475a',
-                text: '#cdd6f4', sub: '#a6adc8', input: '#313244', inputBorder: '#45475a',
-                btn: '#313244', btnText: '#cdd6f4', btnBorder: '#45475a',
-                btnPrimary: '#E8713A', btnPrimaryText: '#ffffff',
+                overlay: 'rgba(0,0,0,0.55)', panel: '#1e293b', border: '#334155',
+                text: '#f1f5f9', sub: '#94a3b8', input: '#0f172a', inputBorder: '#475569',
+                btn: '#334155', btnText: '#e2e8f0', btnBorder: '#475569',
+                btnPrimary: '#3b82f6', btnPrimaryText: '#ffffff',
             };
+            try { const s = getComputedStyle(document.documentElement);
+              col.panel = s.getPropertyValue('--color-gray-900').trim() || col.panel;
+              col.text = s.getPropertyValue('--color-gray-50').trim() || col.text;
+              col.btnPrimary = s.getPropertyValue('--color-blue-500').trim() || col.btnPrimary;
+            } catch(e) {}
         """
 
     def _build_plan_approval_js(self, tasks: list, timeout_s: int = 600) -> str:
@@ -1376,237 +1391,99 @@ return (function() {{
       return new Promise((resolve) => {{
     {self._base_theme_js()}
         let _timer;
-        const OVERLAY_ID = '__owui_helix_plan__';
-        const existing = document.getElementById(OVERLAY_ID);
-        if (existing) existing.remove();
-
-        // -- Overlay ----------------------------------------------------------
         const overlay = document.createElement('div');
-        overlay.id = OVERLAY_ID;
-        Object.assign(overlay.style, {{
-          position: 'fixed', inset: '0', zIndex: '999999',
-          background: col.overlay,
-          backdropFilter: 'blur(12px)', WebkitBackdropFilter: 'blur(12px)',
-          display: 'flex', alignItems: 'center', justifyContent: 'center',
-          fontFamily: "-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif",
-          opacity: '0', transition: 'opacity 0.18s ease',
-        }});
-
-        // -- Panel --------------------------------------------------------------
+        overlay.style.cssText = `position:fixed;inset:0;z-index:999999;background:${{col.overlay}};display:flex;align-items:center;justify-content:center;padding:20px;backdrop-filter:blur(4px);`;
         const panel = document.createElement('div');
-        Object.assign(panel.style, {{
-          background: col.panel, border: '1px solid ' + col.border,
-          borderRadius: '16px', padding: '26px 26px 20px',
-          maxWidth: '520px', width: 'calc(100vw - 32px)',
-          maxHeight: '85vh', overflowY: 'auto',
-          boxShadow: '0 28px 80px rgba(0,0,0,0.65)',
-          display: 'flex', flexDirection: 'column', gap: '14px',
-          transform: 'scale(0.92)', opacity: '0',
-          transition: 'transform 0.22s cubic-bezier(0.34,1.56,0.64,1), opacity 0.18s ease',
-        }});
+        panel.style.cssText = `background:${{col.panel}};border:1px solid ${{col.border}};border-radius:20px;box-shadow:0 20px 60px rgba(0,0,0,0.3);color:${{col.text}};font-family:ui-sans-serif,system-ui,sans-serif;width:100%;max-width:520px;max-height:90vh;padding:32px;display:flex;flex-direction:column;gap:24px;`;
 
-        // -- Header row ---------------------------------------------------------
         const header = document.createElement('div');
-        Object.assign(header.style, {{ display: 'flex', alignItems: 'flex-start', gap: '12px' }});
+        header.style.cssText = 'display:flex;align-items:center;gap:12px;flex-shrink:0;';
+        const icon = document.createElement('div'); icon.textContent = '\uD83D\uDCCB'; icon.style.cssText = 'font-size:24px;';
+        const title = document.createElement('div'); title.textContent = 'Review Proposed Plan'; title.style.cssText = `font-size:20px;font-weight:800;color:${{col.text}};letter-spacing:-0.4px;`;
+        header.appendChild(icon); header.appendChild(title); panel.appendChild(header);
 
-        const iconBlock = document.createElement('div');
-        iconBlock.textContent = '\uD83D\uDCCB';
-        Object.assign(iconBlock.style, {{ fontSize: '22px', flexShrink: '0', marginTop: '2px' }});
-
-        const titleText = document.createElement('p');
-        Object.assign(titleText.style, {{
-          margin: '0', color: col.text, fontSize: '16px',
-          fontWeight: '700', lineHeight: '1.4', flex: '1', wordBreak: 'break-word',
-        }});
-        titleText.textContent = 'Review Proposed Plan';
-
-        const badge = document.createElement('span');
-        Object.assign(badge.style, {{
-          flexShrink: '0', fontSize: '10px', fontWeight: '700',
-          letterSpacing: '0.07em', padding: '3px 9px', borderRadius: '99px',
-          background: col.btnPrimary + '26', color: col.btnPrimary,
-          marginTop: '2px', whiteSpace: 'nowrap',
-        }});
-        badge.textContent = 'PLAN REVIEW';
-
-        header.appendChild(iconBlock);
-        header.appendChild(titleText);
-        header.appendChild(badge);
-
-        // -- Scrollable task list ---------------------------------------------
         const scrollContainer = document.createElement('div');
-        Object.assign(scrollContainer.style, {{
-          overflowY: 'auto', flex: '1', display: 'flex', flexDirection: 'column', gap: '7px',
-          paddingRight: '4px',
-        }});
+        scrollContainer.style.cssText = 'overflow-y:auto;flex:1;display:flex;flex-direction:column;gap:12px;padding-right:8px;';
 
         const tasksData = {ts};
         tasksData.forEach((t, i) => {{
             const card = document.createElement('div');
-            Object.assign(card.style, {{
-              display: 'flex', alignItems: 'flex-start', gap: '12px',
-              background: col.input, border: '1.5px solid ' + col.inputBorder,
-              borderRadius: '10px', padding: '11px 13px',
-              minHeight: '48px', transition: 'background 0.12s, border-color 0.12s',
-            }});
+            card.style.cssText = `background:${{col.input}};border:1px solid ${{col.inputBorder}};border-radius:12px;padding:12px 16px;display:flex;gap:12px;align-items:flex-start;`;
 
-            const num = document.createElement('span');
-            Object.assign(num.style, {{
-              flexShrink: '0', width: '26px', height: '26px',
-              borderRadius: '6px', background: col.btnPrimary,
-              display: 'flex', alignItems: 'center', justifyContent: 'center',
-              fontSize: '11px', fontWeight: '700', color: col.btnPrimaryText,
-              marginTop: '2px',
-            }});
-            num.textContent = String(i + 1);
+            const num = document.createElement('div');
+            num.textContent = i + 1;
+            num.style.cssText = `width:24px;height:24px;background:${{col.btnPrimary}};color:${{col.btnPrimaryText}};border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:bold;flex-shrink:0;margin-top:2px;`;
 
             const content = document.createElement('div');
-            Object.assign(content.style, {{ display: 'flex', flexDirection: 'column', gap: '4px', flex: '1', minWidth: '0' }});
-            const tid = document.createElement('span');
-            Object.assign(tid.style, {{
-              fontSize: '11px', fontWeight: '700', color: col.sub,
-              textTransform: 'uppercase', letterSpacing: '0.05em',
-            }});
-            tid.textContent = t.task_id;
-            const desc = document.createElement('span');
-            Object.assign(desc.style, {{
-              fontSize: '14px', color: col.text, lineHeight: '1.5', wordBreak: 'break-word',
-            }});
-            desc.textContent = t.description;
+            content.style.cssText = 'display:flex;flex-direction:column;gap:4px;';
+            const tid = document.createElement('div'); tid.textContent = t.task_id; tid.style.cssText = `font-size:11px;font-weight:bold;color:${{col.sub}};text-transform:uppercase;`;
+            const desc = document.createElement('div'); desc.textContent = t.description; desc.style.cssText = `font-size:14px;color:${{col.text}};line-height:1.4;`;
 
-            content.appendChild(tid);
-            content.appendChild(desc);
-            card.appendChild(num);
-            card.appendChild(content);
+            content.appendChild(tid); content.appendChild(desc);
+            card.appendChild(num); card.appendChild(content);
             scrollContainer.appendChild(card);
         }});
+        panel.appendChild(scrollContainer);
 
-        // -- Feedback input -----------------------------------------------------
         const inputContainer = document.createElement('div');
-        Object.assign(inputContainer.style, {{ display: 'flex', flexDirection: 'column', gap: '8px' }});
-        const inputLabel = document.createElement('div');
-        inputLabel.textContent = 'Feedback (optional):';
-        Object.assign(inputLabel.style, {{
-          fontSize: '11px', fontWeight: '700', color: col.sub,
-          textTransform: 'uppercase', letterSpacing: '0.06em',
-        }});
+        inputContainer.style.cssText = 'display:flex;flex-direction:column;gap:10px;flex-shrink:0;';
+        const inputLabel = document.createElement('div'); inputLabel.textContent = 'Feedback (optional):'; inputLabel.style.cssText = `font-size:12px;font-weight:700;color:${{col.sub}};text-transform:uppercase;letter-spacing:0.5px;`;
         const feedbackInput = document.createElement('textarea');
         feedbackInput.placeholder = 'e.g., "Add a step to check for X" or "Skip the second task"';
-        Object.assign(feedbackInput.style, {{
-          background: col.input, border: '1.5px solid ' + col.inputBorder,
-          color: col.text, padding: '12px 14px',
-          borderRadius: '10px', fontSize: '14px', outline: 'none',
-          minHeight: '64px', resize: 'none',
-          fontFamily: 'inherit', boxSizing: 'border-box',
-          transition: 'border-color 0.15s',
-        }});
-        feedbackInput.addEventListener('focus', function() {{ feedbackInput.style.borderColor = col.btnPrimary; }});
-        feedbackInput.addEventListener('blur', function() {{ feedbackInput.style.borderColor = col.inputBorder; }});
-        inputContainer.appendChild(inputLabel);
-        inputContainer.appendChild(feedbackInput);
+        feedbackInput.style.cssText = `background:${{col.input}};border:1px solid ${{col.inputBorder}};color:${{col.text}};padding:14px;border-radius:14px;font-size:14px;outline:none;min-height:70px;resize:none;transition:border-color 0.2s;`;
+        feedbackInput.onfocus = () => feedbackInput.style.borderColor = 'var(--color-blue-500)';
+        feedbackInput.onblur = () => feedbackInput.style.borderColor = col.inputBorder;
+        inputContainer.appendChild(inputLabel); inputContainer.appendChild(feedbackInput); panel.appendChild(inputContainer);
 
-        // -- Footer buttons ---------------------------------------------------
         const footer = document.createElement('div');
-        Object.assign(footer.style, {{ display: 'flex', gap: '8px', justifyContent: 'flex-end', marginTop: '2px' }});
+        footer.style.cssText = 'display:flex;gap:12px;flex-shrink:0;';
 
-        function makeBtn(label, primary) {{
-          const b = document.createElement('button');
-          b.textContent = label;
-          Object.assign(b.style, {{
-            padding: '10px 18px', borderRadius: '8px',
-            fontSize: '13px', fontWeight: '700',
-            cursor: 'pointer', fontFamily: 'inherit',
-            border: '1.5px solid ' + (primary ? 'transparent' : col.btnBorder),
-            background: primary ? col.btnPrimary : col.btn,
-            color: primary ? col.btnPrimaryText : col.btnText,
-            transition: 'opacity 0.12s, transform 0.1s, border-color 0.12s',
-          }});
-          b.addEventListener('mouseenter', function() {{ b.style.opacity = '0.9'; b.style.transform = 'translateY(-1px)'; }});
-          b.addEventListener('mouseleave', function() {{ b.style.opacity = '1'; b.style.transform = ''; }});
-          return b;
-        }}
+        const makeBtn = (label, primary) => {{
+            const b = document.createElement('button');
+            b.textContent = label;
+            b.style.cssText = `flex:1;padding:14px 20px;border-radius:9999px;font-size:15px;font-weight:700;cursor:pointer;transition:all 0.2s;border:1px solid ${{primary ? 'transparent' : col.btnBorder}};background:${{primary ? col.btnPrimary : col.btn}};color:${{primary ? col.btnPrimaryText : col.btnText}};`;
+            b.onmouseenter = () => {{ b.style.opacity='0.9'; b.style.transform='translateY(-1px)'; }};
+            b.onmouseleave = () => {{ b.style.opacity='1'; b.style.transform='translateY(0)'; }};
+            return b;
+        }};
 
         const acceptBtn = makeBtn('Accept Plan', true);
         const feedbackBtn = makeBtn('Send Feedback', false);
         const cancelBtn = makeBtn('Cancel', false);
-        Object.assign(cancelBtn.style, {{
-          background: '#313244', color: '#f38ba8', borderColor: '#f38ba8',
-        }});
-        cancelBtn.addEventListener('mouseenter', function() {{ cancelBtn.style.opacity = '0.85'; cancelBtn.style.transform = 'translateY(-1px)'; }});
-        cancelBtn.addEventListener('mouseleave', function() {{ cancelBtn.style.opacity = '1'; cancelBtn.style.transform = ''; }});
+        cancelBtn.style.background = '#7f1d1d';
+        cancelBtn.style.color = '#fecaca';
+        cancelBtn.style.borderColor = '#991b1b';
 
-        const cleanup = function() {{
-          panel.style.transform = 'scale(0.95)';
-          panel.style.opacity = '0';
-          overlay.style.opacity = '0';
-          setTimeout(function() {{
-            overlay.remove();
-            document.removeEventListener('keydown', onKey);
-          }}, 180);
-        }};
+        const cleanup = () => {{ overlay.remove(); }};
 
-        acceptBtn.addEventListener('click', function() {{ clearTimeout(_timer); cleanup(); resolve(JSON.stringify({{action:'accept'}})); }});
-        feedbackBtn.addEventListener('click', function() {{
+        acceptBtn.onclick = () => {{ clearTimeout(_timer); cleanup(); resolve(JSON.stringify({{action:'accept'}})); }};
+        feedbackBtn.onclick = () => {{
             const val = feedbackInput.value.trim();
             if (val) {{ clearTimeout(_timer); cleanup(); resolve(JSON.stringify({{action:'feedback', value: val}})); }}
-            else {{ acceptBtn.click(); }}
-        }});
-        cancelBtn.addEventListener('click', function() {{ clearTimeout(_timer); cleanup(); resolve(JSON.stringify({{action:'cancel'}})); }});
+            else {{ acceptBtn.onclick(); }}
+        }};
+        cancelBtn.onclick = () => {{ clearTimeout(_timer); cleanup(); resolve(JSON.stringify({{action:'cancel'}})); }};
 
-        footer.appendChild(cancelBtn);
-        footer.appendChild(feedbackBtn);
-        footer.appendChild(acceptBtn);
+        footer.appendChild(acceptBtn); footer.appendChild(feedbackBtn); footer.appendChild(cancelBtn); panel.appendChild(footer);
 
-        // -- Countdown ----------------------------------------------------------
         const countdown = document.createElement('div');
-        countdown.textContent = '';
-        Object.assign(countdown.style, {{
-          fontSize: '11px', color: col.sub, textAlign: 'center', minHeight: '16px',
-        }});
-
-        // -- Global keyboard handler --------------------------------------------
-        function onKey(e) {{
-          if (e.key === 'Escape') {{
-            cancelBtn.click();
-            return;
-          }}
-          if (e.key === 'Enter' && e.metaKey) {{
-            acceptBtn.click();
-            return;
-          }}
-        }}
-        document.addEventListener('keydown', onKey);
-
-        // -- Assemble DOM -----------------------------------------------------
-        panel.appendChild(header);
-        panel.appendChild(scrollContainer);
-        panel.appendChild(inputContainer);
-        panel.appendChild(footer);
+        countdown.style.cssText = `font-size:11px;color:${{col.sub}};text-align:center;margin-top:-12px;flex-shrink:0;`;
         panel.appendChild(countdown);
-        overlay.appendChild(panel);
-        document.body.appendChild(overlay);
+
+        overlay.appendChild(panel); document.body.appendChild(overlay);
         feedbackInput.focus();
 
-        // -- Entrance animation -----------------------------------------------
-        requestAnimationFrame(function() {{
-          requestAnimationFrame(function() {{
-            overlay.style.opacity = '1';
-            panel.style.transform = 'scale(1)';
-            panel.style.opacity = '1';
-          }});
-        }});
-
         let remaining = {timeout_s};
-        function updateCountdown() {{
-            countdown.textContent = remaining > 0 ? 'Auto-accepting in ' + remaining + 's...' : '';
+        const updateCountdown = () => {{
+            countdown.textContent = remaining > 0 ? `Auto-accepting in ${{remaining}}s...` : '';
             if (remaining <= 0) {{ cleanup(); resolve(JSON.stringify({{action:'accept'}})); }}
-        }}
+        }};
         updateCountdown();
-        _timer = setInterval(function() {{ remaining--; updateCountdown(); }}, 1000);
+        _timer = setInterval(() => {{ remaining--; updateCountdown(); }}, 1000);
       }});
     }})();"""
 
-    # -- Iteration Limit UI --
+    # ── Iteration Limit UI ──
 
     def _build_iteration_limit_js(self, current_iter, max_iter, timeout_s: int = 300) -> str:
         """Build a Continue/Cancel modal for iteration limit reached."""
@@ -1614,164 +1491,57 @@ return (function() {{
     return (function() {{
       return new Promise((resolve) => {{
     {self._base_theme_js()}
-        const OVERLAY_ID = '__owui_helix_limit__';
-        const existing = document.getElementById(OVERLAY_ID);
-        if (existing) existing.remove();
-
-        // -- Overlay ----------------------------------------------------------
         const overlay = document.createElement('div');
-        overlay.id = OVERLAY_ID;
-        Object.assign(overlay.style, {{
-          position: 'fixed', inset: '0', zIndex: '999999',
-          background: col.overlay,
-          backdropFilter: 'blur(12px)', WebkitBackdropFilter: 'blur(12px)',
-          display: 'flex', alignItems: 'center', justifyContent: 'center',
-          fontFamily: "-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif",
-          opacity: '0', transition: 'opacity 0.18s ease',
-        }});
-
-        // -- Panel --------------------------------------------------------------
+        overlay.style.cssText = `position:fixed;inset:0;z-index:999999;background:${{col.overlay}};display:flex;align-items:center;justify-content:center;padding:20px;backdrop-filter:blur(4px);`;
         const panel = document.createElement('div');
-        Object.assign(panel.style, {{
-          background: col.panel, border: '1px solid ' + col.border,
-          borderRadius: '16px', padding: '26px 26px 20px',
-          maxWidth: '440px', width: 'calc(100vw - 32px)',
-          boxShadow: '0 28px 80px rgba(0,0,0,0.65)',
-          display: 'flex', flexDirection: 'column', gap: '14px',
-          transform: 'scale(0.92)', opacity: '0',
-          transition: 'transform 0.22s cubic-bezier(0.34,1.56,0.64,1), opacity 0.18s ease',
-        }});
+        panel.style.cssText = `background:${{col.panel}};border:1px solid ${{col.border}};border-radius:20px;box-shadow:0 20px 60px rgba(0,0,0,0.3);color:${{col.text}};font-family:ui-sans-serif,system-ui,sans-serif;width:100%;max-width:440px;padding:32px;display:flex;flex-direction:column;gap:20px;`;
 
-        // -- Header row ---------------------------------------------------------
         const header = document.createElement('div');
-        Object.assign(header.style, {{ display: 'flex', alignItems: 'flex-start', gap: '12px' }});
+        header.style.cssText = 'display:flex;align-items:center;gap:12px;';
+        const icon = document.createElement('div'); icon.textContent = '⚠️'; icon.style.cssText = 'font-size:24px;';
+        const title = document.createElement('div'); title.textContent = 'Iteration Limit Reached'; title.style.cssText = `font-size:18px;font-weight:800;color:${{col.text}};`;
+        header.appendChild(icon); header.appendChild(title); panel.appendChild(header);
 
-        const iconBlock = document.createElement('div');
-        iconBlock.textContent = '\u26A0\uFE0F';
-        Object.assign(iconBlock.style, {{ fontSize: '22px', flexShrink: '0', marginTop: '2px' }});
-
-        const titleText = document.createElement('p');
-        Object.assign(titleText.style, {{
-          margin: '0', color: col.text, fontSize: '16px',
-          fontWeight: '700', lineHeight: '1.4', flex: '1', wordBreak: 'break-word',
-        }});
-        titleText.textContent = 'Iteration Limit Reached';
-
-        const badge = document.createElement('span');
-        Object.assign(badge.style, {{
-          flexShrink: '0', fontSize: '10px', fontWeight: '700',
-          letterSpacing: '0.07em', padding: '3px 9px', borderRadius: '99px',
-          background: col.btnPrimary + '26', color: col.btnPrimary,
-          marginTop: '2px', whiteSpace: 'nowrap',
-        }});
-        badge.textContent = 'LIMIT';
-
-        header.appendChild(iconBlock);
-        header.appendChild(titleText);
-        header.appendChild(badge);
-
-        // -- Message ------------------------------------------------------------
-        const msg = document.createElement('p');
-        Object.assign(msg.style, {{
-          margin: '0', color: col.sub, fontSize: '14px', lineHeight: '1.55', wordBreak: 'break-word',
-        }});
+        const msg = document.createElement('div');
+        msg.style.cssText = `font-size:14px;color:${{col.sub}};line-height:1.5;`;
         msg.textContent = `The agent has used {current_iter} of {max_iter} iterations. Continue for more?`;
+        panel.appendChild(msg);
 
-        // -- Footer buttons ---------------------------------------------------
+        const countdown = document.createElement('div');
+        countdown.style.cssText = `font-size:11px;color:${{col.sub}};text-align:center;margin-top:-8px;`;
+        panel.appendChild(countdown);
+
         const footer = document.createElement('div');
-        Object.assign(footer.style, {{ display: 'flex', gap: '8px', justifyContent: 'flex-end', marginTop: '2px' }});
-
-        function makeBtn(label, primary) {{
-          const b = document.createElement('button');
-          b.textContent = label;
-          Object.assign(b.style, {{
-            padding: '10px 18px', borderRadius: '8px',
-            fontSize: '13px', fontWeight: '700',
-            cursor: 'pointer', fontFamily: 'inherit',
-            border: '1.5px solid ' + (primary ? 'transparent' : col.btnBorder),
-            background: primary ? col.btnPrimary : col.btn,
-            color: primary ? col.btnPrimaryText : col.btnText,
-            transition: 'opacity 0.12s, transform 0.1s, border-color 0.12s',
-          }});
-          b.addEventListener('mouseenter', function() {{ b.style.opacity = '0.9'; b.style.transform = 'translateY(-1px)'; }});
-          b.addEventListener('mouseleave', function() {{ b.style.opacity = '1'; b.style.transform = ''; }});
-          return b;
-        }}
-
+        footer.style.cssText = 'display:flex;gap:10px;';
+        const makeBtn = (label, primary) => {{
+            const b = document.createElement('button');
+            b.textContent = label;
+            b.style.cssText = `flex:1;padding:12px 18px;border-radius:9999px;font-size:14px;font-weight:700;cursor:pointer;border:1px solid ${{primary ? 'transparent' : col.btnBorder}};background:${{primary ? col.btnPrimary : col.btn}};color:${{primary ? col.btnPrimaryText : col.btnText}};`;
+            b.onmouseenter = () => {{ b.style.opacity='0.9'; }};
+            b.onmouseleave = () => {{ b.style.opacity='1'; }};
+            return b;
+        }};
         const continueBtn = makeBtn('Continue', true);
         const stopBtn = makeBtn('Stop', false);
-        stopBtn.style.background = '#313244';
-        stopBtn.style.color = '#f38ba8';
-        stopBtn.style.borderColor = '#f38ba8';
-        stopBtn.addEventListener('mouseenter', function() {{ stopBtn.style.opacity = '0.85'; stopBtn.style.transform = 'translateY(-1px)'; }});
-        stopBtn.addEventListener('mouseleave', function() {{ stopBtn.style.opacity = '1'; stopBtn.style.transform = ''; }});
-
-        const cleanup = function() {{
-          panel.style.transform = 'scale(0.95)';
-          panel.style.opacity = '0';
-          overlay.style.opacity = '0';
-          setTimeout(function() {{
-            overlay.remove();
-            document.removeEventListener('keydown', onKey);
-          }}, 180);
-        }};
-
+        const cleanup = () => {{ overlay.remove(); }};
         let _timer;
-        continueBtn.addEventListener('click', function() {{ clearTimeout(_timer); cleanup(); resolve(JSON.stringify({{action:'continue'}})); }});
-        stopBtn.addEventListener('click', function() {{ clearTimeout(_timer); cleanup(); resolve(JSON.stringify({{action:'stop'}})); }});
+        continueBtn.onclick = () => {{ clearTimeout(_timer); cleanup(); resolve(JSON.stringify({{action:'continue'}})); }};
+        stopBtn.onclick = () => {{ clearTimeout(_timer); cleanup(); resolve(JSON.stringify({{action:'stop'}})); }};
+        footer.appendChild(continueBtn); footer.appendChild(stopBtn); panel.appendChild(footer);
 
-        footer.appendChild(stopBtn);
-        footer.appendChild(continueBtn);
-
-        // -- Countdown ----------------------------------------------------------
-        const countdown = document.createElement('div');
-        countdown.textContent = '';
-        Object.assign(countdown.style, {{
-          fontSize: '11px', color: col.sub, textAlign: 'center', minHeight: '16px',
-        }});
-
-        // -- Global keyboard handler --------------------------------------------
-        function onKey(e) {{
-          if (e.key === 'Escape') {{
-            stopBtn.click();
-            return;
-          }}
-          if (e.key === 'Enter' || e.key === ' ') {{
-            e.preventDefault();
-            continueBtn.click();
-            return;
-          }}
-        }}
-        document.addEventListener('keydown', onKey);
-
-        // -- Assemble DOM -----------------------------------------------------
-        panel.appendChild(header);
-        panel.appendChild(msg);
-        panel.appendChild(footer);
-        panel.appendChild(countdown);
-        overlay.appendChild(panel);
-        document.body.appendChild(overlay);
-
-        // -- Entrance animation -----------------------------------------------
-        requestAnimationFrame(function() {{
-          requestAnimationFrame(function() {{
-            overlay.style.opacity = '1';
-            panel.style.transform = 'scale(1)';
-            panel.style.opacity = '1';
-          }});
-        }});
+        overlay.appendChild(panel); document.body.appendChild(overlay);
 
         let remaining = {timeout_s};
-        function updateCountdown() {{
-            countdown.textContent = remaining > 0 ? 'Auto-stopping in ' + remaining + 's...' : '';
+        const updateCountdown = () => {{
+            countdown.textContent = remaining > 0 ? `Auto-stopping in ${{remaining}}s...` : '';
             if (remaining <= 0) {{ cleanup(); resolve(JSON.stringify({{action:'stop'}})); }}
-        }}
+        }};
         updateCountdown();
-        _timer = setInterval(function() {{ remaining--; updateCountdown(); }}, 1000);
+        _timer = setInterval(() => {{ remaining--; updateCountdown(); }}, 1000);
       }});
     }})();"""
 
-    # -- Task State String --
+    # ── Task State String ──
 
     async def emit_task_update(self, finalize_tasks=False):
         """Emit task progress via Open WebUI's native task list UI.
@@ -1829,14 +1599,14 @@ return (function() {{
                 lines.append(f"  - {f['task']}: {f['reason']}")
         return "\n".join(lines)
 
-    # -- File Context Preparation (planner_v3 parity) --
+    # ── File Context Preparation (planner_v3 parity) ──
 
     async def _apply_file_prep(self, msgs: list) -> list:
         """Mirror OWUI middleware: add_file_context then chat_completion_files_handler."""
         if not self.request or not self.user or not self.pipe_metadata:
             return msgs
 
-        # 1. add_file_context - injects text-file content into messages
+        # 1. add_file_context — injects text-file content into messages
         prep = copy.deepcopy(msgs)
         try:
             prep = await add_file_context(prep, self.chat_id, self.user)
@@ -1844,7 +1614,7 @@ return (function() {{
         except Exception as e:
             logger.warning("add_file_context failed: %s", e)
 
-        # 2. chat_completion_files_handler - converts remaining attachments to multimodal blocks
+        # 2. chat_completion_files_handler — converts remaining attachments to multimodal blocks
         try:
             udump = self.user.model_dump() if hasattr(self.user, "model_dump") else {}
             extra = {
@@ -1865,7 +1635,7 @@ return (function() {{
 
         return prep
 
-    # -- File Persistence (tools -> DB sync) --
+    # ── File Persistence (tools → DB sync) ──
 
     async def _append_produced_files(self, raw_files: list) -> list:
         """Deduplicate and append tool-generated files under lock. Return unique new files."""
@@ -1985,7 +1755,7 @@ return (function() {{
         except Exception as e:
             logger.warning(f"Tool file DB sync failed: {e}")
 
-    # -- Execute Tool --
+    # ── Execute Tool ──
 
     async def _execute_tool(self, tool_name, args, call_id):
         """Execute a single resolved tool from phase_tools_dict."""
@@ -2059,53 +1829,58 @@ return (function() {{
             logger.error(f"Tool execution error ({tool_name}): {e}")
             return f"Error executing {tool_name}: {e}", []
 
-    # -- Phase System Prompt --
+    # ── Phase System Prompt ──
 
     def _build_system_prompt(self):
         """Build system prompt based on current phase using Valves overrides."""
         tool_names = ", ".join(sorted(self.phase_tools_dict.keys()))
         task_state = self._build_task_state()
 
-        # Pick base prompt from Valves or fallback to default
+        base = ""
         try:
             if self.phase == self.PHASE_PLAN:
-                base = self.valves.PLAN_PROMPT or DEFAULT_PLAN_PROMPT
-                return base.format(tool_names=tool_names)
-
+                base = (self.valves.PLAN_PROMPT or DEFAULT_PLAN_PROMPT).format(tool_names=tool_names)
             elif self.phase == self.PHASE_EXECUTE:
-                base = self.valves.EXECUTE_PROMPT or DEFAULT_EXECUTE_PROMPT
-                return base.format(tool_names=tool_names, task_state=task_state)
-
+                base = (self.valves.EXECUTE_PROMPT or DEFAULT_EXECUTE_PROMPT).format(tool_names=tool_names, task_state=task_state)
             elif self.phase == self.PHASE_REVIEW:
-                base = self.valves.REVIEW_PROMPT or DEFAULT_REVIEW_PROMPT
-                return base.format(goal=self.goal, task_state=task_state, tool_names=tool_names)
-
-            elif self.phase == self.PHASE_REPLAN_SKIP:
-                base = self.valves.REPLAN_SKIP_PROMPT or DEFAULT_REPLAN_SKIP_PROMPT
-                return base.format(goal=self.goal, tool_names=tool_names)
-
-            return DEFAULT_PLAN_PROMPT.format(tool_names=tool_names)
+                base = (self.valves.REVIEW_PROMPT or DEFAULT_REVIEW_PROMPT).format(goal=self.goal, task_state=task_state, tool_names=tool_names)
+            elif self.phase == self.PHASE_OUTPUT:
+                if self._output_turn >= 2:
+                    base = DEFAULT_OUTPUT_FINAL_PROMPT.format(goal=self.goal, task_state=task_state)
+                else:
+                    base = (self.valves.OUTPUT_PROMPT or DEFAULT_OUTPUT_PROMPT).format(goal=self.goal, task_state=task_state)
+            else:
+                base = DEFAULT_PLAN_PROMPT.format(tool_names=tool_names)
         except (KeyError, IndexError, ValueError):
             # User-provided prompt may have stray braces; fall back to default
             if self.phase == self.PHASE_PLAN:
-                return DEFAULT_PLAN_PROMPT.format(tool_names=tool_names)
+                base = DEFAULT_PLAN_PROMPT.format(tool_names=tool_names)
             elif self.phase == self.PHASE_EXECUTE:
-                return DEFAULT_EXECUTE_PROMPT.format(tool_names=tool_names, task_state=task_state)
+                base = DEFAULT_EXECUTE_PROMPT.format(tool_names=tool_names, task_state=task_state)
             elif self.phase == self.PHASE_REVIEW:
-                return DEFAULT_REVIEW_PROMPT.format(goal=self.goal, task_state=task_state, tool_names=tool_names)
-            elif self.phase == self.PHASE_REPLAN_SKIP:
-                return DEFAULT_REPLAN_SKIP_PROMPT.format(goal=self.goal, tool_names=tool_names)
-            return DEFAULT_PLAN_PROMPT.format(tool_names=tool_names)
+                base = DEFAULT_REVIEW_PROMPT.format(goal=self.goal, task_state=task_state, tool_names=tool_names)
+            elif self.phase == self.PHASE_OUTPUT:
+                if self._output_turn >= 2:
+                    base = DEFAULT_OUTPUT_FINAL_PROMPT.format(goal=self.goal, task_state=task_state)
+                else:
+                    base = DEFAULT_OUTPUT_PROMPT.format(goal=self.goal, task_state=task_state)
+            else:
+                base = DEFAULT_PLAN_PROMPT.format(tool_names=tool_names)
 
-    # -- Phase Transitions --
+        # Prepend skill prompt if resolved (available in all phases)
+        if self._skill_prompt:
+            base = f"{self._skill_prompt}\n\n{base}"
+        return base
+
+    # ── Phase Transitions ──
 
     def _transition_to(self, phase):
         """Transition to a new phase: update tools, system prompt, state."""
         self.phase = phase
         self._consecutive_tool_misses.clear()
-        # Reset question counter when entering planning phases
-        if phase in (self.PHASE_PLAN, self.PHASE_REPLAN_SKIP):
-            self._plan_questions_asked = 0
+        # Reset output turn counter when entering OUTPUT phase
+        if phase == self.PHASE_OUTPUT:
+            self._output_turn = 0
         # Rebuild filtered tools for new phase
         self._filter_tools_for_phase(phase)
 
@@ -2113,7 +1888,7 @@ return (function() {{
         if self.history:
             self.history[0]["content"] = self._build_system_prompt()
 
-    # -- Context Window Management --
+    # ── Context Window Management ──
 
     def _manage_context_window(self, messages):
         """Trim history to MAX_HISTORY_MESSAGES while keeping tool call pairs intact."""
@@ -2171,7 +1946,7 @@ return (function() {{
         - Summarizes old execution into a summary block.
         - Preserves last ~6 messages, but never splits a tool call pair.
         - Tool results that are dropped from the "middle" are replaced with
-          short previews: [Tool: name -> first 200 chars of result].
+          short previews: [Tool: name → first 200 chars of result].
         """
         # 1. System prompt + goal (always preserved)
         preserved = []
@@ -2210,7 +1985,7 @@ return (function() {{
                 name = msg.get("name", "unknown")
                 content = strip_html(msg.get("content", ""))
                 preview = content[:200].replace("\n", " ")
-                middle_previews.append(f"[Tool: {name} -> {preview}...]")
+                middle_previews.append(f"[Tool: {name} → {preview}...]")
             elif msg.get("role") == "user" and len(msg.get("content", "")) < 500:
                 middle_previews.append(f"[User: {strip_html(msg['content'][:200])}]")
 
@@ -2220,7 +1995,7 @@ return (function() {{
 
         summary_msg = {"role": "system", "content": "\n".join(summary_parts)}
 
-        # 4. Recent tail - safe extraction that preserves tool call pairs
+        # 4. Recent tail — safe extraction that preserves tool call pairs
         recent = self.history[-keep_last:] if len(self.history) > keep_last else self.history[len(preserved):]
 
         # If the cutoff split an assistant+tool_calls from its results, fix it
@@ -2236,7 +2011,7 @@ return (function() {{
         compressed.extend(recent)
         return compressed
 
-    # -- Main Loop --
+    # ── Main Loop ──
 
     async def _run_impl(self, user_msg, last_user_msg_raw, model):
         await self.emit_status("Agent starting...")
@@ -2245,59 +2020,36 @@ return (function() {{
         # Attempt DB-backed state recovery at start of turn
         await self._recover_state_from_files(self.body if isinstance(self.body, dict) else {})
 
-        # After recovery, decide whether to continue the old session or start fresh.
-        # If every task is completed or failed, treat this as a brand-new request.
-        has_remaining_tasks = False
-        if self.task_list:
-            failed_names = {f["task"] for f in self.failed_tasks}
-            remaining = [
-                t for t in self.task_list
-                if t not in self.completed_tasks and t not in failed_names
-            ]
-            has_remaining_tasks = bool(remaining)
-
-        if self.goal and self.task_list and has_remaining_tasks:
-            # State was restored and there are still open tasks - continue execution
+        # After recovery, clamp loop_count so the iteration-limit modal
+        # doesn't fire immediately on re-entry (give a small buffer before hitting the limit)
+        if self.goal and self.task_list:
             max_allowed = max(0, self.valves.MAX_ITERATIONS - 5)
             if self.loop_count > max_allowed:
                 logger.info(f"Clamped loop_count from {self.loop_count} to {max_allowed} after state restore.")
                 self.loop_count = max_allowed
 
+        self.consecutive_json_errors = 0
+
+        if self.goal and self.task_list:
+            # State was restored from file attachment
             self.goal = f"{self.goal}; Updated: {user_msg}"
+            # Refresh the system prompt (phase may have changed)
             if self.history and self.history[0].get("role") == "system":
                 self.history[0]["content"] = self._build_system_prompt()
             else:
                 self.history.insert(0, {"role": "system", "content": self._build_system_prompt()})
             self.history.append({"role": "user", "content": user_msg})
+            # Filter tools for the restored phase
             self._filter_tools_for_phase(self.phase)
-            await self.emit_task_update()
-        elif self.goal and self.task_list and not has_remaining_tasks and self.user_valves and getattr(self.user_valves, "SKIP_PLAN_ON_RESUME", True):
-            # Previous session finished. Use Quick Replan phase to let the agent plan the new request.
-            logger.info("Previous session finished; entering Quick Replan phase.")
-            self.loop_count = 0
-            self.task_list = []
-            self.completed_tasks = []
-            self.failed_tasks = []
-            self.goal = self.goal + "\n\nNEW REQUEST:\n" + user_msg
-            self.phase = self.PHASE_REPLAN_SKIP
-            if self.history and self.history[0].get("role") == "system":
-                self.history[0]["content"] = self._build_system_prompt()
-            else:
-                self.history.insert(0, {"role": "system", "content": self._build_system_prompt()})
-            self.history.append({"role": "user", "content": user_msg})
-            self._filter_tools_for_phase(self.PHASE_REPLAN_SKIP)
+            # Restore task list UI so it is visible immediately on re-entering the chat
             await self.emit_task_update()
         else:
-            # Fresh session: reset state and start from PLAN
-            if self.goal and self.task_list and not has_remaining_tasks:
-                logger.info("All tasks completed or failed; starting fresh session.")
+            # Fresh session: initialize everything from scratch
             self.goal = user_msg
             self.phase = self.PHASE_PLAN
             self.task_list = []
             self.completed_tasks = []
             self.failed_tasks = []
-            self.loop_count = 0
-            self._plan_questions_asked = 0
             self._filter_tools_for_phase(self.PHASE_PLAN)
             system_prompt = self._build_system_prompt()
             self.history = [
@@ -2305,12 +2057,22 @@ return (function() {{
                 last_user_msg_raw if last_user_msg_raw else {"role": "user", "content": user_msg},
             ]
 
-        self.consecutive_json_errors = 0
-
         recent_calls = []
         self._output_parts = []
 
         while True:
+            # ── OUTPUT phase hard limit: max 2 turns (tool prep + final text) ──
+            if self.phase == self.PHASE_OUTPUT:
+                self._output_turn += 1
+                if self._output_turn > 2:
+                    # Safety net: exceeded max output turns, return immediately
+                    await self.emit_task_update(finalize_tasks=True)
+                    await self.emit_status("Output phase exceeded max turns", done=True)
+                    return self._format_output()
+                # Refresh system prompt for the current turn
+                if self.history and self.history[0].get("role") == "system":
+                    self.history[0]["content"] = self._build_system_prompt()
+
             if self.loop_count >= self.valves.MAX_ITERATIONS:
                 await self.emit_output(f"\n[WARN] Max iterations ({self.valves.MAX_ITERATIONS}) reached.")
                 should_continue = False
@@ -2337,26 +2099,17 @@ return (function() {{
             self.loop_count += 1
             recent_calls = recent_calls[-30:]
 
-            # Safety-net for REPLAN_SKIP: max 3 loops, then fallback to single-task EXECUTE
-            if self.phase == self.PHASE_REPLAN_SKIP and self.loop_count > self.MAX_REPLAN_SKIP_LOOPS:
-                logger.warning("REPLAN_SKIP exceeded %d loops; falling back to single-task EXECUTE.", self.MAX_REPLAN_SKIP_LOOPS)
-                self.task_list = [user_msg]
-                if self.history and len(self.history) > 0:
-                    self.history[0]["content"] = self._build_system_prompt()
-                self._transition_to(self.PHASE_EXECUTE)
-                await self.emit_task_update()
-
             phase_icons = {
                 self.PHASE_PLAN: "[PLAN]",
                 self.PHASE_EXECUTE: "[EXEC]",
                 self.PHASE_REVIEW: "[REVU]",
-                self.PHASE_REPLAN_SKIP: "[RPLN]",
+                self.PHASE_OUTPUT: "[OUT]",
             }
             phase_name = {
                 self.PHASE_PLAN: "Plan",
                 self.PHASE_EXECUTE: "Execute",
                 self.PHASE_REVIEW: "Review",
-                self.PHASE_REPLAN_SKIP: "Replan",
+                self.PHASE_OUTPUT: "Output",
             }
             icon = phase_icons.get(self.phase, "[LOOP]")
             name = phase_name.get(self.phase, "Loop")
@@ -2377,13 +2130,17 @@ return (function() {{
                 "metadata": self.pipe_metadata,
             }
 
+            # In OUTPUT phase turn 2, remove tools to force pure text output
+            if self.phase == self.PHASE_OUTPUT and self._output_turn >= 2:
+                completion_body["tools"] = None
+
             # Apply OpenWebUI file context prep (add_file_context + chat_completion_files_handler)
             try:
                 completion_body["messages"] = await self._apply_file_prep(copy.deepcopy(call_messages))
             except Exception as e:
                 logger.warning("_apply_file_prep failed: %s", e)
 
-            # -- Stream LLM response --
+            # ── Stream LLM response ──
             tc_dict = {}
             content_chunks = []
 
@@ -2418,7 +2175,25 @@ return (function() {{
                 if xml_calls:
                     tc_dict = {tc["index"]: tc for tc in xml_calls}
                 else:
-                    # No tool calls and no XML rescue - check for unfinished tasks
+                    # No tool calls and no XML rescue
+                    # OUTPUT phase: never emit text in Turn 1, always proceed to Turn 2
+                    if self.phase == self.PHASE_OUTPUT:
+                        if self._output_turn == 1:
+                            # Turn 1 with no tools: skip text and proceed to Turn 2
+                            self.history.append({
+                                "role": "assistant",
+                                "content": content or "",
+                            })
+                            # Refresh final prompt for Turn 2
+                            if self.history and self.history[0].get("role") == "system":
+                                self.history[0]["content"] = self._build_system_prompt()
+                            continue
+                        # Turn 2: emit final text and return
+                        if content:
+                            await self.emit_output(content)
+                        await self.emit_task_update(finalize_tasks=True)
+                        await self.emit_status("Done", done=True)
+                        return self._format_output()
                     if content and self.task_list and len(self.completed_tasks) < len(self.task_list):
                         # Tasks remain: inject continuation prompt instead of terminating
                         self.history.append({
@@ -2427,26 +2202,10 @@ return (function() {{
                         })
                         self.history.append({
                             "role": "user",
-                            "content": "SYSTEM: You produced text but did not call any tools. You have unfinished tasks. Continue working by calling the appropriate tool. Do NOT just describe what to do - call a tool.",
+                            "content": "SYSTEM: You produced text but did not call any tools. You have unfinished tasks. Continue working by calling the appropriate tool. Do NOT just describe what to do — call a tool.",
                         })
                         await self.emit_output(f"\n[WARN] No tool call produced. Re-prompting to continue.\n")
                         continue
-
-                    # CRITICAL FIX: In PLAN or QUICK REPLAN phases, never return content directly.
-                    # The loop must continue until confirm_plan is called.
-                    if self.phase in (self.PHASE_PLAN, self.PHASE_REPLAN_SKIP):
-                        if content:
-                            self.history.append({
-                                "role": "assistant",
-                                "content": content,
-                            })
-                        self.history.append({
-                            "role": "user",
-                            "content": "SYSTEM: You are still in PLAN mode. Do NOT answer the user directly. You MUST call confirm_plan with a numbered task list to move to execution. If you have asked enough questions, just formulate your best plan and call confirm_plan now.",
-                        })
-                        await self.emit_output(f"\n[WARN] PLAN phase: produced content without confirm_plan. Re-prompting...\n")
-                        continue
-
                     if content:
                         await self.emit_output(content)
                     await self.emit_status("Done", done=True)
@@ -2486,7 +2245,33 @@ return (function() {{
                     })
                     continue
 
-                # -- Handle terminate --
+                # ── Handle early_finish ──
+                if tool_name == "early_finish":
+                    if self.phase != self.PHASE_EXECUTE:
+                        result_json = json.dumps({"early_finish": False, "error": f"early_finish is only available in EXECUTE phase, not {self.phase}"})
+                        self.history.append({
+                            "role": "tool",
+                            "content": result_json,
+                            "tool_call_id": call_id,
+                            "name": tool_name,
+                        })
+                        continue
+                    result_json = await self._tool_early_finish(**args)
+                    result_data = json.loads(result_json)
+                    if result_data.get("early_finish"):
+                        await self.emit_output(f"\n[FIN] Finishing early: {result_data.get('reason', '')}\n")
+                        await self.emit_status("Finishing early...")
+                    else:
+                        await self.emit_output(f"\n[FIN] Early finish failed: {result_data.get('error', 'Unknown error')}\n")
+                    self.history.append({
+                        "role": "tool",
+                        "content": result_json,
+                        "tool_call_id": call_id,
+                        "name": tool_name,
+                    })
+                    continue
+
+                # ── Handle terminate ──
                 if tool_name == "terminate":
                     result = args.get("result", "Task complete.")
                     success = args.get("success", True)
@@ -2499,7 +2284,7 @@ return (function() {{
                     await self.emit_status("Finished", done=True)
                     return self._format_output()
 
-                # -- Handle replan --
+                # ── Handle replan ──
                 if tool_name == "replan":
                     reason = args.get("reason", "Plan needs adjustment")
                     updated = args.get("updated_tasks", "")
@@ -2532,7 +2317,7 @@ return (function() {{
                     await self.emit_status(f"[RPLN] Re-planning ({mode_label}): {reason}")
                     continue
 
-                # -- Handle complete_task --
+                # ── Handle complete_task ──
                 if tool_name == "complete_task":
                     result_json = await self._tool_complete_task(**args)
                     result_data = json.loads(result_json)
@@ -2548,7 +2333,7 @@ return (function() {{
                         self._transition_to(self.PHASE_REVIEW)
                     continue
 
-                # -- Handle fail_task --
+                # ── Handle fail_task ──
                 if tool_name == "fail_task":
                     result_json = await self._tool_fail_task(**args)
                     result_data = json.loads(result_json)
@@ -2565,7 +2350,24 @@ return (function() {{
                         self._transition_to(self.PHASE_REVIEW)
                     continue
 
-                # -- Handle fix_plan --
+                # ── Handle proceed_to_output ──
+                if tool_name == "proceed_to_output":
+                    result_json = await self._tool_proceed_to_output(**args)
+                    result_data = json.loads(result_json)
+                    if result_data.get("proceed_to_output"):
+                        await self.emit_output(f"\n[OUT] **Proceeding to output generation...**\n")
+                        await self.emit_status("[OUT] Moving to output phase...")
+                    else:
+                        await self.emit_output(f"\n[OUT] **Output transition failed:** {result_data.get('error', 'Unknown error')}\n")
+                    self.history.append({
+                        "role": "tool",
+                        "content": result_json,
+                        "tool_call_id": call_id,
+                        "name": tool_name,
+                    })
+                    continue
+
+                # ── Handle fix_plan ──
                 if tool_name == "fix_plan":
                     result_json = await self._tool_fix_plan(**args)
                     result_data = json.loads(result_json)
@@ -2580,11 +2382,11 @@ return (function() {{
                         "tool_call_id": call_id,
                         "name": tool_name,
                     })
-                    if self.phase == self.PHASE_REVIEW:
+                    if self.phase in (self.PHASE_REVIEW, self.PHASE_OUTPUT):
                         self._transition_to(self.PHASE_EXECUTE)
                     continue
 
-                # -- Handle confirm_plan --
+                # ── Handle confirm_plan ──
                 if tool_name == "confirm_plan":
                     plan_text = args.get("plan", content or "")
                     self.task_list = self._extract_task_list(plan_text or content or "")
@@ -2603,11 +2405,11 @@ return (function() {{
                             "role": "user",
                             "content": f"SYSTEM: User provided feedback on the proposed plan: {feedback}. Please revise the plan and call confirm_plan again with the updated plan.",
                         })
-                        await self.emit_output(f"\n[PLAN] Plan rejected - user feedback: {feedback}\n")
+                        await self.emit_output(f"\n[PLAN] Plan rejected — user feedback: {feedback}\n")
                         await self.emit_status("[PLAN] Revising plan based on feedback...")
                         continue
                     elif result_data.get("action") == "cancel":
-                        await self.emit_output("\n[PLAN] Plan cancelled by user.\n")
+                        await self.emit_output("\nThe plan was cancelled by the user. The agent will not proceed.\n")
                         await self.emit_task_update(finalize_tasks=True)
                         await self.emit_status("Plan cancelled", done=True)
                         return self._format_output()
@@ -2625,7 +2427,7 @@ return (function() {{
                         await self.emit_output(f"\n[PLAN] Plan approved. Moving to execution.\n\n{task_summary}\n")
                         continue
 
-                # -- Duplicate detection --
+                # ── Duplicate detection ──
                 sig = f"{tool_name}:{json.dumps(args, sort_keys=True)}"
                 if recent_calls.count(sig) >= 2:
                     tool_result = f"Error: Identical call to `{tool_name}` repeated. Try a different approach."
@@ -2643,7 +2445,7 @@ return (function() {{
                     truncation_limit = self._get_truncation_limit()
                     tool_result = smart_truncate(result_str, truncation_limit)
 
-                    # -- Consecutive tool-not-found tracking --
+                    # ── Consecutive tool-not-found tracking ──
                     if "not found in current phase" in tool_result:
                         self._consecutive_tool_misses[tool_name] = self._consecutive_tool_misses.get(tool_name, 0) + 1
                         if self._consecutive_tool_misses[tool_name] >= 3:
@@ -2673,14 +2475,27 @@ return (function() {{
             if self.phase == self.PHASE_EXECUTE and self.completed_tasks and len(self.completed_tasks) >= len(self.task_list):
                 self._transition_to(self.PHASE_REVIEW)
 
+            # OUTPUT phase: after tool calls in turn 1, continue to turn 2 (no tools)
+            if self.phase == self.PHASE_OUTPUT and self._output_turn == 1:
+                continue
+
+    async def _disconnect_mcp_clients(self):
+        """Gracefully disconnect any MCP clients opened during tool resolution."""
+        if not self._mcp_clients:
+            return
+        for name, client in list(self._mcp_clients.items()):
+            try:
+                if hasattr(client, "disconnect"):
+                    await asyncio.wait_for(client.disconnect(), timeout=3.0)
+            except Exception:
+                pass
+        self._mcp_clients.clear()
+
     async def run(self, user_msg, last_user_msg_raw, model):
         try:
             result = await self._run_impl(user_msg, last_user_msg_raw, model)
             return result
         except GeneratorExit:
-            # NOTE: GeneratorExit can only be raised if pipe() becomes an async generator.
-            # Currently pipe() returns a string, so this catch will not be triggered by
-            # OpenWebUI's normal cancellation mechanism. CancelledError handles asyncio cancellation.
             logger.info("Agent loop cancelled by user (GeneratorExit).")
             await self._save_state_to_file()
             await self.emit_task_update(finalize_tasks=True)
@@ -2697,9 +2512,8 @@ return (function() {{
             await self.emit_task_update(finalize_tasks=True)
             return f"\n[ERROR] Agent loop failed: {e}"
         finally:
-            # Final immediate DB sync
+            await self._disconnect_mcp_clients()
             await self._sync_produced_files_to_db()
-            # Fire-and-forget delayed sync with backoff to survive heavy DB load
             if HAS_DB_PERSISTENCE and self.chat_id and self.message_id:
                 snapshot = list(self.produced_files)
                 asyncio.get_running_loop().create_task(
@@ -2779,27 +2593,52 @@ class Pipe:
         )
 
         PLAN_TOOLS: str = Field(
-            default="",
+            default=(
+                "read_file, calculate_timestamp, fetch_url, get_current_timestamp, "
+                "glob_search, grep_search, list_files, list_knowledge_bases, "
+                "query_knowledge_bases, query_knowledge_files, search_knowledge_bases, search_knowledge_files, search_notes, "
+                "search_papers, search_web, view_chat, view_knowledge_file, view_note, view_skill"
+            ),
             description=(
                 "Comma-separated tool names allowed in PLAN phase. "
                 "Leave EMPTY to allow ALL tools. "
-                "Recommended: read-only tools like read_file, search_web, get_github_file_contents."
+                "Default is a read-only / research-safe set."
             )
         )
         EXECUTE_TOOLS: str = Field(
             default="",
             description=(
                 "Comma-separated tool names allowed in EXECUTE phase. "
-                "Leave EMPTY to allow ALL tools. "
-                "Example: github_access, file_write, web_search, read_file"
+                "Leave EMPTY to allow ALL tools."
             )
         )
         REVIEW_TOOLS: str = Field(
-            default="",
+            default=(
+                "read_file, calculate_timestamp, fetch_url, get_current_timestamp, get_process_status, run_command, "
+                "glob_search, grep_search, list_files, list_knowledge_bases, list_processes, "
+                "query_knowledge_bases, query_knowledge_files, "
+                "search_chats, search_knowledge_bases, search_knowledge_files, search_notes, search_web, "
+                "view_chat, view_knowledge_file, view_note, view_skill"
+            ),
             description=(
                 "Comma-separated tool names allowed in REVIEW phase. "
                 "Leave EMPTY to allow ALL tools. "
-                "Recommended: read-only tools like read_file, search_web, get_github_file_contents."
+                "Default is a read-only / review-safe set + command execution."
+            )
+        )
+        OUTPUT_TOOLS: str = Field(
+            default=(
+                "show_map, get_weather_forecast, render_visualization, "
+                "list_files, read_file, display_file, grep_search, glob_search, "
+                "list_processes, get_process_status, get_current_timestamp, calculate_timestamp, "
+                "list_knowledge_bases, search_knowledge_bases, query_knowledge_bases, "
+                "search_knowledge_files, query_knowledge_files, view_knowledge_file, "
+                "search_chats, view_chat, search_notes, view_note, view_skill"
+            ),
+            description=(
+                "Comma-separated tool names allowed in OUTPUT phase. "
+                "Leave EMPTY to allow ALL tools. "
+                "Default includes rendering/output tools and read-only helpers."
             )
         )
 
@@ -2815,13 +2654,9 @@ class Pipe:
             default=DEFAULT_REVIEW_PROMPT,
             description="System prompt for REVIEW phase. Available placeholders: {goal}, {task_state}, {tool_names}."
         )
-        REPLAN_SKIP_PROMPT: str = Field(
-            default=DEFAULT_REPLAN_SKIP_PROMPT,
-            description="System prompt for QUICK REPLAN phase. Available placeholders: {goal}, {tool_names}."
-        )
-        MAX_PLAN_QUESTIONS: int = Field(
-            default=3,
-            description="Maximum number of ask_user calls allowed in PLAN and QUICK REPLAN phases before the agent is forced to call confirm_plan. Set to 0 to disable user questions entirely.",
+        OUTPUT_PROMPT: str = Field(
+            default=DEFAULT_OUTPUT_PROMPT,
+            description="System prompt for OUTPUT phase — Turn 1 (collection / rendering allowed). Available placeholders: {goal}, {task_state}."
         )
 
     class UserValves(BaseModel):
@@ -2832,10 +2667,6 @@ class Pipe:
         YOLO_MODE: bool = Field(
             default=False,
             description="Skip all user confirmations. Auto-approve plans and ignore iteration limits.",
-        )
-        SKIP_PLAN_ON_RESUME: bool = Field(
-            default=True,
-            description="When the previous session is finished, skip the full PLAN phase for a new user request and jump straight to EXECUTE with a single task. Set to False to always start fresh with full PLAN phase.",
         )
 
     def __init__(self):
