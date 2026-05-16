@@ -1,7 +1,7 @@
 """
 title: Helix Agent
 author: Piggidragon
-version: 0.19.1
+version: 0.19.2
 description: >
   Helix Agent — OpenWebUI-native agent loop with modular per-phase tool control.
 
@@ -110,7 +110,7 @@ Rules:
 - If the request is simple (1-2 tasks), still list them explicitly.
 - Call exactly ONE tool per step.
 - When done planning, call confirm_plan with the plan for confirmation.
-- NEVER call terminate in PLAN mode -- the user must confirm first.
+- If the request is inappropriate or impossible, call terminate with a brief explanation.
 - NEVER call replan in PLAN mode.
 - If a tool returns an error during planning (e.g., file not found), try an alternative tool or note the limitation in your plan. Do not call fix_plan for planning-stage errors.
 - If the user rejects your plan with feedback, revise the plan based on their feedback and call confirm_plan again with the updated plan. Do NOT repeat the same plan unchanged.
@@ -141,8 +141,8 @@ File paths: Create a project folder under `/home/userxy/agent/` named after the 
 Rules:
 - Call exactly ONE tool per step.
 - NEVER repeat identical failed tool calls (duplicate detection is active).
-- When all tasks are done, call terminate with a summary.
-- If a tool returns an error (timeout, file not found, syntax error, wrong path), analyze the error and retry with corrected parameters. You do NOT need to call fix_plan for trivial errors.
+- When all tasks are done, the system will move to review automatically. You may also call early_finish(reason) if you believe you're done early.
+- If a tool returns an error, analyze it and retry with corrected parameters. You do NOT need to call fix_plan for trivial errors.
 - Only call fix_plan if the same task fails repeatedly (3+ attempts) or if the task design was wrong.
 - Only call replan(mode='soft') if the entire approach is wrong. Use replan(mode='hard') only for complete strategy replacement.
 - If you need to think step-by-step before acting, do so — reasoning will be captured in a collapsible block.
@@ -177,23 +177,17 @@ Rules:
 """
 
 DEFAULT_OUTPUT_PROMPT = """\
-You are in OUTPUT mode. Your ONLY job is to produce the final, polished answer for the user.
+You are in OUTPUT mode — COLLECTION. Gather missing context and render visualisations if needed. Do not produce any answer text yet.
 
-PHASE: OUTPUT
-Original goal: {goal}
-Available tools: {tool_names}
+Goal: {goal}
 
 {task_state}
+"""
 
-What to do:
-1. Produce the final answer. Summarise what was accomplished clearly.
-2. Use rendering or output-specific tools (e.g. show_map, diagram rendering, visualisations) if they help present the result.
-3. When done, call terminate with the final answer.
+DEFAULT_OUTPUT_FINAL_PROMPT = """\
+Write the final answer.
 
-Rules:
-- This is the FINAL phase. Do NOT call replan, fix_plan, complete_task, or fail_task here.
-- You may only use the tools listed above.
-- Do NOT ask the user questions.
+Goal: {goal}
 """
 
 
@@ -389,13 +383,13 @@ class HelixAgentEngine:
     MAX_HISTORY_MESSAGES = 50
 
     # Internal tools that are ALWAYS available regardless of phase filters
-    INTERNAL_TOOLS = {"terminate", "replan", "complete_task", "fail_task", "confirm_plan", "fix_plan", "rag_search", "proceed_to_output"}
+    INTERNAL_TOOLS = {"terminate", "replan", "complete_task", "fail_task", "confirm_plan", "fix_plan", "rag_search", "proceed_to_output", "early_finish"}
 
     PHASE_INTERNAL_TOOLS = {
-        PHASE_PLAN:    {"replan", "complete_task", "fail_task", "confirm_plan", "fix_plan", "rag_search"},
-        PHASE_EXECUTE: {"terminate", "replan", "complete_task", "fail_task", "fix_plan", "rag_search"},
+        PHASE_PLAN:    {"terminate", "replan", "complete_task", "fail_task", "confirm_plan", "fix_plan", "rag_search"},
+        PHASE_EXECUTE: {"replan", "complete_task", "fail_task", "fix_plan", "rag_search", "early_finish"},
         PHASE_REVIEW:  {"proceed_to_output", "replan", "fix_plan", "rag_search"},
-        PHASE_OUTPUT:  {"terminate", "rag_search"},
+        PHASE_OUTPUT:  {"rag_search"},
     }
 
     def __init__(self, request, user, body, event_emitter, event_call, metadata, valves, user_valves=None):
@@ -425,6 +419,7 @@ class HelixAgentEngine:
         self.produced_files = []
         self._files_lock = asyncio.Lock()
         self._consecutive_tool_misses: Dict[str, int] = {}
+        self._output_turn = 0
         self._seen_file_ids: Set[str] = set()
         self._output_parts = []
         self.loop_count = 0
@@ -814,6 +809,21 @@ class HelixAgentEngine:
                 },
             },
             "callable": self._tool_proceed_to_output,
+            "type": "function",
+        }
+        self.all_tools_dict["early_finish"] = {
+            "spec": {
+                "name": "early_finish",
+                "description": "Signal that the current work is complete enough to move to the next phase. Only available in EXECUTE phase.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "reason": {"type": "string", "description": "Brief reason why you're finishing early"},
+                    },
+                    "required": ["reason"],
+                },
+            },
+            "callable": self._tool_early_finish,
             "type": "function",
         }
         self.all_tools_dict["rag_search"] = {
@@ -1262,6 +1272,15 @@ class HelixAgentEngine:
             res = {"action": "accept"}
 
         return json.dumps(res)
+
+    async def _tool_early_finish(self, reason: str, **kwargs):
+        """Signal early completion and move to REVIEW from EXECUTE."""
+        if self.phase == self.PHASE_EXECUTE:
+            self._transition_to(self.PHASE_REVIEW)
+            await self._save_state_to_file()
+            await self.emit_task_update()
+            return json.dumps({"early_finish": True, "phase": "review", "reason": reason})
+        return json.dumps({"early_finish": False, "error": f"Cannot early_finish from {self.phase}"})
 
     async def _tool_rag_search(self, file_id: str, query: str, top_k: int = 5, **kwargs):
         """RAG search: chunk, embed (if needed) and retrieve top_k chunks."""
@@ -1826,7 +1845,10 @@ class HelixAgentEngine:
             elif self.phase == self.PHASE_REVIEW:
                 base = (self.valves.REVIEW_PROMPT or DEFAULT_REVIEW_PROMPT).format(goal=self.goal, task_state=task_state, tool_names=tool_names)
             elif self.phase == self.PHASE_OUTPUT:
-                base = (self.valves.OUTPUT_PROMPT or DEFAULT_OUTPUT_PROMPT).format(goal=self.goal, task_state=task_state, tool_names=tool_names)
+                if self._output_turn >= 2:
+                    base = DEFAULT_OUTPUT_FINAL_PROMPT.format(goal=self.goal, task_state=task_state)
+                else:
+                    base = (self.valves.OUTPUT_PROMPT or DEFAULT_OUTPUT_PROMPT).format(goal=self.goal, task_state=task_state)
             else:
                 base = DEFAULT_PLAN_PROMPT.format(tool_names=tool_names)
         except (KeyError, IndexError, ValueError):
@@ -1838,7 +1860,10 @@ class HelixAgentEngine:
             elif self.phase == self.PHASE_REVIEW:
                 base = DEFAULT_REVIEW_PROMPT.format(goal=self.goal, task_state=task_state, tool_names=tool_names)
             elif self.phase == self.PHASE_OUTPUT:
-                base = DEFAULT_OUTPUT_PROMPT.format(goal=self.goal, task_state=task_state, tool_names=tool_names)
+                if self._output_turn >= 2:
+                    base = DEFAULT_OUTPUT_FINAL_PROMPT.format(goal=self.goal, task_state=task_state)
+                else:
+                    base = DEFAULT_OUTPUT_PROMPT.format(goal=self.goal, task_state=task_state)
             else:
                 base = DEFAULT_PLAN_PROMPT.format(tool_names=tool_names)
 
@@ -1853,6 +1878,9 @@ class HelixAgentEngine:
         """Transition to a new phase: update tools, system prompt, state."""
         self.phase = phase
         self._consecutive_tool_misses.clear()
+        # Reset output turn counter when entering OUTPUT phase
+        if phase == self.PHASE_OUTPUT:
+            self._output_turn = 0
         # Rebuild filtered tools for new phase
         self._filter_tools_for_phase(phase)
 
@@ -2033,6 +2061,18 @@ class HelixAgentEngine:
         self._output_parts = []
 
         while True:
+            # ── OUTPUT phase hard limit: max 2 turns (tool prep + final text) ──
+            if self.phase == self.PHASE_OUTPUT:
+                self._output_turn += 1
+                if self._output_turn > 2:
+                    # Safety net: exceeded max output turns, return immediately
+                    await self.emit_task_update(finalize_tasks=True)
+                    await self.emit_status("Output phase exceeded max turns", done=True)
+                    return self._format_output()
+                # Refresh system prompt for the current turn
+                if self.history and self.history[0].get("role") == "system":
+                    self.history[0]["content"] = self._build_system_prompt()
+
             if self.loop_count >= self.valves.MAX_ITERATIONS:
                 await self.emit_output(f"\n[WARN] Max iterations ({self.valves.MAX_ITERATIONS}) reached.")
                 should_continue = False
@@ -2090,6 +2130,10 @@ class HelixAgentEngine:
                 "metadata": self.pipe_metadata,
             }
 
+            # In OUTPUT phase turn 2, remove tools to force pure text output
+            if self.phase == self.PHASE_OUTPUT and self._output_turn >= 2:
+                completion_body["tools"] = None
+
             # Apply OpenWebUI file context prep (add_file_context + chat_completion_files_handler)
             try:
                 completion_body["messages"] = await self._apply_file_prep(copy.deepcopy(call_messages))
@@ -2131,7 +2175,25 @@ class HelixAgentEngine:
                 if xml_calls:
                     tc_dict = {tc["index"]: tc for tc in xml_calls}
                 else:
-                    # No tool calls and no XML rescue — check for unfinished tasks
+                    # No tool calls and no XML rescue
+                    # OUTPUT phase: never emit text in Turn 1, always proceed to Turn 2
+                    if self.phase == self.PHASE_OUTPUT:
+                        if self._output_turn == 1:
+                            # Turn 1 with no tools: skip text and proceed to Turn 2
+                            self.history.append({
+                                "role": "assistant",
+                                "content": content or "",
+                            })
+                            # Refresh final prompt for Turn 2
+                            if self.history and self.history[0].get("role") == "system":
+                                self.history[0]["content"] = self._build_system_prompt()
+                            continue
+                        # Turn 2: emit final text and return
+                        if content:
+                            await self.emit_output(content)
+                        await self.emit_task_update(finalize_tasks=True)
+                        await self.emit_status("Done", done=True)
+                        return self._format_output()
                     if content and self.task_list and len(self.completed_tasks) < len(self.task_list):
                         # Tasks remain: inject continuation prompt instead of terminating
                         self.history.append({
@@ -2178,6 +2240,32 @@ class HelixAgentEngine:
                     self.history.append({
                         "role": "tool",
                         "content": "Error: Invalid JSON in tool arguments.",
+                        "tool_call_id": call_id,
+                        "name": tool_name,
+                    })
+                    continue
+
+                # ── Handle early_finish ──
+                if tool_name == "early_finish":
+                    if self.phase != self.PHASE_EXECUTE:
+                        result_json = json.dumps({"early_finish": False, "error": f"early_finish is only available in EXECUTE phase, not {self.phase}"})
+                        self.history.append({
+                            "role": "tool",
+                            "content": result_json,
+                            "tool_call_id": call_id,
+                            "name": tool_name,
+                        })
+                        continue
+                    result_json = await self._tool_early_finish(**args)
+                    result_data = json.loads(result_json)
+                    if result_data.get("early_finish"):
+                        await self.emit_output(f"\n[FIN] Finishing early: {result_data.get('reason', '')}\n")
+                        await self.emit_status("Finishing early...")
+                    else:
+                        await self.emit_output(f"\n[FIN] Early finish failed: {result_data.get('error', 'Unknown error')}\n")
+                    self.history.append({
+                        "role": "tool",
+                        "content": result_json,
                         "tool_call_id": call_id,
                         "name": tool_name,
                     })
@@ -2321,7 +2409,7 @@ class HelixAgentEngine:
                         await self.emit_status("[PLAN] Revising plan based on feedback...")
                         continue
                     elif result_data.get("action") == "cancel":
-                        await self.emit_output("\n[PLAN] Plan cancelled by user.\n")
+                        await self.emit_output("\nThe plan was cancelled by the user. The agent will not proceed.\n")
                         await self.emit_task_update(finalize_tasks=True)
                         await self.emit_status("Plan cancelled", done=True)
                         return self._format_output()
@@ -2386,6 +2474,10 @@ class HelixAgentEngine:
             # Auto-transition to REVIEW
             if self.phase == self.PHASE_EXECUTE and self.completed_tasks and len(self.completed_tasks) >= len(self.task_list):
                 self._transition_to(self.PHASE_REVIEW)
+
+            # OUTPUT phase: after tool calls in turn 1, continue to turn 2 (no tools)
+            if self.phase == self.PHASE_OUTPUT and self._output_turn == 1:
+                continue
 
     async def _disconnect_mcp_clients(self):
         """Gracefully disconnect any MCP clients opened during tool resolution."""
@@ -2536,12 +2628,12 @@ class Pipe:
         )
         OUTPUT_TOOLS: str = Field(
             default=(
-                "show_map, run_tools_parallel, get_weather_forecast, render_visualization, "
+                "show_map, get_weather_forecast, render_visualization, "
                 "list_files, read_file, display_file, grep_search, glob_search, "
                 "list_processes, get_process_status, get_current_timestamp, calculate_timestamp, "
                 "list_knowledge_bases, search_knowledge_bases, query_knowledge_bases, "
                 "search_knowledge_files, query_knowledge_files, view_knowledge_file, "
-                "search_chats, view_chat, search_notes, view_note, view_skill, create_tasks"
+                "search_chats, view_chat, search_notes, view_note, view_skill"
             ),
             description=(
                 "Comma-separated tool names allowed in OUTPUT phase. "
@@ -2564,7 +2656,7 @@ class Pipe:
         )
         OUTPUT_PROMPT: str = Field(
             default=DEFAULT_OUTPUT_PROMPT,
-            description="System prompt for OUTPUT phase. Available placeholders: {goal}, {task_state}, {tool_names}."
+            description="System prompt for OUTPUT phase — Turn 1 (collection / rendering allowed). Available placeholders: {goal}, {task_state}."
         )
 
     class UserValves(BaseModel):
