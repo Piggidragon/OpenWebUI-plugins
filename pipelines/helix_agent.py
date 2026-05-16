@@ -2412,45 +2412,45 @@ return (function() {{
 
             content = strip_thinking("".join(content_chunks).strip())
 
-                if not tc_dict:
-                    # Try XML tool call rescue for hallucinated <ToolCall> blocks
-                    xml_calls = extract_xml_tool_calls(content or "")
-                    if xml_calls:
-                        tc_dict = {tc["index"]: tc for tc in xml_calls}
-                    else:
-                        # No tool calls and no XML rescue - check for unfinished tasks
-                        if content and self.task_list and len(self.completed_tasks) < len(self.task_list):
-                            # Tasks remain: inject continuation prompt instead of terminating
+            if not tc_dict:
+                # Try XML tool call rescue for hallucinated <ToolCall> blocks
+                xml_calls = extract_xml_tool_calls(content or "")
+                if xml_calls:
+                    tc_dict = {tc["index"]: tc for tc in xml_calls}
+                else:
+                    # No tool calls and no XML rescue - check for unfinished tasks
+                    if content and self.task_list and len(self.completed_tasks) < len(self.task_list):
+                        # Tasks remain: inject continuation prompt instead of terminating
+                        self.history.append({
+                            "role": "assistant",
+                            "content": content,
+                        })
+                        self.history.append({
+                            "role": "user",
+                            "content": "SYSTEM: You produced text but did not call any tools. You have unfinished tasks. Continue working by calling the appropriate tool. Do NOT just describe what to do - call a tool.",
+                        })
+                        await self.emit_output(f"\n[WARN] No tool call produced. Re-prompting to continue.\n")
+                        continue
+
+                    # CRITICAL FIX: In PLAN or QUICK REPLAN phases, never return content directly.
+                    # The loop must continue until confirm_plan is called.
+                    if self.phase in (self.PHASE_PLAN, self.PHASE_REPLAN_SKIP):
+                        if content:
                             self.history.append({
                                 "role": "assistant",
                                 "content": content,
                             })
-                            self.history.append({
-                                "role": "user",
-                                "content": "SYSTEM: You produced text but did not call any tools. You have unfinished tasks. Continue working by calling the appropriate tool. Do NOT just describe what to do - call a tool.",
-                            })
-                            await self.emit_output(f"\n[WARN] No tool call produced. Re-prompting to continue.\n")
-                            continue
+                        self.history.append({
+                            "role": "user",
+                            "content": "SYSTEM: You are still in PLAN mode. Do NOT answer the user directly. You MUST call confirm_plan with a numbered task list to move to execution. If you have asked enough questions, just formulate your best plan and call confirm_plan now.",
+                        })
+                        await self.emit_output(f"\n[WARN] PLAN phase: produced content without confirm_plan. Re-prompting...\n")
+                        continue
 
-                        # CRITICAL FIX: In PLAN or QUICK REPLAN phases, never return content directly.
-                        # The loop must continue until confirm_plan is called.
-                        if self.phase in (self.PHASE_PLAN, self.PHASE_REPLAN_SKIP):
-                            if content:
-                                self.history.append({
-                                    "role": "assistant",
-                                    "content": content,
-                                })
-                            self.history.append({
-                                "role": "user",
-                                "content": "SYSTEM: You are still in PLAN mode. Do NOT answer the user directly. You MUST call confirm_plan with a numbered task list to move to execution. If you have asked enough questions, just formulate your best plan and call confirm_plan now.",
-                            })
-                            await self.emit_output(f"\n[WARN] PLAN phase: produced content without confirm_plan. Re-prompting...\n")
-                            continue
-
-                        if content:
-                            await self.emit_output(content)
-                        await self.emit_status("Done", done=True)
-                        return self._format_output()
+                    if content:
+                        await self.emit_output(content)
+                    await self.emit_status("Done", done=True)
+                    return self._format_output()
 
             tool_calls_list = list(tc_dict.values())
             self.history.append({
