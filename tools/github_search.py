@@ -6,13 +6,13 @@ description: >
   issues, pull requests, commits, users, and topics — right from OpenWebUI.
   Works without a token (lower rate limits), or with a token for higher limits
   and access to your private repositories.
-version: 1.0.1
+version: 1.1.0
 """
 
 import json
 import httpx
 from pydantic import BaseModel, Field
-from typing import Optional, Literal
+from typing import Optional, Literal, Callable, Awaitable, Any
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -79,6 +79,7 @@ class Tools:
         ] = "repositories",
         per_page: int = 10,
         __user__: Optional[dict] = None,
+        __event_emitter__: Optional[Callable[[Any], Awaitable[None]]] = None,
     ) -> str:
         """
         Search across all of GitHub — code, repos, issues, PRs, commits, users, topics.
@@ -174,6 +175,17 @@ class Tools:
                     f"Forks: {repo.get('forks_count', 0):,}  |  "
                     f"Open issues: {repo.get('open_issues_count', 0):,}"
                 )
+                if __event_emitter__:
+                    await __event_emitter__(
+                        {
+                            "type": "citation",
+                            "data": {
+                                "document": [desc],
+                                "metadata": [{"source": repo["html_url"]}],
+                                "source": {"name": repo["full_name"]},
+                            },
+                        }
+                    )
 
         elif search_type == "code":
             for i, item in enumerate(items, 1):
@@ -185,6 +197,17 @@ class Tools:
                     f"   Repository: [{repo_name}]({item['repository']['html_url']})  "
                     f"⭐ {item['repository'].get('stargazers_count', 0)}"
                 )
+                if __event_emitter__:
+                    await __event_emitter__(
+                        {
+                            "type": "citation",
+                            "data": {
+                                "document": [item.get("name", path)],
+                                "metadata": [{"source": url}],
+                                "source": {"name": f"{repo_name}/{path}"},
+                            },
+                        }
+                    )
 
         elif search_type == "issues":
             for i, item in enumerate(items, 1):
@@ -205,6 +228,17 @@ class Tools:
                     f"by [{item['user']['login']}]({item['user']['html_url']})  |  "
                     f"{item['created_at'][:10]}{labels}"
                 )
+                if __event_emitter__:
+                    await __event_emitter__(
+                        {
+                            "type": "citation",
+                            "data": {
+                                "document": [item.get("body") or item.get("title") or ""],
+                                "metadata": [{"source": item["html_url"]}],
+                                "source": {"name": f"{kind} #{item['number']} in {item['repository_url'].split('/repos/')[-1]}"},
+                            },
+                        }
+                    )
 
         elif search_type == "commits":
             for i, item in enumerate(items, 1):
@@ -220,6 +254,17 @@ class Tools:
                     f"   {item['repository']['full_name']}  |  "
                     f"by {author}  |  {item['commit']['author']['date'][:10]}"
                 )
+                if __event_emitter__:
+                    await __event_emitter__(
+                        {
+                            "type": "citation",
+                            "data": {
+                                "document": [item["commit"]["message"]],
+                                "metadata": [{"source": item["html_url"]}],
+                                "source": {"name": f"Commit {sha} in {item['repository']['full_name']}"},
+                            },
+                        }
+                    )
 
         elif search_type == "users":
             for i, user in enumerate(items, 1):
@@ -232,6 +277,17 @@ class Tools:
                     f"Followers: {user.get('followers', '?')}  |  "
                     f"Location: {user.get('location') or '—'}"
                 )
+                if __event_emitter__:
+                    await __event_emitter__(
+                        {
+                            "type": "citation",
+                            "data": {
+                                "document": [bio],
+                                "metadata": [{"source": user["html_url"]}],
+                                "source": {"name": user["login"]},
+                            },
+                        }
+                    )
 
         elif search_type == "topics":
             # topic results are just repos tagged with the topic
@@ -245,6 +301,17 @@ class Tools:
                     f"   {desc[:200]}\n"
                     f"   Updated: {repo['updated_at'][:10]}"
                 )
+                if __event_emitter__:
+                    await __event_emitter__(
+                        {
+                            "type": "citation",
+                            "data": {
+                                "document": [desc],
+                                "metadata": [{"source": repo["html_url"]}],
+                                "source": {"name": repo["full_name"]},
+                            },
+                        }
+                    )
 
         # ── add qualifier reference ────────────────────────────
         out_lines.append("")
@@ -261,31 +328,36 @@ class Tools:
     # ═══════════════════════════════════════════════════════════════
 
     async def github_search_repos(
-        self, query: str, per_page: int = 10, __user__: Optional[dict] = None
+        self, query: str, per_page: int = 10, __user__: Optional[dict] = None,
+        __event_emitter__: Optional[Callable[[Any], Awaitable[None]]] = None,
     ) -> str:
         """Search public/private GitHub repositories. Shortcut for github_search(type='repositories')."""
-        return await self.github_search(query, "repositories", per_page, __user__)
+        return await self.github_search(query, "repositories", per_page, __user__, __event_emitter__)
 
     async def github_search_code(
-        self, query: str, per_page: int = 10, __user__: Optional[dict] = None
+        self, query: str, per_page: int = 10, __user__: Optional[dict] = None,
+        __event_emitter__: Optional[Callable[[Any], Awaitable[None]]] = None,
     ) -> str:
         """Search source code across all of GitHub. Shortcut for github_search(type='code')."""
-        return await self.github_search(query, "code", per_page, __user__)
+        return await self.github_search(query, "code", per_page, __user__, __event_emitter__)
 
     async def github_search_issues(
-        self, query: str, per_page: int = 10, __user__: Optional[dict] = None
+        self, query: str, per_page: int = 10, __user__: Optional[dict] = None,
+        __event_emitter__: Optional[Callable[[Any], Awaitable[None]]] = None,
     ) -> str:
         """Search issues and pull requests across GitHub. Shortcut for github_search(type='issues')."""
-        return await self.github_search(query, "issues", per_page, __user__)
+        return await self.github_search(query, "issues", per_page, __user__, __event_emitter__)
 
     async def github_search_commits(
-        self, query: str, per_page: int = 10, __user__: Optional[dict] = None
+        self, query: str, per_page: int = 10, __user__: Optional[dict] = None,
+        __event_emitter__: Optional[Callable[[Any], Awaitable[None]]] = None,
     ) -> str:
         """Search commit messages across GitHub. Shortcut for github_search(type='commits')."""
-        return await self.github_search(query, "commits", per_page, __user__)
+        return await self.github_search(query, "commits", per_page, __user__, __event_emitter__)
 
     async def github_search_users(
-        self, query: str, per_page: int = 10, __user__: Optional[dict] = None
+        self, query: str, per_page: int = 10, __user__: Optional[dict] = None,
+        __event_emitter__: Optional[Callable[[Any], Awaitable[None]]] = None,
     ) -> str:
         """Search GitHub users and organizations. Shortcut for github_search(type='users')."""
-        return await self.github_search(query, "users", per_page, __user__)
+        return await self.github_search(query, "users", per_page, __user__, __event_emitter__)
