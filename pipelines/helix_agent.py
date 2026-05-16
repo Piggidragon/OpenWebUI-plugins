@@ -429,7 +429,7 @@ class HelixAgentEngine:
         PHASE_REPLAN_SKIP:{"confirm_plan", "rag_search", "ask_user"},  # Quick replan has minimal internal tools
     }
 
-    def __init__(self, request, user, body, event_emitter, event_call, metadata, valves, user_valves=None):
+    def __init__(self, request, user, body, event_emitter, event_call, metadata, valves, user_valves=None, incoming_tools=None):
         self.request = request
         self.user = user
         self.body = body
@@ -466,6 +466,9 @@ class HelixAgentEngine:
         self._extra_grace = 0
         self.consecutive_json_errors = 0
         self._plan_questions_asked = 0  # Counter for ask_user calls in PLAN/REPLAN_SKIP
+        self._incoming_tools = list(incoming_tools) if incoming_tools else []
+        self._incoming_tool_names = set()
+        self._builtin_tools_names = set()
 
     def _format_output(self):
         filtered = []
@@ -720,13 +723,13 @@ class HelixAgentEngine:
         if skill_ids:
             extra_params["__skill_ids__"] = skill_ids
         features = self._get_model_features(model_info)
-        if features or extra_params.get("__skill_ids__"):
-            try:
-                builtin = await get_builtin_tools(self.request, extra_params, features=features, model=model_info)
-                if builtin:
-                    self.all_tools_dict.update(builtin)
-            except Exception as e:
-                logger.error(f"get_builtin_tools failed: {e}")
+        try:
+            builtin = await get_builtin_tools(self.request, extra_params, features=features, model=model_info)
+            if builtin:
+                self.all_tools_dict.update(builtin)
+                self._builtin_tools_names = set(builtin.keys())
+        except Exception as e:
+            logger.error(f"get_builtin_tools failed: {e}")
 
         # 4. Terminal tools
         terminal_id = self.pipe_metadata.get("terminal_id")
@@ -744,6 +747,32 @@ class HelixAgentEngine:
 
         # 5. Add internal control tools (always available, stored in all_tools_dict too)
         self._add_internal_tools()
+
+        # 6. Merge any tools passed in via the Pipe __tools__ param that are missing
+        if self._incoming_tools:
+            for tool in self._incoming_tools:
+                if not isinstance(tool, dict):
+                    continue
+                # OpenAI-style tool entry {"type": "function", "function": {...}}
+                if tool.get("type") == "function":
+                    func = tool.get("function", {})
+                    name = func.get("name")
+                elif "name" in tool:
+                    # Direct dict fallback
+                    name = tool.get("name")
+                    func = tool
+                else:
+                    continue
+                if not name or name in self.INTERNAL_TOOLS:
+                    continue
+                self._incoming_tool_names.add(name)
+                if name not in self.all_tools_dict:
+                    # Lightweight placeholder: no local callable, but present for diagnostics
+                    self.all_tools_dict[name] = {
+                        "spec": func if isinstance(func, dict) else {},
+                        "callable": None,
+                        "type": "from_pipe",
+                    }
 
         return self.all_tools_dict
 
@@ -1397,7 +1426,7 @@ class HelixAgentEngine:
         """Interactive user question tool. Only available during PLAN and QUICK REPLAN phases."""
         if self.phase in (self.PHASE_PLAN, self.PHASE_REPLAN_SKIP):
             self._plan_questions_asked += 1
-            max_questions = getattr(self.valves, "MAX_PLAN_QUESTIONS", 3)
+            max_questions = getattr(self.user_valves, "MAX_PLAN_QUESTIONS", 3)
             if self._plan_questions_asked >= max_questions:
                 return json.dumps({
                     "type": "error",
@@ -2690,26 +2719,85 @@ class HelixAgentEngine:
         if getattr(self.valves, "DEBUG_MODE", False):
             msg_lower = (user_msg or "").strip().lower()
             if msg_lower in ("show tools", "debug tools", "list tools"):
-                # Only external tools (exclude Helix internal control tools)
-                external_tools = sorted(
-                    name for name in self.all_tools_dict.keys()
-                    if name not in self.INTERNAL_TOOLS
+                # Ensure phase_tools_dict is up to date for status indicators
+                self._filter_tools_for_phase(self.phase)
+                phase_allowed = set(self.phase_tools_dict.keys())
+                phase_internal = self.PHASE_INTERNAL_TOOLS.get(self.phase, self.INTERNAL_TOOLS)
+
+                builtin_tools = []
+                mcp_tools = []
+                external_tools = []
+                pipe_only_tools = []
+
+                for name, info in self.all_tools_dict.items():
+                    if name in self.INTERNAL_TOOLS:
+                        continue
+                    tool_type = info.get("type", "") if isinstance(info, dict) else ""
+                    if tool_type == "mcp":
+                        mcp_tools.append(name)
+                    elif name in self._builtin_tools_names:
+                        builtin_tools.append(name)
+                    elif tool_type == "from_pipe" or name in self._incoming_tool_names:
+                        pipe_only_tools.append(name)
+                    else:
+                        external_tools.append(name)
+
+                builtin_tools.sort()
+                mcp_tools.sort()
+                external_tools.sort()
+                pipe_only_tools.sort()
+                internal_tools = sorted(phase_internal)
+
+                def _mark(name):
+                    ok = name in phase_allowed
+                    return f"- {name} ✅" if ok else f"- {name} ❌ (not in current phase)"
+
+                def _mark_pipe(name):
+                    ok = name in phase_allowed
+                    base = f"- {name} _(pipe only, no local callable)_"
+                    return f"{base} ✅" if ok else f"{base} ❌ (not in current phase)"
+
+                sections = []
+                sections.append(f"**Phase:** `{self.phase.upper()}`")
+
+                if builtin_tools:
+                    sections.append(
+                        f"**Built-in Tools ({len(builtin_tools)}):**\n"
+                        + "\n".join(_mark(t) for t in builtin_tools)
+                    )
+                else:
+                    sections.append("**Built-in Tools:** none")
+
+                if mcp_tools:
+                    sections.append(
+                        f"**MCP Tools ({len(mcp_tools)}):**\n"
+                        + "\n".join(_mark(t) for t in mcp_tools)
+                    )
+                else:
+                    sections.append("**MCP Tools:** none")
+
+                if external_tools:
+                    sections.append(
+                        f"**External / Attached Tools ({len(external_tools)}):**\n"
+                        + "\n".join(_mark(t) for t in external_tools)
+                    )
+                else:
+                    sections.append("**External / Attached Tools:** none")
+
+                if pipe_only_tools:
+                    sections.append(
+                        f"**From Pipe (__tools__) — unresolved ({len(pipe_only_tools)}):**\n"
+                        + "\n".join(_mark_pipe(t) for t in pipe_only_tools)
+                    )
+                else:
+                    sections.append("**From Pipe (__tools__):** none (all resolved locally)")
+
+                sections.append(
+                    f"**Helix Internal Tools ({len(internal_tools)}):**\n"
+                    + "\n".join(f"- {t}" for t in internal_tools)
                 )
-                tool_list = "\n".join(f"- {t}" for t in external_tools)
-                tool_csv = ", ".join(external_tools)
-                return f"**Available tools ({len(external_tools)}):**\n\n{tool_list}\n\n**Comma-separated:** {tool_csv}"
-            if msg_lower in ("show mcp", "debug mcp", "list mcp"):
-                mcp_tools = sorted(
-                    name for name, info in self.all_tools_dict.items()
-                    if info.get("type") == "mcp" and name not in self.INTERNAL_TOOLS
-                )
-                tool_list = "\n".join(f"- {t}" for t in mcp_tools)
-                tool_csv = ", ".join(mcp_tools)
-                return f"**Available MCP tools ({len(mcp_tools)}):**\n\n{tool_list}\n\n**Comma-separated:** {tool_csv}"
-            if msg_lower in ("show skills", "debug skills", "list skills"):
-                if self._skill_prompt:
-                    return f"**Injected skills prompt:**\n\n{self._skill_prompt}"
-                return "**No skills injected.**"
+
+                return "\n\n".join(sections)
 
         await self.emit_status("Agent starting...")
 
@@ -3519,6 +3607,7 @@ class Pipe:
         __files__: list = None,
         __chat_id__: str = None,
         __message_id__: str = None,
+        __tools__: list = None,
         **kwargs,
     ):
         if __request__ is None:
@@ -3572,6 +3661,7 @@ class Pipe:
             metadata=metadata,
             valves=self.valves,
             user_valves=user_valves,
+            incoming_tools=__tools__,
         )
 
         return await engine.run(user_msg, last_user_msg_raw, model)
