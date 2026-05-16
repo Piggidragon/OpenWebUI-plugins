@@ -1,7 +1,7 @@
 """
 title: Helix Agent
 author: Piggidragon
-version: 0.19.2
+version: 4.8.2
 description: >
   Helix Agent - OpenWebUI-native agent loop with modular per-phase tool control.
 
@@ -25,8 +25,6 @@ description: >
   - Iteration limit with Continue/Cancel modal; graceful shutdown on CancelledError/GeneratorExit
   - File handling: add_file_context + chat_completion_files_handler for native multimodal/text file injection
   - RAG search built-in: agent can query attached large files via vector search
-  - MCP support: resolves and calls MCP server tools via OpenWebUI's MCPClient
-  - Skills support: resolves user skills from model metadata and injects them into the system prompt
 requirements: open-webui>=0.9.1, chromadb, sentence-transformers, langchain-text-splitters
 """
 
@@ -39,7 +37,7 @@ import os
 import re
 import copy
 import uuid
-from typing import Callable, Set, List, Dict, Any
+from typing import Callable, Set, List, Dict
 from pydantic import BaseModel, Field
 
 from fastapi import Request
@@ -50,18 +48,7 @@ from open_webui.utils.middleware import (
     process_tool_result,
     add_file_context,
     chat_completion_files_handler,
-    get_system_oauth_token,
 )
-from open_webui.utils.mcp.client import MCPClient
-from open_webui.utils.access_control import has_connection_access
-from open_webui.utils.misc import is_string_allowed
-from open_webui.utils.headers import include_user_info_headers
-from open_webui.env import (
-    ENABLE_FORWARD_USER_INFO_HEADERS,
-    FORWARD_SESSION_INFO_HEADER_CHAT_ID,
-    FORWARD_SESSION_INFO_HEADER_MESSAGE_ID,
-)
-from open_webui.models.skills import Skills
 
 logger = logging.getLogger(__name__)
 
@@ -110,7 +97,7 @@ Rules:
 - If the request is simple (1-2 tasks), still list them explicitly.
 - Call exactly ONE tool per step.
 - When done planning, call confirm_plan with the plan for confirmation.
-- If the request is inappropriate or impossible, call terminate with a brief explanation.
+- NEVER call terminate in PLAN mode -- the user must confirm first.
 - NEVER call replan in PLAN mode.
 - If a tool returns an error during planning (e.g., file not found), try an alternative tool or note the limitation in your plan. Do not call fix_plan for planning-stage errors.
 - If the user rejects your plan with feedback, revise the plan based on their feedback and call confirm_plan again with the updated plan. Do NOT repeat the same plan unchanged.
@@ -144,8 +131,8 @@ File paths: Create a project folder under `/home/userxy/agent/` named after the 
 Rules:
 - Call exactly ONE tool per step.
 - NEVER repeat identical failed tool calls (duplicate detection is active).
-- When all tasks are done, the system will move to review automatically. You may also call early_finish(reason) if you believe you're done early.
-- If a tool returns an error, analyze it and retry with corrected parameters. You do NOT need to call fix_plan for trivial errors.
+- When all tasks are done, call terminate with a summary.
+- If a tool returns an error (timeout, file not found, syntax error, wrong path), analyze the error and retry with corrected parameters. You do NOT need to call fix_plan for trivial errors.
 - Only call fix_plan if the same task fails repeatedly (3+ attempts) or if the task design was wrong.
 - Only call replan(mode='soft') if the entire approach is wrong. Use replan(mode='hard') only for complete strategy replacement.
 - If you need to think step-by-step before acting, do so - reasoning will be captured in a collapsible block.
@@ -155,7 +142,7 @@ Rules:
 """
 
 DEFAULT_REVIEW_PROMPT = """\
-You are in REVIEW mode. Your ONLY job is to pick one of these actions.
+You are in REVIEW mode. Your ONLY job is to pick one of three actions.
 
 PHASE: REVIEW
 Original goal: {goal}
@@ -167,32 +154,20 @@ Task status markers: [done] = completed, [FAIL: reason] = failed with reason, [ 
 
 You MUST call exactly ONE of these tools:
 
-1. `proceed_to_output()` — Everything is done and correct. Move to the OUTPUT phase to generate the polished final answer.
-2. `fix_plan(reason, updated_tasks)` — Only minor fixes are needed (a task failed or needs a small correction). List just the new/corrected tasks.
-3. `replan(reason, updated_tasks, mode="soft")` — The overall strategy is broken and tasks need to be replaced entirely.
+1. `terminate(final_answer)` - Everything is done and correct. Provide a concise final answer summarising what was accomplished.
+2. `fix_plan(reason, updated_tasks)` - Only minor fixes are needed (a task failed or needs a small correction). List just the new/corrected tasks.
+3. `replan(reason, updated_tasks, mode="soft")` - The overall strategy is broken and tasks need to be replaced entirely.
 
 Rules:
 - If there are only minor issues with individual tasks, ALWAYS prefer `fix_plan` over `replan`. Only use `replan` if the overall strategy is broken.
-- Be honest — don't call `proceed_to_output` if something is missing or wrong.
-- If the result is good enough, call `proceed_to_output`. Don't gold-plate.
+- Be honest - don't call `terminate` if something is missing or wrong.
+- If the result is good enough, call `terminate`. Don't gold-plate.
 - Provide a brief reasoning for your assessment before calling the final tool.
 - You may only use the tools listed above.
 """
 
-DEFAULT_OUTPUT_PROMPT = """\
-You are in OUTPUT mode — COLLECTION. Gather missing context and render visualisations if needed. Do not produce any answer text yet.
-
-Goal: {goal}
-
-{task_state}
-"""
-
-DEFAULT_OUTPUT_FINAL_PROMPT = """\
-Write the final answer.
-
-Goal: {goal}
-"""
-
+DEFAULT_REPLAN_SKIP_PROMPT = """\
+You are in QUICK REPLAN mode. The previous session has finished. The user has a new follow-up request.
 
 PHASE: QUICK REPLAN
 
@@ -412,20 +387,13 @@ class HelixAgentEngine:
     PHASE_PLAN = "plan"
     PHASE_EXECUTE = "execute"
     PHASE_REVIEW = "review"
-    PHASE_OUTPUT = "output"
+    PHASE_REPLAN_SKIP = "replan_skip"
 
     MAX_HISTORY_MESSAGES = 50
     MAX_REPLAN_SKIP_LOOPS = 3
 
     # Internal tools that are ALWAYS available regardless of phase filters
-    INTERNAL_TOOLS = {"terminate", "replan", "complete_task", "fail_task", "confirm_plan", "fix_plan", "rag_search", "proceed_to_output", "early_finish"}
-
-    PHASE_INTERNAL_TOOLS = {
-        PHASE_PLAN:    {"terminate", "replan", "complete_task", "fail_task", "confirm_plan", "fix_plan", "rag_search"},
-        PHASE_EXECUTE: {"replan", "complete_task", "fail_task", "fix_plan", "rag_search", "early_finish"},
-        PHASE_REVIEW:  {"proceed_to_output", "replan", "fix_plan", "rag_search"},
-        PHASE_OUTPUT:  {"rag_search"},
-    }
+    INTERNAL_TOOLS = {"terminate", "replan", "complete_task", "fail_task", "confirm_plan", "fix_plan", "rag_search"}
 
     def __init__(self, request, user, body, event_emitter, event_call, metadata, valves, user_valves=None):
         self.request = request
@@ -454,13 +422,11 @@ class HelixAgentEngine:
         self.produced_files = []
         self._files_lock = asyncio.Lock()
         self._consecutive_tool_misses: Dict[str, int] = {}
-        self._output_turn = 0
         self._seen_file_ids: Set[str] = set()
         self._output_parts = []
         self.loop_count = 0
         self.goal = ""
-        self._skill_prompt = ""
-        self._mcp_clients: Dict[str, Any] = {}
+        self._plan_questions_asked = 0  # Track ask_user calls in PLAN/REPLAN_SKIP phases
 
     def _format_output(self):
         filtered = []
@@ -676,11 +642,6 @@ class HelixAgentEngine:
 
         self.all_tools_dict = {}
 
-        # 0. Resolve skills from model metadata (injected into system prompt later)
-        model_info = self.app_models.get(self.body.get("model", ""), {})
-        skill_ids, skill_prompt = await self._resolve_model_skills(model_info)
-        self._skill_prompt = skill_prompt
-
         # 1. External tools (DB + OpenAPI)
         unique_ids = list(dict.fromkeys(tid for tid in tool_ids if tid))
         if unique_ids:
@@ -691,24 +652,10 @@ class HelixAgentEngine:
             except Exception as e:
                 logger.error(f"get_tools failed: {e}")
 
-        # 2. MCP tools (from server:mcp: / mcp: prefixed IDs)
-        try:
-            mcp_tools = await self._resolve_mcp_tools(unique_ids, extra_params)
-            if mcp_tools:
-                self.all_tools_dict.update(mcp_tools)
-                # Track clients for later cleanup
-                for name, tool in mcp_tools.items():
-                    client = tool.get("client")
-                    if client and hasattr(client, "disconnect"):
-                        self._mcp_clients[name] = client
-        except Exception as e:
-            logger.error(f"MCP tool resolution failed: {e}")
-
-        # 3. Built-in tools (pass skill_ids so view_skill is available)
-        if skill_ids:
-            extra_params["__skill_ids__"] = skill_ids
+        # 2. Built-in tools
+        model_info = self.app_models.get(self.body.get("model", ""), {})
         features = self._get_model_features(model_info)
-        if features or extra_params.get("__skill_ids__"):
+        if features:
             try:
                 builtin = await get_builtin_tools(self.request, extra_params, features=features, model=model_info)
                 if builtin:
@@ -716,7 +663,7 @@ class HelixAgentEngine:
             except Exception as e:
                 logger.error(f"get_builtin_tools failed: {e}")
 
-        # 4. Terminal tools
+        # 3. Terminal tools
         terminal_id = self.pipe_metadata.get("terminal_id")
         if terminal_id:
             try:
@@ -730,7 +677,7 @@ class HelixAgentEngine:
             except Exception as e:
                 logger.error(f"get_terminal_tools failed: {e}")
 
-        # 5. Add internal control tools (always available, stored in all_tools_dict too)
+        # 4. Add internal control tools (always available, stored in all_tools_dict too)
         self._add_internal_tools()
 
         return self.all_tools_dict
@@ -832,35 +779,6 @@ class HelixAgentEngine:
             "callable": self._tool_fix_plan,
             "type": "function",
         }
-        self.all_tools_dict["proceed_to_output"] = {
-            "spec": {
-                "name": "proceed_to_output",
-                "description": "Move from REVIEW to OUTPUT phase to generate the polished final answer. Call this when everything is done and correct.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "notes": {"type": "string", "description": "Optional brief notes about the review decision."},
-                    },
-                },
-            },
-            "callable": self._tool_proceed_to_output,
-            "type": "function",
-        }
-        self.all_tools_dict["early_finish"] = {
-            "spec": {
-                "name": "early_finish",
-                "description": "Signal that the current work is complete enough to move to the next phase. Only available in EXECUTE phase.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "reason": {"type": "string", "description": "Brief reason why you're finishing early"},
-                    },
-                    "required": ["reason"],
-                },
-            },
-            "callable": self._tool_early_finish,
-            "type": "function",
-        }
         self.all_tools_dict["rag_search"] = {
             "spec": {
                 "name": "rag_search",
@@ -915,233 +833,7 @@ class HelixAgentEngine:
                     features[fk] = bool(fv)
         return features
 
-    # ── Skills & MCP Helpers ──
-
-    async def _resolve_model_skills(self, model_info: dict) -> tuple[list[str], str]:
-        """Resolve skillIds from model metadata and fetch user skills from DB."""
-        skill_ids: list[str] = []
-        skill_prompt = ""
-        if not model_info:
-            return skill_ids, skill_prompt
-
-        meta = model_info.get("info", {}).get("meta", {})
-        if not meta:
-            meta = model_info
-        model_skill_ids = meta.get("skillIds", [])
-        if not model_skill_ids:
-            return skill_ids, skill_prompt
-
-        try:
-            user_id = None
-            if hasattr(self.user, "id"):
-                user_id = self.user.id
-            elif isinstance(self.user, dict):
-                user_id = self.user.get("id")
-            if not user_id:
-                return skill_ids, skill_prompt
-
-            user_skills = await Skills.get_skills_by_user_id(user_id, "read")
-            accessible = {s.id: s for s in user_skills if s.is_active}
-            available = []
-            for sid in model_skill_ids:
-                sk = accessible.get(sid)
-                if sk:
-                    available.append(sk)
-                    skill_ids.append(sid)
-
-            if available:
-                descriptions = ""
-                for sk in available:
-                    descriptions += f"<skill>\n<name>{sk.name}</name>\n<description>{sk.description or ''}</description>\n</skill>\n"
-                skill_prompt = (
-                    f"<available_skills>\n{descriptions}</available_skills>\n\n"
-                    "You have access to the above skills. ONLY use them when they are directly useful for the current task or context. Do not invoke a skill unless it provides clear value for what the user is asking."
-                )
-        except Exception as e:
-            logger.error(f"Error resolving skills: {e}")
-
-        return skill_ids, skill_prompt
-
-    async def _resolve_mcp_tools(self, tool_ids: list[str], extra_params: dict) -> dict[str, Any]:
-        """Resolve MCP server tools from tool_ids, mirroring planner_v3 logic."""
-        out: dict[str, Any] = {}
-        if not tool_ids or not self.request or not self.user:
-            return out
-
-        oauth_token = None
-        try:
-            oauth_token = await get_system_oauth_token(self.request, self.user)
-        except Exception:
-            pass
-
-        resolved_servers = set()
-        for tool_id in tool_ids:
-            if not isinstance(tool_id, str):
-                continue
-
-            server_id = None
-            if tool_id.startswith("server:mcp:"):
-                server_id = tool_id[len("server:mcp:"):]
-            elif tool_id.startswith("mcp:"):
-                server_id = tool_id[len("mcp:"):]
-                mcp_connections = getattr(
-                    self.request.app.state.config, "TOOL_SERVER_CONNECTIONS", []
-                )
-                for server_connection in mcp_connections:
-                    if server_connection.get("type", "") == "mcp":
-                        sid = server_connection.get("info", {}).get("id")
-                        if sid and (tool_id == sid or tool_id.startswith(f"{sid}_")):
-                            server_id = sid
-                            break
-
-            if not server_id:
-                continue
-            if server_id in resolved_servers:
-                continue
-            resolved_servers.add(server_id)
-
-            try:
-                mcp_server_connection = None
-                for conn in self.request.app.state.config.TOOL_SERVER_CONNECTIONS:
-                    if (
-                        conn.get("type", "") == "mcp"
-                        and conn.get("info", {}).get("id") == server_id
-                    ):
-                        mcp_server_connection = conn
-                        break
-
-                if not mcp_server_connection:
-                    logger.error("MCP server %s not found in connections", server_id)
-                    continue
-
-                if not await has_connection_access(self.user, mcp_server_connection):
-                    logger.warning("Access denied to MCP server %s", server_id)
-                    continue
-
-                auth_type = mcp_server_connection.get("auth_type", "")
-                headers: dict[str, str] = {}
-                if auth_type == "bearer":
-                    headers["Authorization"] = f"Bearer {mcp_server_connection.get('key', '')}"
-                elif auth_type == "none":
-                    pass
-                elif auth_type == "session":
-                    tok = getattr(getattr(self.request, "state", None), "token", None)
-                    creds = getattr(tok, "credentials", None) if tok else None
-                    if creds:
-                        headers["Authorization"] = f"Bearer {creds}"
-                elif auth_type == "system_oauth":
-                    if oauth_token:
-                        headers["Authorization"] = f"Bearer {oauth_token.get('access_token', '')}"
-                elif auth_type == "oauth_2.1":
-                    try:
-                        splits = server_id.split(":")
-                        sid = splits[-1] if len(splits) > 1 else server_id
-                        mgr = getattr(self.request.app.state, "oauth_client_manager", None)
-                        if mgr:
-                            ot = await mgr.get_oauth_token(
-                                getattr(self.user, "id", ""), f"mcp:{sid}"
-                            )
-                            if ot:
-                                headers["Authorization"] = f"Bearer {ot.get('access_token', '')}"
-                    except Exception as e:
-                        logger.error("OAuth token for MCP: %s", e)
-
-                connection_headers = mcp_server_connection.get("headers")
-                if connection_headers and isinstance(connection_headers, dict):
-                    headers.update(connection_headers)
-
-                if ENABLE_FORWARD_USER_INFO_HEADERS and self.user:
-                    headers = include_user_info_headers(headers, self.user)
-                    cid = self.chat_id
-                    if cid:
-                        headers[FORWARD_SESSION_INFO_HEADER_CHAT_ID] = cid
-                    mid = self.message_id
-                    if mid:
-                        headers[FORWARD_SESSION_INFO_HEADER_MESSAGE_ID] = mid
-
-                client = MCPClient()
-                await client.connect(
-                    url=mcp_server_connection.get("url", ""),
-                    headers=headers if headers else None,
-                )
-
-                if not hasattr(client, "_call_lock"):
-                    client._call_lock = asyncio.Lock()
-
-                function_name_filter_list = mcp_server_connection.get("config", {}).get(
-                    "function_name_filter_list", ""
-                )
-                if isinstance(function_name_filter_list, str):
-                    function_name_filter_list = function_name_filter_list.split(",")
-
-                async with client._call_lock:
-                    tool_specs = await client.list_tool_specs()
-
-                def make_tool_function(mcp_client, function_name, sid):
-                    async def tool_function(**kwargs):
-                        try:
-                            logger.debug(
-                                "[MCP] Calling '%s' on server '%s' with args: %s",
-                                function_name, sid, kwargs,
-                            )
-                            async with mcp_client._call_lock:
-                                result = await mcp_client.call_tool(
-                                    function_name, function_args=kwargs
-                                )
-                            if hasattr(result, "content") and result.content:
-                                texts = []
-                                for c in result.content:
-                                    if hasattr(c, "text") and c.text:
-                                        texts.append(c.text)
-                                    elif hasattr(c, "image"):
-                                        texts.append(
-                                            f"[Image Content: {c.image[:50]}...]"
-                                            if isinstance(c.image, str)
-                                            else "[Image Content]"
-                                        )
-                                    else:
-                                        texts.append(str(c))
-                                return "\n".join(texts)
-                            if hasattr(result, "isError") and result.isError:
-                                return f"MCP Error from {sid}: {result}"
-                            return str(result)
-                        except Exception as e:
-                            logger.error(
-                                "Failed to call MCP tool '%s' on '%s': %s",
-                                function_name, sid, e, exc_info=True,
-                            )
-                            return f"Error calling MCP tool: {e}"
-
-                    return tool_function
-
-                for tool_spec in tool_specs:
-                    if function_name_filter_list:
-                        if not is_string_allowed(tool_spec["name"], function_name_filter_list):
-                            continue
-                    tool_function = make_tool_function(client, tool_spec["name"], server_id)
-                    prefixed_name = f'{server_id}_{tool_spec["name"]}'
-                    out[prefixed_name] = {
-                        "spec": {**tool_spec, "name": prefixed_name},
-                        "callable": tool_function,
-                        "type": "mcp",
-                        "client": client,
-                        "direct": False,
-                    }
-            except Exception as e:
-                logger.debug("MCP tool load failed for %s: %s", tool_id, e)
-                if self.event_emitter:
-                    try:
-                        await self.event_emitter({
-                            "type": "chat:message:error",
-                            "data": {"error": {"content": f"Failed to connect to MCP server '{server_id}'"}},
-                        })
-                    except Exception:
-                        pass
-                continue
-
-        return out
-
-    # ── Phase-aware Tool Filtering ──
+    # -- Phase-aware Tool Filtering --
 
     def _filter_tools_for_phase(self, phase: str):
         """Build phase_tools_dict from all_tools_dict based on Valves config."""
@@ -1154,24 +846,27 @@ class HelixAgentEngine:
             allowlist = set(_comma_list(self.valves.EXECUTE_TOOLS))
         elif phase == self.PHASE_REVIEW:
             allowlist = set(_comma_list(self.valves.REVIEW_TOOLS))
-        elif phase == self.PHASE_OUTPUT:
-            allowlist = set(_comma_list(self.valves.OUTPUT_TOOLS))
-
-        # Phase-specific internal tools (only show relevant ones per phase)
-        phase_internal_tools = self.PHASE_INTERNAL_TOOLS.get(phase, self.INTERNAL_TOOLS)
+        elif phase == self.PHASE_REPLAN_SKIP:
+            # QUICK REPLAN uses the same tool allowlist as PLAN
+            allowlist = set(_comma_list(self.valves.PLAN_TOOLS))
 
         # If allowlist is empty -> allow ALL tools
-        # If allowlist has entries -> only those tools (plus phase-internal ones)
+        # If allowlist has entries -> only those tools (plus internals)
         self.phase_tools_dict = {}
 
         for name, tool in self.all_tools_dict.items():
-            # Internal tools are included ONLY if in phase_internal_tools
+            # Internal tools are ALWAYS included regardless of allowlist
             if name in self.INTERNAL_TOOLS:
-                if name in phase_internal_tools:
+                self.phase_tools_dict[name] = tool
+                continue
+
+            # ask_user is only available in PLAN and REPLAN_SKIP phases
+            if name == "ask_user":
+                if phase in (self.PHASE_PLAN, self.PHASE_REPLAN_SKIP):
                     self.phase_tools_dict[name] = tool
                 continue
 
-            # Allowlist filtering for non-internal tools
+            # Allowlist filtering
             if allowlist:
                 if name in allowlist:
                     self.phase_tools_dict[name] = tool
@@ -1294,15 +989,6 @@ class HelixAgentEngine:
         await self.emit_task_update()
         return json.dumps({"fix_plan": True, "inserted_tasks": new_tasks, "reason": reason})
 
-    async def _tool_proceed_to_output(self, **kwargs):
-        """Transition from REVIEW to OUTPUT phase."""
-        if self.phase == self.PHASE_REVIEW:
-            self._transition_to(self.PHASE_OUTPUT)
-            await self._save_state_to_file()
-            await self.emit_task_update()
-            return json.dumps({"proceed_to_output": True})
-        return json.dumps({"proceed_to_output": False, "error": f"Cannot proceed to output from {self.phase} phase"})
-
     async def _tool_confirm_plan(self, **kwargs):
         plan_text = kwargs.get("plan", "")
         uv = self.user_valves
@@ -1336,15 +1022,6 @@ class HelixAgentEngine:
             res = {"action": "accept"}
 
         return json.dumps(res)
-
-    async def _tool_early_finish(self, reason: str, **kwargs):
-        """Signal early completion and move to REVIEW from EXECUTE."""
-        if self.phase == self.PHASE_EXECUTE:
-            self._transition_to(self.PHASE_REVIEW)
-            await self._save_state_to_file()
-            await self.emit_task_update()
-            return json.dumps({"early_finish": True, "phase": "review", "reason": reason})
-        return json.dumps({"early_finish": False, "error": f"Cannot early_finish from {self.phase}"})
 
     async def _tool_rag_search(self, file_id: str, query: str, top_k: int = 5, **kwargs):
         """RAG search: chunk, embed (if needed) and retrieve top_k chunks."""
@@ -2389,41 +2066,36 @@ return (function() {{
         tool_names = ", ".join(sorted(self.phase_tools_dict.keys()))
         task_state = self._build_task_state()
 
-        base = ""
+        # Pick base prompt from Valves or fallback to default
         try:
             if self.phase == self.PHASE_PLAN:
-                base = (self.valves.PLAN_PROMPT or DEFAULT_PLAN_PROMPT).format(tool_names=tool_names)
+                base = self.valves.PLAN_PROMPT or DEFAULT_PLAN_PROMPT
+                return base.format(tool_names=tool_names)
+
             elif self.phase == self.PHASE_EXECUTE:
-                base = (self.valves.EXECUTE_PROMPT or DEFAULT_EXECUTE_PROMPT).format(tool_names=tool_names, task_state=task_state)
+                base = self.valves.EXECUTE_PROMPT or DEFAULT_EXECUTE_PROMPT
+                return base.format(tool_names=tool_names, task_state=task_state)
+
             elif self.phase == self.PHASE_REVIEW:
-                base = (self.valves.REVIEW_PROMPT or DEFAULT_REVIEW_PROMPT).format(goal=self.goal, task_state=task_state, tool_names=tool_names)
-            elif self.phase == self.PHASE_OUTPUT:
-                if self._output_turn >= 2:
-                    base = DEFAULT_OUTPUT_FINAL_PROMPT.format(goal=self.goal, task_state=task_state)
-                else:
-                    base = (self.valves.OUTPUT_PROMPT or DEFAULT_OUTPUT_PROMPT).format(goal=self.goal, task_state=task_state)
-            else:
-                base = DEFAULT_PLAN_PROMPT.format(tool_names=tool_names)
+                base = self.valves.REVIEW_PROMPT or DEFAULT_REVIEW_PROMPT
+                return base.format(goal=self.goal, task_state=task_state, tool_names=tool_names)
+
+            elif self.phase == self.PHASE_REPLAN_SKIP:
+                base = self.valves.REPLAN_SKIP_PROMPT or DEFAULT_REPLAN_SKIP_PROMPT
+                return base.format(goal=self.goal, tool_names=tool_names)
+
+            return DEFAULT_PLAN_PROMPT.format(tool_names=tool_names)
         except (KeyError, IndexError, ValueError):
             # User-provided prompt may have stray braces; fall back to default
             if self.phase == self.PHASE_PLAN:
-                base = DEFAULT_PLAN_PROMPT.format(tool_names=tool_names)
+                return DEFAULT_PLAN_PROMPT.format(tool_names=tool_names)
             elif self.phase == self.PHASE_EXECUTE:
-                base = DEFAULT_EXECUTE_PROMPT.format(tool_names=tool_names, task_state=task_state)
+                return DEFAULT_EXECUTE_PROMPT.format(tool_names=tool_names, task_state=task_state)
             elif self.phase == self.PHASE_REVIEW:
-                base = DEFAULT_REVIEW_PROMPT.format(goal=self.goal, task_state=task_state, tool_names=tool_names)
-            elif self.phase == self.PHASE_OUTPUT:
-                if self._output_turn >= 2:
-                    base = DEFAULT_OUTPUT_FINAL_PROMPT.format(goal=self.goal, task_state=task_state)
-                else:
-                    base = DEFAULT_OUTPUT_PROMPT.format(goal=self.goal, task_state=task_state)
-            else:
-                base = DEFAULT_PLAN_PROMPT.format(tool_names=tool_names)
-
-        # Prepend skill prompt if resolved (available in all phases)
-        if self._skill_prompt:
-            base = f"{self._skill_prompt}\n\n{base}"
-        return base
+                return DEFAULT_REVIEW_PROMPT.format(goal=self.goal, task_state=task_state, tool_names=tool_names)
+            elif self.phase == self.PHASE_REPLAN_SKIP:
+                return DEFAULT_REPLAN_SKIP_PROMPT.format(goal=self.goal, tool_names=tool_names)
+            return DEFAULT_PLAN_PROMPT.format(tool_names=tool_names)
 
     # -- Phase Transitions --
 
@@ -2431,9 +2103,9 @@ return (function() {{
         """Transition to a new phase: update tools, system prompt, state."""
         self.phase = phase
         self._consecutive_tool_misses.clear()
-        # Reset output turn counter when entering OUTPUT phase
-        if phase == self.PHASE_OUTPUT:
-            self._output_turn = 0
+        # Reset question counter when entering planning phases
+        if phase in (self.PHASE_PLAN, self.PHASE_REPLAN_SKIP):
+            self._plan_questions_asked = 0
         # Rebuild filtered tools for new phase
         self._filter_tools_for_phase(phase)
 
@@ -2639,18 +2311,6 @@ return (function() {{
         self._output_parts = []
 
         while True:
-            # ── OUTPUT phase hard limit: max 2 turns (tool prep + final text) ──
-            if self.phase == self.PHASE_OUTPUT:
-                self._output_turn += 1
-                if self._output_turn > 2:
-                    # Safety net: exceeded max output turns, return immediately
-                    await self.emit_task_update(finalize_tasks=True)
-                    await self.emit_status("Output phase exceeded max turns", done=True)
-                    return self._format_output()
-                # Refresh system prompt for the current turn
-                if self.history and self.history[0].get("role") == "system":
-                    self.history[0]["content"] = self._build_system_prompt()
-
             if self.loop_count >= self.valves.MAX_ITERATIONS:
                 await self.emit_output(f"\n[WARN] Max iterations ({self.valves.MAX_ITERATIONS}) reached.")
                 should_continue = False
@@ -2690,13 +2350,13 @@ return (function() {{
                 self.PHASE_PLAN: "[PLAN]",
                 self.PHASE_EXECUTE: "[EXEC]",
                 self.PHASE_REVIEW: "[REVU]",
-                self.PHASE_OUTPUT: "[OUT]",
+                self.PHASE_REPLAN_SKIP: "[RPLN]",
             }
             phase_name = {
                 self.PHASE_PLAN: "Plan",
                 self.PHASE_EXECUTE: "Execute",
                 self.PHASE_REVIEW: "Review",
-                self.PHASE_OUTPUT: "Output",
+                self.PHASE_REPLAN_SKIP: "Replan",
             }
             icon = phase_icons.get(self.phase, "[LOOP]")
             name = phase_name.get(self.phase, "Loop")
@@ -2716,10 +2376,6 @@ return (function() {{
                 "tools": self.phase_tools_specs if self.phase_tools_specs else None,
                 "metadata": self.pipe_metadata,
             }
-
-            # In OUTPUT phase turn 2, remove tools to force pure text output
-            if self.phase == self.PHASE_OUTPUT and self._output_turn >= 2:
-                completion_body["tools"] = None
 
             # Apply OpenWebUI file context prep (add_file_context + chat_completion_files_handler)
             try:
@@ -2762,25 +2418,7 @@ return (function() {{
                 if xml_calls:
                     tc_dict = {tc["index"]: tc for tc in xml_calls}
                 else:
-                    # No tool calls and no XML rescue
-                    # OUTPUT phase: never emit text in Turn 1, always proceed to Turn 2
-                    if self.phase == self.PHASE_OUTPUT:
-                        if self._output_turn == 1:
-                            # Turn 1 with no tools: skip text and proceed to Turn 2
-                            self.history.append({
-                                "role": "assistant",
-                                "content": content or "",
-                            })
-                            # Refresh final prompt for Turn 2
-                            if self.history and self.history[0].get("role") == "system":
-                                self.history[0]["content"] = self._build_system_prompt()
-                            continue
-                        # Turn 2: emit final text and return
-                        if content:
-                            await self.emit_output(content)
-                        await self.emit_task_update(finalize_tasks=True)
-                        await self.emit_status("Done", done=True)
-                        return self._format_output()
+                    # No tool calls and no XML rescue - check for unfinished tasks
                     if content and self.task_list and len(self.completed_tasks) < len(self.task_list):
                         # Tasks remain: inject continuation prompt instead of terminating
                         self.history.append({
@@ -2848,33 +2486,7 @@ return (function() {{
                     })
                     continue
 
-                # ── Handle early_finish ──
-                if tool_name == "early_finish":
-                    if self.phase != self.PHASE_EXECUTE:
-                        result_json = json.dumps({"early_finish": False, "error": f"early_finish is only available in EXECUTE phase, not {self.phase}"})
-                        self.history.append({
-                            "role": "tool",
-                            "content": result_json,
-                            "tool_call_id": call_id,
-                            "name": tool_name,
-                        })
-                        continue
-                    result_json = await self._tool_early_finish(**args)
-                    result_data = json.loads(result_json)
-                    if result_data.get("early_finish"):
-                        await self.emit_output(f"\n[FIN] Finishing early: {result_data.get('reason', '')}\n")
-                        await self.emit_status("Finishing early...")
-                    else:
-                        await self.emit_output(f"\n[FIN] Early finish failed: {result_data.get('error', 'Unknown error')}\n")
-                    self.history.append({
-                        "role": "tool",
-                        "content": result_json,
-                        "tool_call_id": call_id,
-                        "name": tool_name,
-                    })
-                    continue
-
-                # ── Handle terminate ──
+                # -- Handle terminate --
                 if tool_name == "terminate":
                     result = args.get("result", "Task complete.")
                     success = args.get("success", True)
@@ -2953,24 +2565,7 @@ return (function() {{
                         self._transition_to(self.PHASE_REVIEW)
                     continue
 
-                # ── Handle proceed_to_output ──
-                if tool_name == "proceed_to_output":
-                    result_json = await self._tool_proceed_to_output(**args)
-                    result_data = json.loads(result_json)
-                    if result_data.get("proceed_to_output"):
-                        await self.emit_output(f"\n[OUT] **Proceeding to output generation...**\n")
-                        await self.emit_status("[OUT] Moving to output phase...")
-                    else:
-                        await self.emit_output(f"\n[OUT] **Output transition failed:** {result_data.get('error', 'Unknown error')}\n")
-                    self.history.append({
-                        "role": "tool",
-                        "content": result_json,
-                        "tool_call_id": call_id,
-                        "name": tool_name,
-                    })
-                    continue
-
-                # ── Handle fix_plan ──
+                # -- Handle fix_plan --
                 if tool_name == "fix_plan":
                     result_json = await self._tool_fix_plan(**args)
                     result_data = json.loads(result_json)
@@ -2985,7 +2580,7 @@ return (function() {{
                         "tool_call_id": call_id,
                         "name": tool_name,
                     })
-                    if self.phase in (self.PHASE_REVIEW, self.PHASE_OUTPUT):
+                    if self.phase == self.PHASE_REVIEW:
                         self._transition_to(self.PHASE_EXECUTE)
                     continue
 
@@ -3012,7 +2607,7 @@ return (function() {{
                         await self.emit_status("[PLAN] Revising plan based on feedback...")
                         continue
                     elif result_data.get("action") == "cancel":
-                        await self.emit_output("\nThe plan was cancelled by the user. The agent will not proceed.\n")
+                        await self.emit_output("\n[PLAN] Plan cancelled by user.\n")
                         await self.emit_task_update(finalize_tasks=True)
                         await self.emit_status("Plan cancelled", done=True)
                         return self._format_output()
@@ -3078,27 +2673,14 @@ return (function() {{
             if self.phase == self.PHASE_EXECUTE and self.completed_tasks and len(self.completed_tasks) >= len(self.task_list):
                 self._transition_to(self.PHASE_REVIEW)
 
-            # OUTPUT phase: after tool calls in turn 1, continue to turn 2 (no tools)
-            if self.phase == self.PHASE_OUTPUT and self._output_turn == 1:
-                continue
-
-    async def _disconnect_mcp_clients(self):
-        """Gracefully disconnect any MCP clients opened during tool resolution."""
-        if not self._mcp_clients:
-            return
-        for name, client in list(self._mcp_clients.items()):
-            try:
-                if hasattr(client, "disconnect"):
-                    await asyncio.wait_for(client.disconnect(), timeout=3.0)
-            except Exception:
-                pass
-        self._mcp_clients.clear()
-
     async def run(self, user_msg, last_user_msg_raw, model):
         try:
             result = await self._run_impl(user_msg, last_user_msg_raw, model)
             return result
         except GeneratorExit:
+            # NOTE: GeneratorExit can only be raised if pipe() becomes an async generator.
+            # Currently pipe() returns a string, so this catch will not be triggered by
+            # OpenWebUI's normal cancellation mechanism. CancelledError handles asyncio cancellation.
             logger.info("Agent loop cancelled by user (GeneratorExit).")
             await self._save_state_to_file()
             await self.emit_task_update(finalize_tasks=True)
@@ -3115,8 +2697,9 @@ return (function() {{
             await self.emit_task_update(finalize_tasks=True)
             return f"\n[ERROR] Agent loop failed: {e}"
         finally:
-            await self._disconnect_mcp_clients()
+            # Final immediate DB sync
             await self._sync_produced_files_to_db()
+            # Fire-and-forget delayed sync with backoff to survive heavy DB load
             if HAS_DB_PERSISTENCE and self.chat_id and self.message_id:
                 snapshot = list(self.produced_files)
                 asyncio.get_running_loop().create_task(
@@ -3196,52 +2779,27 @@ class Pipe:
         )
 
         PLAN_TOOLS: str = Field(
-            default=(
-                "read_file, calculate_timestamp, fetch_url, get_current_timestamp, "
-                "glob_search, grep_search, list_files, list_knowledge_bases, "
-                "query_knowledge_bases, query_knowledge_files, search_knowledge_bases, search_knowledge_files, search_notes, "
-                "search_papers, search_web, view_chat, view_knowledge_file, view_note, view_skill"
-            ),
+            default="",
             description=(
                 "Comma-separated tool names allowed in PLAN phase. "
                 "Leave EMPTY to allow ALL tools. "
-                "Default is a read-only / research-safe set."
+                "Recommended: read-only tools like read_file, search_web, get_github_file_contents."
             )
         )
         EXECUTE_TOOLS: str = Field(
             default="",
             description=(
                 "Comma-separated tool names allowed in EXECUTE phase. "
-                "Leave EMPTY to allow ALL tools."
+                "Leave EMPTY to allow ALL tools. "
+                "Example: github_access, file_write, web_search, read_file"
             )
         )
         REVIEW_TOOLS: str = Field(
-            default=(
-                "read_file, calculate_timestamp, fetch_url, get_current_timestamp, get_process_status, run_command, "
-                "glob_search, grep_search, list_files, list_knowledge_bases, list_processes, "
-                "query_knowledge_bases, query_knowledge_files, "
-                "search_chats, search_knowledge_bases, search_knowledge_files, search_notes, search_web, "
-                "view_chat, view_knowledge_file, view_note, view_skill"
-            ),
+            default="",
             description=(
                 "Comma-separated tool names allowed in REVIEW phase. "
                 "Leave EMPTY to allow ALL tools. "
-                "Default is a read-only / review-safe set + command execution."
-            )
-        )
-        OUTPUT_TOOLS: str = Field(
-            default=(
-                "show_map, get_weather_forecast, render_visualization, "
-                "list_files, read_file, display_file, grep_search, glob_search, "
-                "list_processes, get_process_status, get_current_timestamp, calculate_timestamp, "
-                "list_knowledge_bases, search_knowledge_bases, query_knowledge_bases, "
-                "search_knowledge_files, query_knowledge_files, view_knowledge_file, "
-                "search_chats, view_chat, search_notes, view_note, view_skill"
-            ),
-            description=(
-                "Comma-separated tool names allowed in OUTPUT phase. "
-                "Leave EMPTY to allow ALL tools. "
-                "Default includes rendering/output tools and read-only helpers."
+                "Recommended: read-only tools like read_file, search_web, get_github_file_contents."
             )
         )
 
@@ -3257,9 +2815,13 @@ class Pipe:
             default=DEFAULT_REVIEW_PROMPT,
             description="System prompt for REVIEW phase. Available placeholders: {goal}, {task_state}, {tool_names}."
         )
-        OUTPUT_PROMPT: str = Field(
-            default=DEFAULT_OUTPUT_PROMPT,
-            description="System prompt for OUTPUT phase — Turn 1 (collection / rendering allowed). Available placeholders: {goal}, {task_state}."
+        REPLAN_SKIP_PROMPT: str = Field(
+            default=DEFAULT_REPLAN_SKIP_PROMPT,
+            description="System prompt for QUICK REPLAN phase. Available placeholders: {goal}, {tool_names}."
+        )
+        MAX_PLAN_QUESTIONS: int = Field(
+            default=3,
+            description="Maximum number of ask_user calls allowed in PLAN and QUICK REPLAN phases before the agent is forced to call confirm_plan. Set to 0 to disable user questions entirely.",
         )
 
     class UserValves(BaseModel):

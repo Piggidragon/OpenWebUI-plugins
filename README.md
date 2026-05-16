@@ -88,7 +88,7 @@ Pipelines are custom processing flows that run server-side in Open WebUI. Each p
 
 ---
 
-### `helix_agent.py` — Helix Agent (v0.17.1)
+### `helix_agent.py` — Helix Agent (v4.6.1)
 
 A single-model Plan → Execute → Review → Replan loop with per-phase tool control.
 
