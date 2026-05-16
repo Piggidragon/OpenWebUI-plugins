@@ -1,7 +1,7 @@
 """
 title: Helix Agent
 author: Piggidragon
-version: 0.19.2
+version: 0.20.1
 description: >
   Helix Agent — OpenWebUI-native agent loop with modular per-phase tool control.
 
@@ -147,7 +147,7 @@ Rules:
 - Only call replan(mode='soft') if the entire approach is wrong. Use replan(mode='hard') only for complete strategy replacement.
 - If you need to think step-by-step before acting, do so — reasoning will be captured in a collapsible block.
 - You MUST call complete_task(index) or fail_task(index, reason) after working on a task.
-- If a tool named `parallel_tools` is available, use it to call multiple independent tools at once for efficiency.
+- Use `run_tools_parallel` to call multiple independent tools at once for efficiency.
 - You may only use the tools listed above. Do NOT ask the user questions.
 """
 
@@ -383,11 +383,11 @@ class HelixAgentEngine:
     MAX_HISTORY_MESSAGES = 50
 
     # Internal tools that are ALWAYS available regardless of phase filters
-    INTERNAL_TOOLS = {"terminate", "replan", "complete_task", "fail_task", "confirm_plan", "fix_plan", "rag_search", "proceed_to_output", "early_finish"}
+    INTERNAL_TOOLS = {"terminate", "replan", "complete_task", "fail_task", "confirm_plan", "fix_plan", "rag_search", "proceed_to_output", "early_finish", "run_tools_parallel"}
 
     PHASE_INTERNAL_TOOLS = {
         PHASE_PLAN:    {"terminate", "replan", "complete_task", "fail_task", "confirm_plan", "fix_plan", "rag_search"},
-        PHASE_EXECUTE: {"replan", "complete_task", "fail_task", "fix_plan", "rag_search", "early_finish"},
+        PHASE_EXECUTE: {"replan", "complete_task", "fail_task", "fix_plan", "rag_search", "early_finish", "run_tools_parallel"},
         PHASE_REVIEW:  {"proceed_to_output", "replan", "fix_plan", "rag_search"},
         PHASE_OUTPUT:  {"rag_search"},
     }
@@ -841,6 +841,32 @@ class HelixAgentEngine:
                 },
             },
             "callable": self._tool_rag_search,
+            "type": "function",
+        }
+        self.all_tools_dict["run_tools_parallel"] = {
+            "spec": {
+                "name": "run_tools_parallel",
+                "description": "Execute multiple independent tool calls in parallel for faster results. Use this when you need to call 2+ tools that do not depend on each other (e.g., two searches, or a file read and a web fetch). Provide each call as {name: str, args: dict}.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "tool_calls": {
+                            "type": "array",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "name": {"type": "string", "description": "Tool function name to call"},
+                                    "args": {"type": "object", "description": "Arguments to pass to the tool"},
+                                },
+                                "required": ["name", "args"],
+                            },
+                            "description": "List of tool calls. Each item must have 'name' and 'args'. Example: [{\"name\": \"search_web\", \"args\": {\"query\": \"Python\"}}]",
+                        },
+                    },
+                    "required": ["tool_calls"],
+                },
+            },
+            "callable": self._tool_run_tools_parallel,
             "type": "function",
         }
 
@@ -1368,6 +1394,106 @@ class HelixAgentEngine:
         except Exception as rag_err:
             logger.error("RAG search failed: %s", rag_err)
             return json.dumps({"error": f"RAG search failed: {rag_err}"})
+
+    # ── Parallel Tool Execution ──
+
+    def _normalize_parallel_calls(self, tool_calls: list) -> list:
+        """Normalize and validate parallel tool call items."""
+        if not isinstance(tool_calls, list):
+            raise ValueError("tool_calls must be a list")
+        normalized = []
+        for i, call in enumerate(tool_calls):
+            if isinstance(call, str):
+                try:
+                    call = json.loads(call)
+                except json.JSONDecodeError:
+                    raise ValueError(f"tool_calls[{i}] is an unparseable string")
+            if not isinstance(call, dict):
+                raise ValueError(f"tool_calls[{i}] must be an object")
+            name = call.get("name", call.get("tool_name", ""))
+            if not name:
+                raise ValueError(f"tool_calls[{i}] missing 'name' field")
+            # Strip functions. prefix if present
+            if isinstance(name, str) and name.startswith("functions."):
+                name = name[len("functions."):]
+            # Resolve args / arguments / parameters
+            args = call.get("args", call.get("arguments", call.get("parameters", {})))
+            if isinstance(args, str):
+                try:
+                    args = json.loads(args)
+                except json.JSONDecodeError:
+                    args = {}
+            if not isinstance(args, dict):
+                args = {}
+            normalized.append({"name": name, "args": args})
+        return normalized
+
+    async def _execute_parallel_single(self, call_item: dict, call_id: str) -> dict:
+        """Execute a single tool call for parallel batching."""
+        tool_name = call_item["name"]
+        args = call_item["args"]
+        result_str, result_files = await self._execute_tool(tool_name, args, call_id)
+        # Track produced files
+        new_files = await self._append_produced_files(result_files)
+        if new_files and self.event_emitter:
+            await self.event_emitter({
+                "type": "chat:message:files",
+                "data": {"files": new_files},
+            })
+        # Try to parse JSON result back to native type for cleaner aggregation
+        parsed_result = result_str
+        if isinstance(result_str, str):
+            try:
+                parsed_result = json.loads(result_str)
+            except json.JSONDecodeError:
+                pass
+        return {
+            "tool_name": tool_name,
+            "result": parsed_result,
+        }
+
+    async def _tool_run_tools_parallel(self, tool_calls: list = None, **kwargs):
+        """Execute multiple independent tool calls in parallel."""
+        if not tool_calls:
+            return json.dumps({"error": "No tool_calls provided"})
+        try:
+            calls = self._normalize_parallel_calls(tool_calls)
+        except ValueError as e:
+            return json.dumps({"error": str(e)})
+
+        # Validate each tool exists in current phase
+        missing = []
+        for c in calls:
+            if c["name"] not in self.phase_tools_dict:
+                missing.append(c["name"])
+        if missing:
+            available = ", ".join(sorted(self.phase_tools_dict.keys())[:20])
+            return json.dumps({
+                "error": f"Tools not available in current phase: {', '.join(missing)}. Available: {available}",
+            })
+
+        # Emit status for each parallel sub-call
+        names = ", ".join(c["name"] for c in calls)
+        await self.emit_status(f"Running parallel: {names}...")
+
+        # Execute all in parallel
+        tasks = [
+            self._execute_parallel_single(c, f"{self.message_id or 'parallel'}_{i}")
+            for i, c in enumerate(calls)
+        ]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        processed = []
+        for i, res in enumerate(results):
+            if isinstance(res, Exception):
+                processed.append({
+                    "tool_name": calls[i]["name"],
+                    "result": f"Error: {res}",
+                })
+            else:
+                processed.append(res)
+
+        return json.dumps({"results": processed}, ensure_ascii=False)
 
     def _base_theme_js(self):
         return """
@@ -2014,8 +2140,34 @@ class HelixAgentEngine:
     # ── Main Loop ──
 
     async def _run_impl(self, user_msg, last_user_msg_raw, model):
-        await self.emit_status("Agent starting...")
         await self.resolve_tools()
+
+        # --- Debug mode intercept ---
+        if getattr(self.valves, "DEBUG_MODE", False):
+            msg_lower = (user_msg or "").strip().lower()
+            if msg_lower in ("show tools", "debug tools", "list tools"):
+                # Only external tools (exclude Helix internal control tools)
+                external_tools = sorted(
+                    name for name in self.all_tools_dict.keys()
+                    if name not in self.INTERNAL_TOOLS
+                )
+                tool_list = "\n".join(f"- {t}" for t in external_tools)
+                tool_csv = ", ".join(external_tools)
+                return f"**Available tools ({len(external_tools)}):**\n\n{tool_list}\n\n**Comma-separated:** {tool_csv}"
+            if msg_lower in ("show mcp", "debug mcp", "list mcp"):
+                mcp_tools = sorted(
+                    name for name, info in self.all_tools_dict.items()
+                    if info.get("type") == "mcp" and name not in self.INTERNAL_TOOLS
+                )
+                tool_list = "\n".join(f"- {t}" for t in mcp_tools)
+                tool_csv = ", ".join(mcp_tools)
+                return f"**Available MCP tools ({len(mcp_tools)}):**\n\n{tool_list}\n\n**Comma-separated:** {tool_csv}"
+            if msg_lower in ("show skills", "debug skills", "list skills"):
+                if self._skill_prompt:
+                    return f"**Injected skills prompt:**\n\n{self._skill_prompt}"
+                return "**No skills injected.**"
+
+        await self.emit_status("Agent starting...")
 
         # Attempt DB-backed state recovery at start of turn
         await self._recover_state_from_files(self.body if isinstance(self.body, dict) else {})
@@ -2427,6 +2579,23 @@ class HelixAgentEngine:
                         await self.emit_output(f"\n[PLAN] Plan approved. Moving to execution.\n\n{task_summary}\n")
                         continue
 
+                # ── Handle run_tools_parallel ──
+                if tool_name == "run_tools_parallel":
+                    result_json = await self._tool_run_tools_parallel(**args)
+                    result_data = json.loads(result_json)
+                    if result_data.get("error"):
+                        await self.emit_output(f"\n[ERR] **Parallel execution failed:** {result_data['error']}\n")
+                    else:
+                        executed_names = [r.get("tool_name", "?") for r in result_data.get("results", [])]
+                        await self.emit_output(f"\n[PAR] **Parallel done:** {', '.join(executed_names)}\n")
+                    self.history.append({
+                        "role": "tool",
+                        "content": result_json,
+                        "tool_call_id": call_id,
+                        "name": tool_name,
+                    })
+                    continue
+
                 # ── Duplicate detection ──
                 sig = f"{tool_name}:{json.dumps(args, sort_keys=True)}"
                 if recent_calls.count(sig) >= 2:
@@ -2575,6 +2744,10 @@ class HelixAgentEngine:
 
 class Pipe:
     class Valves(BaseModel):
+        DEBUG_MODE: bool = Field(
+            default=False,
+            description="Enable debug mode. When on, messages 'show tools', 'show mcp', or 'show skills' return the available items directly without any LLM call.",
+        )
         AGENT_MODEL: str = Field(
             default="",
             description="Model ID for Helix Agent. The model MUST support function calling (tool use). Examples: gpt-4o, claude-3.5-sonnet, gemini-2.0-flash."
@@ -2595,8 +2768,8 @@ class Pipe:
         PLAN_TOOLS: str = Field(
             default=(
                 "read_file, calculate_timestamp, fetch_url, get_current_timestamp, "
-                "glob_search, grep_search, list_files, list_knowledge_bases, "
-                "query_knowledge_bases, query_knowledge_files, search_knowledge_bases, search_knowledge_files, search_notes, "
+                "glob_search, grep_search, list_files, list_knowledge_bases, list_memories, "
+                "query_knowledge_bases, query_knowledge_files, search_knowledge_bases, search_knowledge_files, search_memories, search_notes, "
                 "search_papers, search_web, view_chat, view_knowledge_file, view_note, view_skill"
             ),
             description=(
@@ -2606,18 +2779,29 @@ class Pipe:
             )
         )
         EXECUTE_TOOLS: str = Field(
-            default="",
+            default=(
+                "add_memory, delete_memory, list_memories, replace_memory_content, search_memories, "
+                "bash_command, run_command, get_process_status, list_processes, "
+                "read_file, write_file, copy_file, move_file, delete_file, make_directory, compress_files, edit_file, "
+                "glob_search, grep_search, list_files, "
+                "fetch_url, get_current_timestamp, calculate_timestamp, "
+                "search_web, search_papers, search_notes, search_knowledge_bases, search_knowledge_files, search_memories, "
+                "search_chats, view_chat, view_note, view_knowledge_file, view_skill, "
+                "query_knowledge_bases, query_knowledge_files, list_knowledge_bases, list_memories, "
+                "calculate, render_visualization, display_file, show_map, get_weather_forecast, "
+                "github_create_branch, github_create_or_update_file, github_create_pull_request"
+            ),
             description=(
                 "Comma-separated tool names allowed in EXECUTE phase. "
                 "Leave EMPTY to allow ALL tools."
             )
-        )
+        ),
         REVIEW_TOOLS: str = Field(
             default=(
                 "read_file, calculate_timestamp, fetch_url, get_current_timestamp, get_process_status, run_command, "
-                "glob_search, grep_search, list_files, list_knowledge_bases, list_processes, "
+                "glob_search, grep_search, list_files, list_knowledge_bases, list_memories, list_processes, "
                 "query_knowledge_bases, query_knowledge_files, "
-                "search_chats, search_knowledge_bases, search_knowledge_files, search_notes, search_web, "
+                "search_chats, search_knowledge_bases, search_knowledge_files, search_memories, search_notes, search_web, "
                 "view_chat, view_knowledge_file, view_note, view_skill"
             ),
             description=(
@@ -2631,9 +2815,9 @@ class Pipe:
                 "show_map, get_weather_forecast, render_visualization, "
                 "list_files, read_file, display_file, grep_search, glob_search, "
                 "list_processes, get_process_status, get_current_timestamp, calculate_timestamp, "
-                "list_knowledge_bases, search_knowledge_bases, query_knowledge_bases, "
+                "list_knowledge_bases, list_memories, search_knowledge_bases, query_knowledge_bases, "
                 "search_knowledge_files, query_knowledge_files, view_knowledge_file, "
-                "search_chats, view_chat, search_notes, view_note, view_skill"
+                "search_chats, search_memories, view_chat, search_notes, view_note, view_skill"
             ),
             description=(
                 "Comma-separated tool names allowed in OUTPUT phase. "
