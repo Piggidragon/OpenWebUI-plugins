@@ -1,7 +1,7 @@
 """
 title: Helix Agent
 author: Piggidragon
-version: 0.20.3
+version: 0.21.0
 description: >
   Helix Agent — OpenWebUI-native agent loop with modular per-phase tool control.
 
@@ -115,6 +115,7 @@ Rules:
 - If a tool returns an error during planning (e.g., file not found), note the limitation in your plan. Do not call fix_plan for planning-stage errors.
 - If the user rejects your plan with feedback, revise the plan based on their feedback and call confirm_plan again with the updated plan. Do NOT repeat the same plan unchanged.
 - If the user cancels the plan, acknowledge it and stop.
+- Use the ask_user tool if you need clarification from the user (e.g., ambiguous request, missing details, unclear scope).
 - You may only use the tools listed above.
 """
 
@@ -188,6 +189,39 @@ DEFAULT_OUTPUT_FINAL_PROMPT = """\
 Write the final answer.
 
 Goal: {goal}
+"""
+
+DEFAULT_REPLAN_SKIP_PROMPT = """\
+You are in QUICK REPLAN mode. A previous session completed, and the user has a new request.
+
+PHASE: QUICK REPLAN
+
+Available tools: {tool_names}
+
+Recent context (previous goal):
+{goal}
+
+What to do:
+1. Review the previous goal and the user's new request.
+2. Create a minimal, focused task plan (1-3 tasks) that addresses the new request in the context of what was already done.
+3. Call confirm_plan with the updated plan.
+
+Plan format for confirm_plan:
+When calling confirm_plan, provide the plan parameter as a numbered list with one task per line:
+1. First task description
+2. Second task description
+
+Alternatively, you may provide the plan as JSON: {{"tasks": ["task 1", "task 2"]}}
+
+Rules:
+- Keep the plan short and actionable. 1-3 tasks maximum.
+- Re-use previous context where relevant.
+- Call exactly ONE tool per step.
+- When done, call confirm_plan to move to execution.
+- NEVER call terminate in QUICK REPLAN mode.
+- You may use the ask_user tool to ask the user a multiple-choice question if you need clarification.
+- You may only use the tools listed above.
+- ABSOLUTELY CRITICAL: You MUST call confirm_plan to finish QUICK REPLAN mode. Do NOT answer the user directly. Do NOT generate story text, code, or any other output. Only call tools.
 """
 
 
@@ -379,17 +413,20 @@ class HelixAgentEngine:
     PHASE_EXECUTE = "execute"
     PHASE_REVIEW = "review"
     PHASE_OUTPUT = "output"
+    PHASE_REPLAN_SKIP = "replan_skip"  # Quick replan when previous session finished
 
     MAX_HISTORY_MESSAGES = 50
+    MAX_REPLAN_SKIP_LOOPS = 3  # Safety net: max loops in quick replan phase
 
     # Internal tools that are ALWAYS available regardless of phase filters
     INTERNAL_TOOLS = {"terminate", "replan", "complete_task", "fail_task", "confirm_plan", "fix_plan", "rag_search", "proceed_to_output", "early_finish", "run_tools_parallel"}
 
     PHASE_INTERNAL_TOOLS = {
-        PHASE_PLAN:    {"terminate", "replan", "complete_task", "fail_task", "confirm_plan", "fix_plan", "rag_search"},
-        PHASE_EXECUTE: {"replan", "complete_task", "fail_task", "fix_plan", "rag_search", "early_finish", "run_tools_parallel"},
-        PHASE_REVIEW:  {"proceed_to_output", "replan", "fix_plan", "rag_search"},
-        PHASE_OUTPUT:  {"rag_search"},
+        PHASE_PLAN:       {"terminate", "replan", "complete_task", "fail_task", "confirm_plan", "fix_plan", "rag_search"},
+        PHASE_EXECUTE:    {"replan", "complete_task", "fail_task", "fix_plan", "rag_search", "early_finish", "run_tools_parallel"},
+        PHASE_REVIEW:     {"proceed_to_output", "replan", "fix_plan", "rag_search"},
+        PHASE_OUTPUT:     {"rag_search"},
+        PHASE_REPLAN_SKIP:{"confirm_plan", "rag_search", "ask_user"},  # Quick replan has minimal internal tools
     }
 
     def __init__(self, request, user, body, event_emitter, event_call, metadata, valves, user_valves=None):
@@ -427,6 +464,7 @@ class HelixAgentEngine:
         self._skill_prompt = ""
         self._mcp_clients: Dict[str, Any] = {}
         self._extra_grace = 0
+        self._plan_questions_asked = 0  # Counter for ask_user calls in PLAN/REPLAN_SKIP
 
     def _format_output(self):
         filtered = []
@@ -877,6 +915,31 @@ class HelixAgentEngine:
             "callable": self._tool_run_tools_parallel,
             "type": "function",
         }
+        self.all_tools_dict["ask_user"] = {
+            "spec": {
+                "name": "ask_user",
+                "description": "Ask the user an interactive question with selectable options and optional custom free-text input. Use this ONLY when you need clarification or a decision from the user before you can continue planning. NOT available in EXECUTE, REVIEW or OUTPUT phases.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "question": {"type": "string", "description": "The question to display to the user."},
+                        "options": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "List of 2–6 options for the user to pick from.",
+                        },
+                        "allow_custom": {
+                            "type": "boolean",
+                            "default": True,
+                            "description": "If true, the user can type a custom answer instead of picking an option.",
+                        },
+                    },
+                    "required": ["question", "options"],
+                },
+            },
+            "callable": self._tool_ask_user,
+            "type": "function",
+        }
 
     def _get_model_features(self, model_info):
         info = model_info.get("info", {}) or {}
@@ -1124,6 +1187,8 @@ class HelixAgentEngine:
 
         if phase == self.PHASE_PLAN:
             allowlist = set(_comma_list(self.valves.PLAN_TOOLS))
+        elif phase == self.PHASE_REPLAN_SKIP:
+            allowlist = set(_comma_list(self.valves.PLAN_TOOLS))  # Same tools as PLAN for quick replan
         elif phase == self.PHASE_EXECUTE:
             allowlist = set(_comma_list(self.valves.EXECUTE_TOOLS))
         elif phase == self.PHASE_REVIEW:
@@ -1142,6 +1207,12 @@ class HelixAgentEngine:
             # Internal tools are included ONLY if in phase_internal_tools
             if name in self.INTERNAL_TOOLS:
                 if name in phase_internal_tools:
+                    self.phase_tools_dict[name] = tool
+                continue
+
+            # ask_user is shown only in PLAN and REPLAN_SKIP phases (planning / clarification only)
+            if name == "ask_user":
+                if phase in (self.PHASE_PLAN, self.PHASE_REPLAN_SKIP):
                     self.phase_tools_dict[name] = tool
                 continue
 
@@ -1284,8 +1355,12 @@ class HelixAgentEngine:
         if uv and (getattr(uv, "YOLO_MODE", False) or not getattr(uv, "ENABLE_PLAN_APPROVAL", False)):
             return json.dumps({"action": "accept"})
 
+        # Auto-accept when in QUICK REPLAN phase to keep the skip flow fast
+        if self.phase == self.PHASE_REPLAN_SKIP:
+            return json.dumps({"action": "accept"})
+
         if not self.event_call:
-            return json.dumps({"action": "error", "error": "Plan confirmation required but unavailable (no event_call channel)."})
+            return json.dumps({"action": "accept"})
 
         # Task list extraction is deferred to the accept branch in _run_impl
         tasks = self._extract_task_list(plan_text)
@@ -1316,6 +1391,54 @@ class HelixAgentEngine:
             await self.emit_task_update()
             return json.dumps({"early_finish": True, "phase": "review", "reason": reason})
         return json.dumps({"early_finish": False, "error": f"Cannot early_finish from {self.phase}"})
+
+    async def _tool_ask_user(self, question: str, options: list, allow_custom: bool = True, **kwargs):
+        """Interactive user question tool. Only available during PLAN and QUICK REPLAN phases."""
+        if self.phase in (self.PHASE_PLAN, self.PHASE_REPLAN_SKIP):
+            self._plan_questions_asked += 1
+            max_questions = getattr(self.valves, "MAX_PLAN_QUESTIONS", 3)
+            if self._plan_questions_asked >= max_questions:
+                return json.dumps({
+                    "type": "error",
+                    "response": (
+                        f"CRITICAL: You have reached the maximum number of clarification questions "
+                        f"({max_questions}). You must NOT ask more questions. "
+                        "Call confirm_plan with your best plan NOW."
+                    ),
+                    "skipped": True,
+                })
+
+        if not self.event_call:
+            return json.dumps({"type": "error", "response": "Interactive input not available in this context.", "skipped": True})
+
+        if not options or not isinstance(options, list):
+            return json.dumps({"type": "error", "response": "Provide at least one option.", "skipped": True})
+
+        opts = [str(o) for o in options[:8]]
+        if not opts:
+            return json.dumps({"type": "error", "response": "Options list is empty.", "skipped": True})
+
+        js = self._build_ask_user_js(question=question, options=opts, allow_custom=allow_custom)
+        try:
+            raw = await self.event_call({"type": "execute", "data": {"code": js}})
+        except Exception as e:
+            logger.error(f"ask_user event_call failed: {e}")
+            return json.dumps({"type": "error", "response": f"Error getting user input: {e}", "skipped": True})
+
+        raw_str = raw if isinstance(raw, str) else (raw.get("result") or raw.get("value") or "{}") if raw else "{}"
+        try:
+            parsed = json.loads(raw_str) if isinstance(raw_str, str) and raw_str.startswith("{") else {}
+        except (json.JSONDecodeError, AttributeError):
+            parsed = {}
+
+        rtype = parsed.get("type")
+        if rtype == "select":
+            return json.dumps({"type": "select", "response": parsed.get("value", ""), "skipped": False})
+        elif rtype == "custom":
+            return json.dumps({"type": "custom", "response": parsed.get("value", ""), "skipped": False})
+        elif rtype == "skip":
+            return json.dumps({"type": "skip", "response": "User skipped the question.", "skipped": True})
+        return json.dumps({"type": "unknown", "response": f"User response: {raw_str}", "skipped": False})
 
     async def _tool_rag_search(self, file_id: str, query: str, top_k: int = 5, **kwargs):
         """RAG search: chunk, embed (if needed) and retrieve top_k chunks."""
@@ -1507,10 +1630,10 @@ class HelixAgentEngine:
     def _base_theme_js(self):
         return """
             const col = {
-                overlay: 'rgba(0,0,0,0.55)', panel: '#1e293b', border: '#334155',
-                text: '#f1f5f9', sub: '#94a3b8', input: '#0f172a', inputBorder: '#475569',
-                btn: '#334155', btnText: '#e2e8f0', btnBorder: '#475569',
-                btnPrimary: '#3b82f6', btnPrimaryText: '#ffffff',
+                overlay: 'rgba(0,0,0,0.62)', panel: '#1e1e2e', border: '#45475a',
+                text: '#cdd6f4', sub: '#a6adc8', input: '#313244', inputBorder: '#45475a',
+                btn: '#313244', btnText: '#cdd6f4', btnBorder: '#45475a',
+                btnPrimary: '#E8713A', btnPrimaryText: '#ffffff',
             };
             try { const s = getComputedStyle(document.documentElement);
               col.panel = s.getPropertyValue('--color-gray-900').trim() || col.panel;
@@ -1519,102 +1642,430 @@ class HelixAgentEngine:
             } catch(e) {}
         """
 
+    def _build_ask_user_js(self, question: str, options: list, allow_custom: bool = True) -> str:
+        q_safe = json.dumps(question)
+        opts_safe = json.dumps(options)
+        custom_js = "true" if allow_custom else "false"
+        return f"""
+    return (function(){{
+      return new Promise((resolve)=>{{
+    {self._base_theme_js()}
+        const question    = {q_safe};
+        const options     = {opts_safe};
+        const allowCustom = {custom_js};
+        const OVERLAY_ID  = '__owui_helix_ask_user__';
+
+        const existing = document.getElementById(OVERLAY_ID);
+        if (existing) existing.remove();
+
+        function finish(payload){{
+          panel.style.transform   = 'scale(0.95)';
+          panel.style.opacity     = '0';
+          overlay.style.opacity   = '0';
+          setTimeout(()=>{{
+            overlay.remove();
+            document.removeEventListener('keydown', onKey);
+            resolve(JSON.stringify(payload));
+          }},180);
+        }}
+
+        const overlay = document.createElement('div');
+        overlay.id = OVERLAY_ID;
+        Object.assign(overlay.style, {{
+          position:'fixed',inset:'0',zIndex:'999999',
+          background:col.overlay,
+          backdropFilter:'blur(12px)',WebkitBackdropFilter:'blur(12px)',
+          display:'flex',alignItems:'center',justifyContent:'center',
+          fontFamily:"-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif",
+          opacity:'0',transition:'opacity 0.18s ease',
+        }});
+
+        const panel = document.createElement('div');
+        Object.assign(panel.style, {{
+          background:col.panel,border:'1px solid '+col.border,
+          borderRadius:'16px',padding:'26px 26px 20px',
+          maxWidth:'520px',width:'calc(100vw - 32px)',
+          maxHeight:'85vh',overflowY:'auto',
+          boxShadow:'0 28px 80px rgba(0,0,0,0.65)',
+          display:'flex',flexDirection:'column',gap:'14px',
+          transform:'scale(0.92)',opacity:'0',
+          transition:'transform 0.22s cubic-bezier(0.34,1.56,0.64,1), opacity 0.18s ease',
+        }});
+
+        const header = document.createElement('div');
+        Object.assign(header.style, {{ display:'flex',alignItems:'flex-start',gap:'12px' }});
+        const questionEl = document.createElement('p');
+        Object.assign(questionEl.style, {{
+          margin:'0',color:col.text,fontSize:'15px',
+          fontWeight:'600',lineHeight:'1.55',flex:'1',wordBreak:'break-word',
+        }});
+        questionEl.textContent = question;
+        const badge = document.createElement('span');
+        Object.assign(badge.style, {{
+          flexShrink:'0',fontSize:'10px',fontWeight:'700',
+          letterSpacing:'0.07em',padding:'3px 9px',borderRadius:'99px',
+          background:col.btnPrimary+'26',color:col.btnPrimary,
+          marginTop:'2px',whiteSpace:'nowrap',
+        }});
+        badge.textContent = 'CHOOSE ONE';
+        header.appendChild(questionEl); header.appendChild(badge);
+
+        const optContainer = document.createElement('div');
+        Object.assign(optContainer.style, {{ display:'flex',flexDirection:'column',gap:'7px' }});
+
+        options.forEach(function(opt, i){{
+          const keyLabel = i < 26 ? String.fromCharCode(65 + i) : String(i + 1);
+
+          const btn = document.createElement('button');
+          Object.assign(btn.style, {{
+            display:'flex',alignItems:'center',gap:'11px',
+            background:col.btn,border:'1.5px solid '+col.btnBorder,
+            borderRadius:'10px',padding:'11px 13px',
+            cursor:'pointer',textAlign:'left',width:'100%',
+            minHeight:'48px',outline:'none',fontFamily:'inherit',boxSizing:'border-box',
+            transition:'background 0.12s, border-color 0.12s, transform 0.1s',
+          }});
+
+          const keyBadge = document.createElement('span');
+          Object.assign(keyBadge.style, {{
+            flexShrink:'0',width:'26px',height:'26px',
+            borderRadius:'6px',background:col.btnBorder,
+            display:'flex',alignItems:'center',justifyContent:'center',
+            fontSize:'11px',fontWeight:'700',color:col.btnPrimary,
+            transition:'background 0.12s, color 0.12s',userSelect:'none',
+          }});
+          keyBadge.textContent = keyLabel;
+
+          const textBlock = document.createElement('div');
+          Object.assign(textBlock.style, {{ flex:'1',minWidth:'0' }});
+          const optLabel = document.createElement('span');
+          Object.assign(optLabel.style, {{
+            display:'block',color:col.text,fontSize:'14px',
+            fontWeight:'500',wordBreak:'break-word',
+          }});
+          optLabel.textContent = opt;
+          textBlock.appendChild(optLabel);
+
+          const check = document.createElement('span');
+          Object.assign(check.style, {{
+            flexShrink:'0',fontSize:'15px',color:col.btnPrimary,
+            opacity:'0',transition:'opacity 0.12s',display:'none',
+          }});
+          check.textContent = '\u2713';
+
+          btn.appendChild(keyBadge); btn.appendChild(textBlock); btn.appendChild(check);
+
+          function applySelected(){{
+            btn.style.background    = col.btnPrimary+'1c';
+            btn.style.borderColor   = col.btnPrimary;
+            keyBadge.style.background = col.btnPrimary;
+            keyBadge.style.color    = '#ffffff';
+          }}
+          function applyDeselected(){{
+            btn.style.background    = col.btn;
+            btn.style.borderColor   = col.btnBorder;
+            keyBadge.style.background = col.btnBorder;
+            keyBadge.style.color    = col.btnPrimary;
+          }}
+
+          btn.addEventListener('mouseenter', function(){{
+            if (btn.dataset.selected !== '1'){{
+              btn.style.background  = '#3c3c52';
+              btn.style.borderColor = col.btnPrimary+'77';
+              btn.style.transform   = 'translateY(-1px)';
+            }}
+          }});
+          btn.addEventListener('mouseleave', function(){{
+            if (btn.dataset.selected !== '1') applyDeselected();
+            btn.style.transform = '';
+          }});
+
+          btn.addEventListener('click', function(){{
+            finish({{type:'select',index:i,value:opt}});
+          }});
+
+          optContainer.appendChild(btn);
+        }});
+
+        if (allowCustom){{
+          const customRow = document.createElement('div');
+          Object.assign(customRow.style, {{ display:'flex',gap:'7px',alignItems:'stretch' }});
+
+          const customInput = document.createElement('input');
+          customInput.type = 'text';
+          customInput.placeholder = 'Or type a custom answer\u2026';
+          Object.assign(customInput.style, {{
+            flex:'1',background:col.input,border:'1.5px solid '+col.inputBorder,
+            borderRadius:'8px',padding:'10px 12px',color:col.text,
+            fontSize:'14px',minHeight:'44px',outline:'none',
+            fontFamily:'inherit',transition:'border-color 0.12s',
+            boxSizing:'border-box',
+          }});
+          customInput.addEventListener('focus', ()=>{{ customInput.style.borderColor=col.btnPrimary; }});
+          customInput.addEventListener('blur', ()=>{{ customInput.style.borderColor=customInput.value?col.btnPrimary:col.inputBorder; }});
+          customInput.addEventListener('keydown', function(e){{
+            if (e.key==='Enter' \u0026\u0026 customInput.value.trim()){{
+              e.stopPropagation();
+              finish({{type:'custom',value:customInput.value.trim()}});
+            }}
+          }});
+
+          const sendBtn = document.createElement('button');
+          sendBtn.title = 'Submit custom answer (Enter)';
+          Object.assign(sendBtn.style, {{
+            background:col.btnPrimary,border:'none',borderRadius:'8px',
+            padding:'10px 16px',cursor:'pointer',fontSize:'16px',
+            color:col.btnPrimaryText,fontWeight:'700',minHeight:'44px',
+            flexShrink:'0',transition:'opacity 0.12s, transform 0.1s',
+            fontFamily:'inherit',
+          }});
+          sendBtn.textContent = '\u21b5';
+          sendBtn.addEventListener('mouseenter', ()=>{{ sendBtn.style.transform='scale(1.08)'; }});
+          sendBtn.addEventListener('mouseleave', ()=>{{ sendBtn.style.transform=''; }});
+          sendBtn.addEventListener('click', ()=>{{
+            if (customInput.value.trim()){{
+              finish({{type:'custom',value:customInput.value.trim()}});
+            }}
+          }});
+
+          customRow.appendChild(customInput); customRow.appendChild(sendBtn);
+          optContainer.appendChild(customRow);
+        }}
+
+        const footer = document.createElement('div');
+        Object.assign(footer.style, {{ display:'flex',gap:'8px',justifyContent:'flex-end',marginTop:'2px' }});
+
+        const skipBtn = document.createElement('button');
+        skipBtn.textContent = 'Skip';
+        Object.assign(skipBtn.style, {{
+          background:'transparent',border:'1.5px solid '+col.btnBorder,
+          borderRadius:'8px',padding:'9px 18px',color:'#6c7086',
+          fontSize:'13px',cursor:'pointer',fontFamily:'inherit',
+          transition:'border-color 0.12s, color 0.12s',
+        }});
+        skipBtn.addEventListener('mouseenter', ()=>{{ skipBtn.style.borderColor='#9399b2'; skipBtn.style.color=col.text; }});
+        skipBtn.addEventListener('mouseleave', ()=>{{ skipBtn.style.borderColor=col.btnBorder; skipBtn.style.color='#6c7086'; }});
+        skipBtn.addEventListener('click', ()=>{{ finish({{type:'skip'}}); }});
+        footer.appendChild(skipBtn);
+
+        function onKey(e){{
+          if (e.key==='Escape'){{ skipBtn.click(); return; }}
+        }}
+        document.addEventListener('keydown', onKey);
+
+        panel.appendChild(header); panel.appendChild(optContainer); panel.appendChild(footer);
+        overlay.appendChild(panel); document.body.appendChild(overlay);
+
+        requestAnimationFrame(()=>{{
+          requestAnimationFrame(()=>{{
+            overlay.style.opacity='1';
+            panel.style.transform='scale(1)';
+            panel.style.opacity='1';
+          }});
+        }});
+      }});
+    }})();
+"""
+
     def _build_plan_approval_js(self, tasks: list, timeout_s: int = 600) -> str:
         ts = json.dumps(tasks)
         return f"""
-    return (function() {{
-      return new Promise((resolve) => {{
+    return (function(){{
+      return new Promise((resolve)=>{{
     {self._base_theme_js()}
         let _timer;
+        const OVERLAY_ID = '__owui_helix_plan__';
+        const existing = document.getElementById(OVERLAY_ID);
+        if (existing) existing.remove();
+
         const overlay = document.createElement('div');
-        overlay.style.cssText = `position:fixed;inset:0;z-index:999999;background:${{col.overlay}};display:flex;align-items:center;justify-content:center;padding:20px;backdrop-filter:blur(4px);`;
+        overlay.id = OVERLAY_ID;
+        Object.assign(overlay.style, {{
+          position:'fixed',inset:'0',zIndex:'999999',
+          background:col.overlay,
+          backdropFilter:'blur(12px)',WebkitBackdropFilter:'blur(12px)',
+          display:'flex',alignItems:'center',justifyContent:'center',
+          fontFamily:"-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif",
+          opacity:'0',transition:'opacity 0.18s ease',
+        }});
+
         const panel = document.createElement('div');
-        panel.style.cssText = `background:${{col.panel}};border:1px solid ${{col.border}};border-radius:20px;box-shadow:0 20px 60px rgba(0,0,0,0.3);color:${{col.text}};font-family:ui-sans-serif,system-ui,sans-serif;width:100%;max-width:520px;max-height:90vh;padding:32px;display:flex;flex-direction:column;gap:24px;`;
+        Object.assign(panel.style, {{
+          background:col.panel,border:'1px solid '+col.border,
+          borderRadius:'16px',padding:'26px 26px 20px',
+          maxWidth:'520px',width:'calc(100vw - 32px)',
+          maxHeight:'85vh',overflowY:'auto',
+          boxShadow:'0 28px 80px rgba(0,0,0,0.65)',
+          display:'flex',flexDirection:'column',gap:'14px',
+          transform:'scale(0.92)',opacity:'0',
+          transition:'transform 0.22s cubic-bezier(0.34,1.56,0.64,1), opacity 0.18s ease',
+        }});
 
         const header = document.createElement('div');
-        header.style.cssText = 'display:flex;align-items:center;gap:12px;flex-shrink:0;';
-        const icon = document.createElement('div'); icon.textContent = '\uD83D\uDCCB'; icon.style.cssText = 'font-size:24px;';
-        const title = document.createElement('div'); title.textContent = 'Review Proposed Plan'; title.style.cssText = `font-size:20px;font-weight:800;color:${{col.text}};letter-spacing:-0.4px;`;
-        header.appendChild(icon); header.appendChild(title); panel.appendChild(header);
+        Object.assign(header.style, {{ display:'flex',alignItems:'flex-start',gap:'12px' }});
+        const iconBlock = document.createElement('div');
+        iconBlock.textContent = '\uD83D\uDCCB';
+        Object.assign(iconBlock.style, {{ fontSize:'22px',flexShrink:'0',marginTop:'2px' }});
+        const titleText = document.createElement('p');
+        Object.assign(titleText.style, {{
+          margin:'0',color:col.text,fontSize:'16px',
+          fontWeight:'700',lineHeight:'1.4',flex:'1',wordBreak:'break-word',
+        }});
+        titleText.textContent = 'Review Proposed Plan';
+        const badge = document.createElement('span');
+        Object.assign(badge.style, {{
+          flexShrink:'0',fontSize:'10px',fontWeight:'700',
+          letterSpacing:'0.07em',padding:'3px 9px',borderRadius:'99px',
+          background:col.btnPrimary+'26',color:col.btnPrimary,
+          marginTop:'2px',whiteSpace:'nowrap',
+        }});
+        badge.textContent = 'PLAN REVIEW';
+        header.appendChild(iconBlock); header.appendChild(titleText); header.appendChild(badge);
 
         const scrollContainer = document.createElement('div');
-        scrollContainer.style.cssText = 'overflow-y:auto;flex:1;display:flex;flex-direction:column;gap:12px;padding-right:8px;';
+        Object.assign(scrollContainer.style, {{
+          overflowY:'auto',flex:'1',display:'flex',flexDirection:'column',gap:'7px',
+          paddingRight:'4px',
+        }});
 
         const tasksData = {ts};
-        tasksData.forEach((t, i) => {{
+        tasksData.forEach((t,i)=>{{
             const card = document.createElement('div');
-            card.style.cssText = `background:${{col.input}};border:1px solid ${{col.inputBorder}};border-radius:12px;padding:12px 16px;display:flex;gap:12px;align-items:flex-start;`;
-
-            const num = document.createElement('div');
-            num.textContent = i + 1;
-            num.style.cssText = `width:24px;height:24px;background:${{col.btnPrimary}};color:${{col.btnPrimaryText}};border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:bold;flex-shrink:0;margin-top:2px;`;
-
+            Object.assign(card.style, {{
+              display:'flex',alignItems:'flex-start',gap:'12px',
+              background:col.input,border:'1.5px solid '+col.inputBorder,
+              borderRadius:'10px',padding:'11px 13px',
+              minHeight:'48px',transition:'background 0.12s, border-color 0.12s',
+            }});
+            const num = document.createElement('span');
+            Object.assign(num.style, {{
+              flexShrink:'0',width:'26px',height:'26px',
+              borderRadius:'6px',background:col.btnPrimary,
+              display:'flex',alignItems:'center',justifyContent:'center',
+              fontSize:'11px',fontWeight:'700',color:col.btnPrimaryText,
+              marginTop:'2px',
+            }});
+            num.textContent = String(i+1);
             const content = document.createElement('div');
-            content.style.cssText = 'display:flex;flex-direction:column;gap:4px;';
-            const tid = document.createElement('div'); tid.textContent = t.task_id; tid.style.cssText = `font-size:11px;font-weight:bold;color:${{col.sub}};text-transform:uppercase;`;
-            const desc = document.createElement('div'); desc.textContent = t.description; desc.style.cssText = `font-size:14px;color:${{col.text}};line-height:1.4;`;
-
+            Object.assign(content.style, {{ display:'flex',flexDirection:'column',gap:'4px',flex:'1',minWidth:'0' }});
+            const tid = document.createElement('span');
+            Object.assign(tid.style, {{
+              fontSize:'11px',fontWeight:'700',color:col.sub,
+              textTransform:'uppercase',letterSpacing:'0.05em',
+            }});
+            tid.textContent = t.task_id;
+            const desc = document.createElement('span');
+            Object.assign(desc.style, {{
+              fontSize:'14px',color:col.text,lineHeight:'1.5',wordBreak:'break-word',
+            }});
+            desc.textContent = t.description;
             content.appendChild(tid); content.appendChild(desc);
             card.appendChild(num); card.appendChild(content);
             scrollContainer.appendChild(card);
         }});
-        panel.appendChild(scrollContainer);
 
         const inputContainer = document.createElement('div');
-        inputContainer.style.cssText = 'display:flex;flex-direction:column;gap:10px;flex-shrink:0;';
-        const inputLabel = document.createElement('div'); inputLabel.textContent = 'Feedback (optional):'; inputLabel.style.cssText = `font-size:12px;font-weight:700;color:${{col.sub}};text-transform:uppercase;letter-spacing:0.5px;`;
+        Object.assign(inputContainer.style, {{ display:'flex',flexDirection:'column',gap:'8px' }});
+        const inputLabel = document.createElement('div');
+        inputLabel.textContent = 'Feedback (optional):';
+        Object.assign(inputLabel.style, {{
+          fontSize:'11px',fontWeight:'700',color:col.sub,
+          textTransform:'uppercase',letterSpacing:'0.06em',
+        }});
         const feedbackInput = document.createElement('textarea');
-        feedbackInput.placeholder = 'e.g., "Add a step to check for X" or "Skip the second task"';
-        feedbackInput.style.cssText = `background:${{col.input}};border:1px solid ${{col.inputBorder}};color:${{col.text}};padding:14px;border-radius:14px;font-size:14px;outline:none;min-height:70px;resize:none;transition:border-color 0.2s;`;
-        feedbackInput.onfocus = () => feedbackInput.style.borderColor = 'var(--color-blue-500)';
-        feedbackInput.onblur = () => feedbackInput.style.borderColor = col.inputBorder;
-        inputContainer.appendChild(inputLabel); inputContainer.appendChild(feedbackInput); panel.appendChild(inputContainer);
+        feedbackInput.placeholder = 'e.g., \"Add a step to check for X\" or \"Skip the second task\"';
+        Object.assign(feedbackInput.style, {{
+          background:col.input,border:'1.5px solid '+col.inputBorder,
+          color:col.text,padding:'12px 14px',
+          borderRadius:'10px',fontSize:'14px',outline:'none',
+          minHeight:'64px',resize:'none',
+          fontFamily:'inherit',boxSizing:'border-box',
+          transition:'border-color 0.15s',
+        }});
+        feedbackInput.addEventListener('focus', ()=>{{ feedbackInput.style.borderColor=col.btnPrimary; }});
+        feedbackInput.addEventListener('blur', ()=>{{ feedbackInput.style.borderColor=col.inputBorder; }});
+        inputContainer.appendChild(inputLabel); inputContainer.appendChild(feedbackInput);
 
         const footer = document.createElement('div');
-        footer.style.cssText = 'display:flex;gap:12px;flex-shrink:0;';
+        Object.assign(footer.style, {{ display:'flex',gap:'8px',justifyContent:'flex-end',marginTop:'2px' }});
 
-        const makeBtn = (label, primary) => {{
-            const b = document.createElement('button');
-            b.textContent = label;
-            b.style.cssText = `flex:1;padding:14px 20px;border-radius:9999px;font-size:15px;font-weight:700;cursor:pointer;transition:all 0.2s;border:1px solid ${{primary ? 'transparent' : col.btnBorder}};background:${{primary ? col.btnPrimary : col.btn}};color:${{primary ? col.btnPrimaryText : col.btnText}};`;
-            b.onmouseenter = () => {{ b.style.opacity='0.9'; b.style.transform='translateY(-1px)'; }};
-            b.onmouseleave = () => {{ b.style.opacity='1'; b.style.transform='translateY(0)'; }};
-            return b;
+        function makeBtn(label,primary){{
+          const b = document.createElement('button');
+          b.textContent = label;
+          Object.assign(b.style, {{
+            padding:'10px 18px',borderRadius:'8px',
+            fontSize:'13px',fontWeight:'700',
+            cursor:'pointer',fontFamily:'inherit',
+            border:'1.5px solid '+(primary?'transparent':col.btnBorder),
+            background:primary?col.btnPrimary:col.btn,
+            color:primary?col.btnPrimaryText:col.btnText,
+            transition:'opacity 0.12s, transform 0.1s, border-color 0.12s',
+          }});
+          b.addEventListener('mouseenter', ()=>{{ b.style.opacity='0.9'; b.style.transform='translateY(-1px)'; }});
+          b.addEventListener('mouseleave', ()=>{{ b.style.opacity='1'; b.style.transform=''; }});
+          return b;
+        }}
+
+        const acceptBtn = makeBtn('Accept Plan',true);
+        const feedbackBtn = makeBtn('Send Feedback',false);
+        const cancelBtn = makeBtn('Cancel',false);
+        Object.assign(cancelBtn.style, {{
+          background:'#313244',color:'#f38ba8',borderColor:'#f38ba8',
+        }});
+        cancelBtn.addEventListener('mouseenter', ()=>{{ cancelBtn.style.opacity='0.85'; cancelBtn.style.transform='translateY(-1px)'; }});
+        cancelBtn.addEventListener('mouseleave', ()=>{{ cancelBtn.style.opacity='1'; cancelBtn.style.transform=''; }});
+
+        const cleanup = ()=>{{
+          panel.style.transform='scale(0.95)';
+          panel.style.opacity='0';
+          overlay.style.opacity='0';
+          setTimeout(()=>{{
+            overlay.remove();
+            document.removeEventListener('keydown',onKey);
+          }},180);
         }};
 
-        const acceptBtn = makeBtn('Accept Plan', true);
-        const feedbackBtn = makeBtn('Send Feedback', false);
-        const cancelBtn = makeBtn('Cancel', false);
-        cancelBtn.style.background = '#7f1d1d';
-        cancelBtn.style.color = '#fecaca';
-        cancelBtn.style.borderColor = '#991b1b';
-
-        const cleanup = () => {{ overlay.remove(); }};
-
-        acceptBtn.onclick = () => {{ clearTimeout(_timer); cleanup(); resolve(JSON.stringify({{action:'accept'}})); }};
-        feedbackBtn.onclick = () => {{
+        acceptBtn.addEventListener('click', ()=>{{ clearTimeout(_timer); cleanup(); resolve(JSON.stringify({{action:'accept'}})); }});
+        feedbackBtn.addEventListener('click', ()=>{{
             const val = feedbackInput.value.trim();
-            if (val) {{ clearTimeout(_timer); cleanup(); resolve(JSON.stringify({{action:'feedback', value: val}})); }}
-            else {{ acceptBtn.onclick(); }}
-        }};
-        cancelBtn.onclick = () => {{ clearTimeout(_timer); cleanup(); resolve(JSON.stringify({{action:'cancel'}})); }};
+            if (val){{ clearTimeout(_timer); cleanup(); resolve(JSON.stringify({{action:'feedback',value:val}})); }}
+            else {{ acceptBtn.click(); }}
+        }});
+        cancelBtn.addEventListener('click', ()=>{{ clearTimeout(_timer); cleanup(); resolve(JSON.stringify({{action:'cancel'}})); }});
 
-        footer.appendChild(acceptBtn); footer.appendChild(feedbackBtn); footer.appendChild(cancelBtn); panel.appendChild(footer);
+        footer.appendChild(cancelBtn); footer.appendChild(feedbackBtn); footer.appendChild(acceptBtn);
 
         const countdown = document.createElement('div');
-        countdown.style.cssText = `font-size:11px;color:${{col.sub}};text-align:center;margin-top:-12px;flex-shrink:0;`;
-        panel.appendChild(countdown);
+        countdown.textContent = '';
+        Object.assign(countdown.style, {{
+          fontSize:'11px',color:col.sub,textAlign:'center',minHeight:'16px',
+        }});
 
+        function onKey(e){{
+          if (e.key==='Escape'){{ cancelBtn.click(); return; }}
+          if (e.key==='Enter' && e.metaKey){{ acceptBtn.click(); return; }}
+        }}
+        document.addEventListener('keydown',onKey);
+
+        panel.appendChild(header); panel.appendChild(scrollContainer); panel.appendChild(inputContainer); panel.appendChild(footer); panel.appendChild(countdown);
         overlay.appendChild(panel); document.body.appendChild(overlay);
         feedbackInput.focus();
 
+        requestAnimationFrame(()=>{{
+          requestAnimationFrame(()=>{{
+            overlay.style.opacity='1';
+            panel.style.transform='scale(1)';
+            panel.style.opacity='1';
+          }});
+        }});
+
         let remaining = {timeout_s};
-        const updateCountdown = () => {{
-            countdown.textContent = remaining > 0 ? `Auto-stopping in ${{remaining}}s...` : '';
-            if (remaining <= 0) {{ cleanup(); resolve(JSON.stringify({{action:'timeout'}})); }}
-        }};
+        function updateCountdown(){{
+            countdown.textContent = remaining>0 ? 'Auto-accepting in '+remaining+'s...' : '';
+            if (remaining<=0){{ cleanup(); resolve(JSON.stringify({{action:'accept'}})); }}
+        }}
         updateCountdown();
-        _timer = setInterval(() => {{ remaining--; updateCountdown(); }}, 1000);
+        _timer = setInterval(()=>{{ remaining--; updateCountdown(); }},1000);
       }});
     }})();"""
 
@@ -1623,56 +2074,134 @@ class HelixAgentEngine:
     def _build_iteration_limit_js(self, current_iter, max_iter, timeout_s: int = 300) -> str:
         """Build a Continue/Cancel modal for iteration limit reached."""
         return f"""
-    return (function() {{
-      return new Promise((resolve) => {{
+    return (function(){{
+      return new Promise((resolve)=>{{
     {self._base_theme_js()}
+        const OVERLAY_ID = '__owui_helix_limit__';
+        const existing = document.getElementById(OVERLAY_ID);
+        if (existing) existing.remove();
+
         const overlay = document.createElement('div');
-        overlay.style.cssText = `position:fixed;inset:0;z-index:999999;background:${{col.overlay}};display:flex;align-items:center;justify-content:center;padding:20px;backdrop-filter:blur(4px);`;
+        overlay.id = OVERLAY_ID;
+        Object.assign(overlay.style, {{
+          position:'fixed',inset:'0',zIndex:'999999',
+          background:col.overlay,
+          backdropFilter:'blur(12px)',WebkitBackdropFilter:'blur(12px)',
+          display:'flex',alignItems:'center',justifyContent:'center',
+          fontFamily:"-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif",
+          opacity:'0',transition:'opacity 0.18s ease',
+        }});
+
         const panel = document.createElement('div');
-        panel.style.cssText = `background:${{col.panel}};border:1px solid ${{col.border}};border-radius:20px;box-shadow:0 20px 60px rgba(0,0,0,0.3);color:${{col.text}};font-family:ui-sans-serif,system-ui,sans-serif;width:100%;max-width:440px;padding:32px;display:flex;flex-direction:column;gap:20px;`;
+        Object.assign(panel.style, {{
+          background:col.panel,border:'1px solid '+col.border,
+          borderRadius:'16px',padding:'26px 26px 20px',
+          maxWidth:'440px',width:'calc(100vw - 32px)',
+          boxShadow:'0 28px 80px rgba(0,0,0,0.65)',
+          display:'flex',flexDirection:'column',gap:'14px',
+          transform:'scale(0.92)',opacity:'0',
+          transition:'transform 0.22s cubic-bezier(0.34,1.56,0.64,1), opacity 0.18s ease',
+        }});
 
         const header = document.createElement('div');
-        header.style.cssText = 'display:flex;align-items:center;gap:12px;';
-        const icon = document.createElement('div'); icon.textContent = '⚠️'; icon.style.cssText = 'font-size:24px;';
-        const title = document.createElement('div'); title.textContent = 'Iteration Limit Reached'; title.style.cssText = `font-size:18px;font-weight:800;color:${{col.text}};`;
-        header.appendChild(icon); header.appendChild(title); panel.appendChild(header);
+        Object.assign(header.style, {{ display:'flex',alignItems:'flex-start',gap:'12px' }});
+        const iconBlock = document.createElement('div');
+        iconBlock.textContent = '\u26A0\uFE0F';
+        Object.assign(iconBlock.style, {{ fontSize:'22px',flexShrink:'0',marginTop:'2px' }});
+        const titleText = document.createElement('p');
+        Object.assign(titleText.style, {{
+          margin:'0',color:col.text,fontSize:'16px',
+          fontWeight:'700',lineHeight:'1.4',flex:'1',wordBreak:'break-word',
+        }});
+        titleText.textContent = 'Iteration Limit Reached';
+        const badge = document.createElement('span');
+        Object.assign(badge.style, {{
+          flexShrink:'0',fontSize:'10px',fontWeight:'700',
+          letterSpacing:'0.07em',padding:'3px 9px',borderRadius:'99px',
+          background:col.btnPrimary+'26',color:col.btnPrimary,
+          marginTop:'2px',whiteSpace:'nowrap',
+        }});
+        badge.textContent = 'LIMIT';
+        header.appendChild(iconBlock); header.appendChild(titleText); header.appendChild(badge);
 
-        const msg = document.createElement('div');
-        msg.style.cssText = `font-size:14px;color:${{col.sub}};line-height:1.5;`;
+        const msg = document.createElement('p');
+        Object.assign(msg.style, {{
+          margin:'0',color:col.sub,fontSize:'14px',lineHeight:'1.55',wordBreak:'break-word',
+        }});
         msg.textContent = `The agent has used {current_iter} of {max_iter} iterations. Continue for more?`;
-        panel.appendChild(msg);
-
-        const countdown = document.createElement('div');
-        countdown.style.cssText = `font-size:11px;color:${{col.sub}};text-align:center;margin-top:-8px;`;
-        panel.appendChild(countdown);
 
         const footer = document.createElement('div');
-        footer.style.cssText = 'display:flex;gap:10px;';
-        const makeBtn = (label, primary) => {{
-            const b = document.createElement('button');
-            b.textContent = label;
-            b.style.cssText = `flex:1;padding:12px 18px;border-radius:9999px;font-size:14px;font-weight:700;cursor:pointer;border:1px solid ${{primary ? 'transparent' : col.btnBorder}};background:${{primary ? col.btnPrimary : col.btn}};color:${{primary ? col.btnPrimaryText : col.btnText}};`;
-            b.onmouseenter = () => {{ b.style.opacity='0.9'; }};
-            b.onmouseleave = () => {{ b.style.opacity='1'; }};
-            return b;
-        }};
-        const continueBtn = makeBtn('Continue', true);
-        const stopBtn = makeBtn('Stop', false);
-        const cleanup = () => {{ overlay.remove(); }};
-        let _timer;
-        continueBtn.onclick = () => {{ clearTimeout(_timer); cleanup(); resolve(JSON.stringify({{action:'continue'}})); }};
-        stopBtn.onclick = () => {{ clearTimeout(_timer); cleanup(); resolve(JSON.stringify({{action:'stop'}})); }};
-        footer.appendChild(continueBtn); footer.appendChild(stopBtn); panel.appendChild(footer);
+        Object.assign(footer.style, {{ display:'flex',gap:'8px',justifyContent:'flex-end',marginTop:'2px' }});
 
+        function makeBtn(label,primary){{
+          const b = document.createElement('button');
+          b.textContent = label;
+          Object.assign(b.style, {{
+            padding:'10px 18px',borderRadius:'8px',
+            fontSize:'13px',fontWeight:'700',
+            cursor:'pointer',fontFamily:'inherit',
+            border:'1.5px solid '+(primary?'transparent':col.btnBorder),
+            background:primary?col.btnPrimary:col.btn,
+            color:primary?col.btnPrimaryText:col.btnText,
+            transition:'opacity 0.12s, transform 0.1s, border-color 0.12s',
+          }});
+          b.addEventListener('mouseenter', ()=>{{ b.style.opacity='0.9'; b.style.transform='translateY(-1px)'; }});
+          b.addEventListener('mouseleave', ()=>{{ b.style.opacity='1'; b.style.transform=''; }});
+          return b;
+        }}
+
+        const continueBtn = makeBtn('Continue',true);
+        const stopBtn = makeBtn('Stop',false);
+        Object.assign(stopBtn.style, {{ background:'#313244',color:'#f38ba8',borderColor:'#f38ba8' }});
+        stopBtn.addEventListener('mouseenter', ()=>{{ stopBtn.style.opacity='0.85'; stopBtn.style.transform='translateY(-1px)'; }});
+        stopBtn.addEventListener('mouseleave', ()=>{{ stopBtn.style.opacity='1'; stopBtn.style.transform=''; }});
+
+        const cleanup = ()=>{{
+          panel.style.transform='scale(0.95)';
+          panel.style.opacity='0';
+          overlay.style.opacity='0';
+          setTimeout(()=>{{
+            overlay.remove();
+            document.removeEventListener('keydown',onKey);
+          }},180);
+        }};
+
+        let _timer;
+        continueBtn.addEventListener('click', ()=>{{ clearTimeout(_timer); cleanup(); resolve(JSON.stringify({{action:'continue'}})); }});
+        stopBtn.addEventListener('click', ()=>{{ clearTimeout(_timer); cleanup(); resolve(JSON.stringify({{action:'stop'}})); }});
+
+        footer.appendChild(stopBtn); footer.appendChild(continueBtn);
+
+        const countdown = document.createElement('div');
+        countdown.textContent = '';
+        Object.assign(countdown.style, {{
+          fontSize:'11px',color:col.sub,textAlign:'center',minHeight:'16px',
+        }});
+
+        function onKey(e){{
+          if (e.key==='Escape'){{ stopBtn.click(); return; }}
+          if (e.key==='Enter' || e.key===' '){{ e.preventDefault(); continueBtn.click(); return; }}
+        }}
+        document.addEventListener('keydown',onKey);
+
+        panel.appendChild(header); panel.appendChild(msg); panel.appendChild(footer); panel.appendChild(countdown);
         overlay.appendChild(panel); document.body.appendChild(overlay);
 
+        requestAnimationFrame(()=>{{
+          requestAnimationFrame(()=>{{
+            overlay.style.opacity='1';
+            panel.style.transform='scale(1)';
+            panel.style.opacity='1';
+          }});
+        }});
+
         let remaining = {timeout_s};
-        const updateCountdown = () => {{
-            countdown.textContent = remaining > 0 ? `Auto-stopping in ${{remaining}}s...` : '';
-            if (remaining <= 0) {{ cleanup(); resolve(JSON.stringify({{action:'stop'}})); }}
-        }};
+        function updateCountdown(){{
+            countdown.textContent = remaining>0 ? 'Auto-stopping in '+remaining+'s...' : '';
+            if (remaining<=0){{ cleanup(); resolve(JSON.stringify({{action:'stop'}})); }}
+        }}
         updateCountdown();
-        _timer = setInterval(() => {{ remaining--; updateCountdown(); }}, 1000);
+        _timer = setInterval(()=>{{ remaining--; updateCountdown(); }},1000);
       }});
     }})();"""
 
@@ -1975,6 +2504,8 @@ class HelixAgentEngine:
         try:
             if self.phase == self.PHASE_PLAN:
                 base = (self.valves.PLAN_PROMPT or DEFAULT_PLAN_PROMPT).format(tool_names=tool_names)
+            elif self.phase == self.PHASE_REPLAN_SKIP:
+                base = DEFAULT_REPLAN_SKIP_PROMPT.format(tool_names=tool_names, goal=self.goal)
             elif self.phase == self.PHASE_EXECUTE:
                 base = (self.valves.EXECUTE_PROMPT or DEFAULT_EXECUTE_PROMPT).format(tool_names=tool_names, task_state=task_state)
             elif self.phase == self.PHASE_REVIEW:
@@ -1990,6 +2521,8 @@ class HelixAgentEngine:
             # User-provided prompt may have stray braces; fall back to default
             if self.phase == self.PHASE_PLAN:
                 base = DEFAULT_PLAN_PROMPT.format(tool_names=tool_names)
+            elif self.phase == self.PHASE_REPLAN_SKIP:
+                base = DEFAULT_REPLAN_SKIP_PROMPT.format(tool_names=tool_names, goal=self.goal)
             elif self.phase == self.PHASE_EXECUTE:
                 base = DEFAULT_EXECUTE_PROMPT.format(tool_names=tool_names, task_state=task_state)
             elif self.phase == self.PHASE_REVIEW:
@@ -2181,36 +2714,59 @@ class HelixAgentEngine:
         # Attempt DB-backed state recovery at start of turn
         await self._recover_state_from_files(self.body if isinstance(self.body, dict) else {})
 
-        # After recovery, clamp loop_count so the iteration-limit modal
-        # doesn't fire immediately on re-entry (give a small buffer before hitting the limit)
-        if self.goal and self.task_list:
+        # After recovery, decide whether to continue the old session or start fresh.
+        # If every task is completed or failed, treat this as a brand-new request.
+        has_remaining_tasks = False
+        if self.task_list:
+            failed_names = {f["task"] for f in self.failed_tasks}
+            remaining = [
+                t for t in self.task_list
+                if t not in self.completed_tasks and t not in failed_names
+            ]
+            has_remaining_tasks = bool(remaining)
+
+        if self.goal and self.task_list and has_remaining_tasks:
+            # State was restored and there are still open tasks - continue execution
             max_allowed = max(0, self.valves.MAX_ITERATIONS - 5)
             if self.loop_count > max_allowed:
                 logger.info(f"Clamped loop_count from {self.loop_count} to {max_allowed} after state restore.")
                 self.loop_count = max_allowed
-
-        self.consecutive_json_errors = 0
-
-        if self.goal and self.task_list:
-            # State was restored from file attachment
             self.goal = f"{self.goal}; Updated: {user_msg}"
-            # Refresh the system prompt (phase may have changed)
             if self.history and self.history[0].get("role") == "system":
                 self.history[0]["content"] = self._build_system_prompt()
             else:
                 self.history.insert(0, {"role": "system", "content": self._build_system_prompt()})
             self.history.append({"role": "user", "content": user_msg})
-            # Filter tools for the restored phase
             self._filter_tools_for_phase(self.phase)
-            # Restore task list UI so it is visible immediately on re-entering the chat
+            await self.emit_task_update()
+        elif self.goal and self.task_list and not has_remaining_tasks and self.user_valves and getattr(self.user_valves, "SKIP_PLAN_ON_RESUME", True):
+            # Previous session finished. Use Quick Replan phase to let the agent plan the new request.
+            logger.info("Previous session finished; entering Quick Replan phase.")
+            self.loop_count = 0
+            self._plan_questions_asked = 0
+            self.task_list = []
+            self.completed_tasks = []
+            self.failed_tasks = []
+            self.goal = self.goal + "\n\nNEW REQUEST:\n" + user_msg
+            self.phase = self.PHASE_REPLAN_SKIP
+            if self.history and self.history[0].get("role") == "system":
+                self.history[0]["content"] = self._build_system_prompt()
+            else:
+                self.history.insert(0, {"role": "system", "content": self._build_system_prompt()})
+            self.history.append({"role": "user", "content": user_msg})
+            self._filter_tools_for_phase(self.PHASE_REPLAN_SKIP)
             await self.emit_task_update()
         else:
-            # Fresh session: initialize everything from scratch
+            # Fresh session: reset state and start from PLAN
+            if self.goal and self.task_list and not has_remaining_tasks:
+                logger.info("All tasks completed or failed; starting fresh session.")
             self.goal = user_msg
             self.phase = self.PHASE_PLAN
             self.task_list = []
             self.completed_tasks = []
             self.failed_tasks = []
+            self.loop_count = 0
+            self._plan_questions_asked = 0
             self._filter_tools_for_phase(self.PHASE_PLAN)
             system_prompt = self._build_system_prompt()
             self.history = [
@@ -2261,14 +2817,25 @@ class HelixAgentEngine:
             self.loop_count += 1
             recent_calls = recent_calls[-30:]
 
+            # Safety-net for REPLAN_SKIP: max 3 loops, then fallback to single-task EXECUTE
+            if self.phase == self.PHASE_REPLAN_SKIP and self.loop_count > self.MAX_REPLAN_SKIP_LOOPS:
+                logger.warning("REPLAN_SKIP exceeded %d loops; falling back to single-task EXECUTE.", self.MAX_REPLAN_SKIP_LOOPS)
+                self.task_list = [user_msg]
+                if self.history and len(self.history) > 0:
+                    self.history[0]["content"] = self._build_system_prompt()
+                self._transition_to(self.PHASE_EXECUTE)
+                await self.emit_task_update()
+
             phase_icons = {
                 self.PHASE_PLAN: "[PLAN]",
+                self.PHASE_REPLAN_SKIP: "[QPLN]",
                 self.PHASE_EXECUTE: "[EXEC]",
                 self.PHASE_REVIEW: "[REVU]",
                 self.PHASE_OUTPUT: "[OUT]",
             }
             phase_name = {
                 self.PHASE_PLAN: "Plan",
+                self.PHASE_REPLAN_SKIP: "Quick Replan",
                 self.PHASE_EXECUTE: "Execute",
                 self.PHASE_REVIEW: "Review",
                 self.PHASE_OUTPUT: "Output",
@@ -2340,7 +2907,7 @@ class HelixAgentEngine:
                 else:
                     # No tool calls and no XML rescue
                     # PLAN phase: enforce that the model must call confirm_plan.
-                    if self.phase == self.PHASE_PLAN:
+                    if self.phase in (self.PHASE_PLAN, self.PHASE_REPLAN_SKIP):
                         self.history.append({
                             "role": "assistant",
                             "content": content or "",
@@ -2349,7 +2916,7 @@ class HelixAgentEngine:
                             "role": "user",
                             "content": "SYSTEM: You produced text but did not call any tools. You MUST call the confirm_plan tool with the plan to proceed. Do NOT output the plan as text—call the tool.",
                         })
-                        await self.emit_output(f"\n[WARN] No tool call produced in PLAN phase. Re-prompting to enforce confirm_plan.\n")
+                        await self.emit_output(f"\n[WARN] No tool call produced in {self.phase} phase. Re-prompting to enforce confirm_plan.\n")
                         continue
                     # OUTPUT phase: never emit text in Turn 1, always proceed to Turn 2
                     if self.phase == self.PHASE_OUTPUT:
@@ -2632,6 +3199,24 @@ class HelixAgentEngine:
                     })
                     continue
 
+                # ── Handle ask_user ──
+                if tool_name == "ask_user":
+                    result_json = await self._tool_ask_user(**args)
+                    result_data = json.loads(result_json)
+                    user_response = result_data.get("response", "")
+                    skipped = result_data.get("skipped", False)
+                    if skipped:
+                        await self.emit_output(f"\n[ASK] **User question skipped:** {user_response}\n")
+                    else:
+                        await self.emit_output(f"\n[ASK] **User answered:** {user_response}\n")
+                    self.history.append({
+                        "role": "tool",
+                        "content": result_json,
+                        "tool_call_id": call_id,
+                        "name": tool_name,
+                    })
+                    continue
+
                 # ── Duplicate detection ──
                 sig = f"{tool_name}:{json.dumps(args, sort_keys=True)}"
                 if recent_calls.count(sig) >= 2:
@@ -2887,6 +3472,10 @@ class Pipe:
         YOLO_MODE: bool = Field(
             default=False,
             description="Skip all user confirmations. Auto-approve plans and ignore iteration limits.",
+        )
+        SKIP_PLAN_ON_RESUME: bool = Field(
+            default=True,
+            description="When the previous session is finished, skip the full PLAN phase for a new user request and jump straight to a Quick Replan. Set to False to always start fresh with full PLAN phase.",
         )
 
     def __init__(self):
