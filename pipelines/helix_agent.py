@@ -1,7 +1,7 @@
 """
 title: Helix Agent
 author: Piggidragon
-version: 0.21.3
+version: 0.22.0
 description: >
   Helix Agent — OpenWebUI-native agent loop with modular per-phase tool control.
 
@@ -11,6 +11,11 @@ description: >
   - Internal control tools (terminate, replan, fix_plan, complete_task, fail_task, confirm_plan) always available
   - Uses OpenWebUI native tool infrastructure (get_tools, get_builtin_tools, get_terminal_tools)
   - Context window management with adaptive history truncation and tool-call pair integrity
+  - LLM-based conversational context compression: goal and history are compressed independently
+    using a configurable compression model (falls back to AGENT_MODEL). Compression happens
+    blocking within the loop when HISTORY_COMPRESSION_THRESHOLD is exceeded, and asynchronously
+    for goal after each agent run. History compression produces an assistant summary message
+    that preserves the conversational flow.
 
   State & Persistence:
   - State persistence via JSON file attachments synced to the OpenWebUI chat DB
@@ -27,6 +32,7 @@ description: >
   - Knowledge bases: native OpenWebUI vector search via model metadata
   - MCP support: resolves and calls MCP server tools via OpenWebUI's MCPClient
   - Skills support: resolves user skills from model metadata and injects them into the system prompt
+  - Context compression: configurable thresholds, separate compression model, recursive compression allowed
 requirements: open-webui>=0.9.1
 """
 
@@ -415,7 +421,7 @@ class HelixAgentEngine:
     PHASE_OUTPUT = "output"
     PHASE_REPLAN_SKIP = "replan_skip"  # Quick replan when previous session finished
 
-    MAX_HISTORY_MESSAGES = 50
+    MAX_HISTORY_MESSAGES = 100
     MAX_REPLAN_SKIP_LOOPS = 3  # Safety net: max loops in quick replan phase
 
     # Internal tools that are ALWAYS available regardless of phase filters
@@ -672,6 +678,10 @@ class HelixAgentEngine:
 
     async def emit_output(self, text):
         self._output_parts.append(text)
+
+    def _total_history_chars(self) -> int:
+        """Return total character count of all messages in self.history."""
+        return sum(len(str(m.get("content", ""))) for m in self.history)
 
     def get_current_files(self) -> list:
         """Return a deduplicated list of all known files (metadata + produced + DB canonical)."""
@@ -1287,7 +1297,8 @@ class HelixAgentEngine:
             self.consecutive_json_errors = 0
             # Grant 3 extra iterations without rewinding the persistent counter
             self._extra_grace += 3
-            self.history = self._compress_history()
+            # Compress history via LLM when soft-replanning
+            await self._compress_history_llm()
         else:
             # Hard replan: replace task list entirely, full history reset
             if new_tasks:
@@ -1321,7 +1332,6 @@ class HelixAgentEngine:
             if task not in self.completed_tasks:
                 self.completed_tasks.append(task)
             await self._save_state_to_file()
-            self.history[0]["content"] = self._build_system_prompt()
             await self.emit_task_update()
             return json.dumps({"completed": True, "task": task, "index": idx})
         return json.dumps({"completed": False, "error": f"Invalid task index {idx}"})
@@ -1335,7 +1345,6 @@ class HelixAgentEngine:
             if not any(f["task"] == task for f in self.failed_tasks):
                 self.failed_tasks.append(entry)
             await self._save_state_to_file()
-            self.history[0]["content"] = self._build_system_prompt()
             await self.emit_task_update()
             return json.dumps({"failed": True, "task": task, "index": idx, "reason": reason})
         return json.dumps({"failed": False, "error": f"Invalid task index {idx}"})
@@ -1366,7 +1375,6 @@ class HelixAgentEngine:
         self.task_list[insert_idx:insert_idx] = new_tasks
 
         await self._save_state_to_file()
-        self.history[0]["content"] = self._build_system_prompt()
         await self.emit_task_update()
         return json.dumps({"fix_plan": True, "inserted_tasks": new_tasks, "reason": reason})
 
@@ -2497,10 +2505,6 @@ class HelixAgentEngine:
         # Rebuild filtered tools for new phase
         self._filter_tools_for_phase(phase)
 
-        # Update system prompt in history
-        if self.history:
-            self.history[0]["content"] = self._build_system_prompt()
-
     # ── Context Window Management ──
 
     def _manage_context_window(self, messages):
@@ -2509,10 +2513,10 @@ class HelixAgentEngine:
             return messages
 
         to_remove = len(messages) - self.MAX_HISTORY_MESSAGES
-        # Build head: system prompt + goal (always preserved)
-        head = messages[:2]
+        # Build head: goal (always preserved) – system prompt is injected separately
+        head = messages[:1]
         # Non-state messages after head, split into removed and tail
-        non_state = messages[2:]
+        non_state = messages[1:]
         removed = non_state[:to_remove]
         tail = non_state[to_remove:]
 
@@ -2552,77 +2556,133 @@ class HelixAgentEngine:
     def _get_truncation_limit(self):
         return self.valves.MAX_TOOL_RESULT_CHARS
 
-    def _compress_history(self):
-        """
-        Compress history for soft replan.
-        - Keeps system prompt + goal.
-        - Summarizes old execution into a summary block.
-        - Preserves last ~6 messages, but never splits a tool call pair.
-        - Tool results that are dropped from the "middle" are replaced with
-          short previews: [Tool: name → first 200 chars of result].
-        """
-        # 1. System prompt + goal (always preserved)
-        preserved = []
-        goal_msg = None
-        for msg in self.history:
-            role = msg.get("role")
-            if role == "system":
-                preserved.append(msg)
-            elif role == "user" and goal_msg is None:
-                goal_msg = msg
-        if goal_msg:
-            preserved.append(goal_msg)
+    async def _call_compression_model(self, messages: list) -> str:
+        """Call LLM for context compression. Uses CONTEXT_COMPRESSION_MODEL or falls back to AGENT_MODEL."""
+        model = self.valves.CONTEXT_COMPRESSION_MODEL or self.valves.AGENT_MODEL
+        if not model:
+            logger.warning("No compression model configured; skipping compression.")
+            return ""
 
-        # 2. Build execution summary
-        summary_parts = ["=== Compressed Execution History ==="]
-        summary_parts.append(f"Goal: {self.goal}")
-        summary_parts.append(f"Completed tasks: {', '.join(self.completed_tasks) if self.completed_tasks else 'None'}")
-        if self.failed_tasks:
-            summary_parts.append("Failed tasks:")
-            for ft in self.failed_tasks:
-                summary_parts.append(f"  - {ft.get('task', 'unknown')}: {ft.get('reason', 'no reason')}")
-        if self.task_list:
-            summary_parts.append(f"Remaining tasks before replan: {', '.join(self.task_list)}")
-        # 3. Middle section: tool results become previews, everything else is dropped
-        middle_previews = []
-        start_idx = len(preserved)
+        try:
+            body = {
+                **self.body,
+                "model": model,
+                "messages": messages,
+                "stream": False,
+            }
+            response = await generate_chat_completion(self.request, body, self.user)
+            if isinstance(response, dict) and response.get("choices"):
+                raw = response["choices"][0].get("message", {}).get("content", "")
+                return raw.strip()
+            return ""
+        except Exception as e:
+            logger.warning(f"Compression model call failed: {e}")
+            return ""
 
-        keep_last = 6
-        if len(self.history) > len(preserved) + keep_last:
-            middle = self.history[len(preserved):-keep_last]
-        else:
-            middle = []
-
-        for msg in middle:
-            if msg.get("role") == "tool":
+    def _format_messages_for_compression(self, messages: list) -> str:
+        """Format a list of conversation messages into a single text for LLM compression."""
+        lines = []
+        for msg in messages:
+            role = msg.get("role", "unknown")
+            if role == "tool":
                 name = msg.get("name", "unknown")
+                content = strip_html(msg.get("content", "")[:1000])
+                lines.append(f"[Tool: {name}]\n{content}")
+            elif role == "assistant" and msg.get("tool_calls"):
+                content = msg.get("content", "")
+                tool_names = ", ".join(tc.get("function", {}).get("name", "?") for tc in msg.get("tool_calls", []))
+                lines.append(f"[Assistant: calling tools → {tool_names}]\n{content}")
+            else:
                 content = strip_html(msg.get("content", ""))
-                preview = content[:200].replace("\n", " ")
-                middle_previews.append(f"[Tool: {name} → {preview}...]")
-            elif msg.get("role") == "user" and len(msg.get("content", "")) < 500:
-                middle_previews.append(f"[User: {strip_html(msg['content'][:200])}]")
+                lines.append(f"[{role.capitalize()}]\n{content}")
+        return "\n\n".join(lines)
 
-        if middle_previews:
-            summary_parts.append("Earlier actions (summarized):")
-            summary_parts.extend(middle_previews)
+    async def _compress_history_llm(self) -> bool:
+        """
+        Blocking LLM-based history compression.
+        Interrupts the loop, compresses old messages into a single assistant summary message.
+        Returns True if compression happened, False otherwise.
+        """
+        keep_recent = getattr(self.valves, "KEEP_RECENT_MESSAGES", 6)
+        threshold = getattr(self.valves, "HISTORY_COMPRESSION_THRESHOLD", 30000)
 
-        summary_msg = {"role": "system", "content": "\n".join(summary_parts)}
+        # Calculate total chars in history
+        total_chars = sum(len(str(m.get("content", ""))) for m in self.history)
+        if total_chars <= threshold:
+            return False
 
-        # 4. Recent tail — safe extraction that preserves tool call pairs
-        recent = self.history[-keep_last:] if len(self.history) > keep_last else self.history[len(preserved):]
+        if len(self.history) <= keep_recent + 1:
+            return False
 
-        # If the cutoff split an assistant+tool_calls from its results, fix it
-        if recent and recent[-1].get("role") == "assistant" and recent[-1].get("tool_calls"):
-            call_ids = {tc.get("id") for tc in recent[-1]["tool_calls"] if tc.get("id")}
-            for msg in self.history:
-                if msg.get("role") == "tool" and msg.get("tool_call_id") in call_ids:
-                    if msg not in recent:
-                        recent.append(msg)
+        # Split: old messages (to compress) + recent messages (keep intact)
+        old_messages = self.history[:-keep_recent]
+        recent_messages = self.history[-keep_recent:]
 
-        compressed = preserved.copy()
-        compressed.append(summary_msg)
-        compressed.extend(recent)
-        return compressed
+        # Emit status: compression started
+        await self.emit_status(f"Compressing history ({total_chars} chars)...", done=False)
+
+        # Format old messages for compression prompt
+        conversation_text = self._format_messages_for_compression(old_messages)
+        compression_prompt = [
+            {
+                "role": "system",
+                "content": (
+                    "You are a conversation compressor for an AI coding agent. "
+                    "Summarize the following conversation part concisely while preserving ALL important context: "
+                    "file paths, key decisions, errors, tool names and their decisive results, user preferences, "
+                    "and any unfinished work. Output as a dense narrative. Keep it under 2000 words."
+                ),
+            },
+            {"role": "user", "content": conversation_text},
+        ]
+
+        compressed = await self._call_compression_model(compression_prompt)
+        if not compressed:
+            await self.emit_status("Compression failed, continuing...", done=True)
+            return False
+
+        compressed_chars = len(compressed)
+        saved = total_chars - compressed_chars - sum(len(str(m.get("content", ""))) for m in recent_messages)
+        saved_pct = round((saved / total_chars) * 100) if total_chars else 0
+
+        # Build the compressed assistant message
+        compressed_msg = {
+            "role": "assistant",
+            "content": f"=== Compressed Context ===\n{compressed}",
+        }
+
+        # Replace history: compressed msg + recent messages
+        self.history = [compressed_msg] + recent_messages
+
+        await self.emit_status(f"History compressed: saved {saved_pct}% ({saved} chars)", done=True)
+        return True
+
+    async def _compress_goal_if_needed(self):
+        """Compress the goal after the agent run completes if it exceeds the threshold."""
+        threshold = getattr(self.valves, "GOAL_COMPRESSION_THRESHOLD", 3000)
+        if len(self.goal) <= threshold:
+            return
+
+        prompt = [
+            {
+                "role": "system",
+                "content": (
+                    "Compress the following user goal into a concise instruction. "
+                    "Preserve all technical requirements, file paths, constraints, and the latest request."
+                ),
+            },
+            {"role": "user", "content": self.goal},
+        ]
+
+        compressed = await self._call_compression_model(prompt)
+        if compressed and len(compressed) < len(self.goal):
+            original_len = len(self.goal)
+            self.goal = compressed
+            saved = original_len - len(compressed)
+            saved_pct = round((saved / original_len) * 100)
+            logger.info(f"Goal compressed: saved {saved_pct}% ({saved} chars)")
+
+
 
     # ── Main Loop ──
 
@@ -2792,10 +2852,6 @@ class HelixAgentEngine:
                 logger.info(f"Clamped loop_count from {self.loop_count} to {max_allowed} after state restore.")
                 self.loop_count = max_allowed
             self.goal = f"{self.goal}; Updated: {user_msg}"
-            if self.history and self.history[0].get("role") == "system":
-                self.history[0]["content"] = self._build_system_prompt()
-            else:
-                self.history.insert(0, {"role": "system", "content": self._build_system_prompt()})
             self.history.append({"role": "user", "content": user_msg})
             self._filter_tools_for_phase(self.phase)
             await self.emit_task_update()
@@ -2806,10 +2862,6 @@ class HelixAgentEngine:
             self._plan_questions_asked = 0
             if user_msg not in self.goal:
                 self.goal = self.goal + "\n\nNEW REQUEST:\n" + user_msg
-            if self.history and self.history[0].get("role") == "system":
-                self.history[0]["content"] = self._build_system_prompt()
-            else:
-                self.history.insert(0, {"role": "system", "content": self._build_system_prompt()})
             self.history.append({"role": "user", "content": user_msg})
             self._filter_tools_for_phase(self.PHASE_REPLAN_SKIP)
             await self.emit_task_update()
@@ -2823,10 +2875,6 @@ class HelixAgentEngine:
             self.failed_tasks = []
             self.goal = self.goal + "\n\nNEW REQUEST:\n" + user_msg
             self.phase = self.PHASE_REPLAN_SKIP
-            if self.history and self.history[0].get("role") == "system":
-                self.history[0]["content"] = self._build_system_prompt()
-            else:
-                self.history.insert(0, {"role": "system", "content": self._build_system_prompt()})
             self.history.append({"role": "user", "content": user_msg})
             self._filter_tools_for_phase(self.PHASE_REPLAN_SKIP)
             await self.emit_task_update()
@@ -2842,11 +2890,7 @@ class HelixAgentEngine:
             self.loop_count = 0
             self._plan_questions_asked = 0
             self._filter_tools_for_phase(self.PHASE_PLAN)
-            system_prompt = self._build_system_prompt()
-            self.history = [
-                {"role": "system", "content": system_prompt},
-                last_user_msg_raw if last_user_msg_raw else {"role": "user", "content": user_msg},
-            ]
+            self.history = [last_user_msg_raw if last_user_msg_raw else {"role": "user", "content": user_msg}]
 
         recent_calls = []
         self._output_parts = []
@@ -2860,9 +2904,6 @@ class HelixAgentEngine:
                     await self.emit_task_update(finalize_tasks=True)
                     await self.emit_status("Output phase exceeded max turns", done=True)
                     return self._format_output()
-                # Refresh system prompt for the current turn
-                if self.history and self.history[0].get("role") == "system":
-                    self.history[0]["content"] = self._build_system_prompt()
 
             effective_max = self.valves.MAX_ITERATIONS + self._extra_grace
             if self.loop_count >= effective_max:
@@ -2920,9 +2961,17 @@ class HelixAgentEngine:
 
 
             self.history = self._manage_context_window(self.history)
-            # Strip system messages from LLM context
-            # Only the first message (system prompt) is kept
-            call_messages = [self.history[0]] + [m for m in self.history[1:] if m.get("role") != "system"]
+
+            # ── Context Compression: check threshold and compress if needed ──
+            if self._total_history_chars() > self.valves.HISTORY_COMPRESSION_THRESHOLD:
+                if self.loop_count - getattr(self, "_last_compression_loop", 0) >= self.valves.COMPRESSION_INTERVAL:
+                    compressed = await self._compress_history_llm()
+                    if compressed:
+                        self._last_compression_loop = self.loop_count
+
+            # Build fresh system prompt and prepend it to history
+            system_prompt = self._build_system_prompt()
+            call_messages = [{"role": "system", "content": system_prompt}] + [m for m in self.history if m.get("role") != "system"]
 
             completion_body = {
                 **self.body,
@@ -3006,9 +3055,6 @@ class HelixAgentEngine:
                                 "role": "assistant",
                                 "content": content or "",
                             })
-                            # Refresh final prompt for Turn 2
-                            if self.history and self.history[0].get("role") == "system":
-                                self.history[0]["content"] = self._build_system_prompt()
                             continue
                         # Turn 2: emit final text and return
                         if content:
@@ -3371,6 +3417,8 @@ class HelixAgentEngine:
     async def run(self, user_msg, last_user_msg_raw, model):
         try:
             result = await self._run_impl(user_msg, last_user_msg_raw, model)
+            # Compress goal after the agent run completes
+            await self._compress_goal_if_needed()
             return result
         except GeneratorExit:
             logger.info("Agent loop cancelled by user (GeneratorExit).")
@@ -3465,8 +3513,8 @@ class Pipe:
             description="Maximum Helix Agent iterations before stopping."
         )
         MAX_TOOL_RESULT_CHARS: int = Field(
-            default=4200,
-            description="Max characters for tool results before truncation."
+            default=12000,
+            description="Max characters for tool results before truncation. Increased from 4200 because context compression now handles long tool outputs gracefully.",
         )
         TOOL_TIMEOUT: int = Field(
             default=90,
@@ -3561,6 +3609,30 @@ class Pipe:
         OUTPUT_PROMPT: str = Field(
             default=DEFAULT_OUTPUT_PROMPT,
             description="System prompt for OUTPUT phase — Turn 1 (collection / rendering allowed). Available placeholders: {goal}, {task_state}."
+        )
+        CONTEXT_COMPRESSION_MODEL: str = Field(
+            default="",
+            description="Model ID for context compression. If empty, falls back to AGENT_MODEL. Consider smaller models like gemini-2.5-flash for cost efficiency.",
+        )
+        HISTORY_COMPRESSION_THRESHOLD: int = Field(
+            default=30000,
+            ge=1000,
+            description="If total history chars exceed this, trigger compression mid-loop. Default ~30k chars ≈ 7.5k tokens.",
+        )
+        GOAL_COMPRESSION_THRESHOLD: int = Field(
+            default=3000,
+            ge=500,
+            description="If goal string chars exceed this, compress goal after the agent run completes. Default ~3k chars ≈ 750 tokens.",
+        )
+        COMPRESSION_INTERVAL: int = Field(
+            default=5,
+            ge=1,
+            description="Minimum loop iterations between consecutive history compressions to avoid token thrashing.",
+        )
+        KEEP_RECENT_MESSAGES: int = Field(
+            default=6,
+            ge=2,
+            description="Number of recent messages to always keep uncompressed in history. Older messages are candidates for compression.",
         )
 
     class UserValves(BaseModel):
