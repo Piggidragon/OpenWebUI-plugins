@@ -1,7 +1,7 @@
 """
 title: Helix Agent
 author: Piggidragon
-version: 0.21.2
+version: 0.21.3
 description: >
   Helix Agent — OpenWebUI-native agent loop with modular per-phase tool control.
 
@@ -948,7 +948,7 @@ class HelixAgentEngine:
         self.all_tools_dict["ask_user"] = {
             "spec": {
                 "name": "ask_user",
-                "description": "Ask the user an interactive question with selectable options and optional custom free-text input. Use this ONLY when you need clarification or a decision from the user before you can continue planning. NOT available in EXECUTE, REVIEW or OUTPUT phases.",
+                "description": "Ask the user an interactive question with selectable options and optional custom free-text input. Use this ONLY when you need clarification or a decision from the user before you can continue planning. Available ONLY in PLAN and QUICK REPLAN phases. NOT available in EXECUTE, REVIEW or OUTPUT phases.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -2829,6 +2829,20 @@ class HelixAgentEngine:
             self.history.append({"role": "user", "content": user_msg})
             self._filter_tools_for_phase(self.phase)
             await self.emit_task_update()
+        elif self.goal and not self.task_list and self.phase == self.PHASE_REPLAN_SKIP:
+            # Interrupted Quick Replan (task_list empty because confirm_plan not yet called)
+            logger.info("Resuming interrupted Quick Replan phase.")
+            self.loop_count = 0
+            self._plan_questions_asked = 0
+            if user_msg not in self.goal:
+                self.goal = self.goal + "\n\nNEW REQUEST:\n" + user_msg
+            if self.history and self.history[0].get("role") == "system":
+                self.history[0]["content"] = self._build_system_prompt()
+            else:
+                self.history.insert(0, {"role": "system", "content": self._build_system_prompt()})
+            self.history.append({"role": "user", "content": user_msg})
+            self._filter_tools_for_phase(self.PHASE_REPLAN_SKIP)
+            await self.emit_task_update()
         elif self.goal and self.task_list and not has_remaining_tasks and self.user_valves and getattr(self.user_valves, "SKIP_PLAN_ON_RESUME", True):
             # Previous session finished. Use Quick Replan phase to let the agent plan the new request.
             logger.info("Previous session finished; entering Quick Replan phase.")
@@ -2908,11 +2922,9 @@ class HelixAgentEngine:
             recent_calls = recent_calls[-30:]
 
             # Safety-net for REPLAN_SKIP: max 3 loops, then fallback to single-task EXECUTE
-            if self.phase == self.PHASE_REPLAN_SKIP and self.loop_count > self.MAX_REPLAN_SKIP_LOOPS:
-                logger.warning("REPLAN_SKIP exceeded %d loops; falling back to single-task EXECUTE.", self.MAX_REPLAN_SKIP_LOOPS)
+            if self.phase == self.PHASE_REPLAN_SKIP and self.loop_count >= self.MAX_REPLAN_SKIP_LOOPS:
+                logger.warning("REPLAN_SKIP reached %d loops; falling back to single-task EXECUTE.", self.MAX_REPLAN_SKIP_LOOPS)
                 self.task_list = [user_msg]
-                if self.history and len(self.history) > 0:
-                    self.history[0]["content"] = self._build_system_prompt()
                 self._transition_to(self.PHASE_EXECUTE)
                 await self.emit_task_update()
 
