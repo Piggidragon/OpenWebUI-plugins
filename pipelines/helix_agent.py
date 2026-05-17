@@ -37,6 +37,7 @@ requirements: open-webui>=0.9.1
 """
 
 import asyncio
+import hashlib
 import inspect
 import io
 import json
@@ -161,7 +162,7 @@ Rules:
 """
 
 DEFAULT_REVIEW_PROMPT = """\
-You are in REVIEW mode. Your ONLY job is to pick one of these actions.
+You are in REVIEW mode. Inspect the completed work using the available tools BEFORE deciding on an action.
 
 PHASE: REVIEW
 Original goal: {goal}
@@ -171,31 +172,36 @@ Available tools: {tool_names}
 
 Task status markers: [done] = completed, [FAIL: reason] = failed with reason, [    ] = not started.
 
-You MUST call exactly ONE of these tools:
+What to do:
+1. Use the available read-only tools (e.g. read_file, grep_search, list_files, view_knowledge_file) to verify the work. Check file contents, code correctness, and whether files exist in `[USER_HOME]/agent/<project>/`.
+2. Once you have inspected the work, call exactly ONE of these tools:
 
-1. `proceed_to_output()` — Everything is done and correct. Move to the OUTPUT phase to generate the polished final answer.
-2. `fix_plan(reason, updated_tasks)` — Only minor fixes are needed (a task failed or needs a small correction). List just the new/corrected tasks.
-3. `replan(reason, updated_tasks)` — The overall strategy is broken and tasks need to be replaced entirely. The agent will enter Replan mode and you must then call confirm_plan with the updated plan.
+- `proceed_to_output()` — Everything is done and correct. Move to the OUTPUT phase to generate the polished final answer.
+- `fix_plan(reason, updated_tasks)` — Only minor fixes are needed (a task failed or needs a small correction). List just the new/corrected tasks.
+- `replan(reason, updated_tasks)` — The overall strategy is broken and tasks need to be replaced entirely. The agent will enter Replan mode and you must then call confirm_plan with the updated plan.
 
 Rules:
+- ALWAYS verify before deciding. Don't guess — read files, run checks, inspect outputs.
 - If there are only minor issues with individual tasks, ALWAYS prefer `fix_plan` over `replan`. Only use `replan` if the overall strategy is broken.
 - Be honest — don't call `proceed_to_output` if something is missing or wrong.
-- Check that code-related tasks have actually produced files in the correct project folder `[USER_HOME]/agent/<project>/` and, if a verification task exists, that it passed or was handled.
 - If the result is good enough, call `proceed_to_output`. Don't gold-plate.
 - Provide a brief reasoning for your assessment before calling the final tool.
 - You may only use the tools listed above.
 """
 
 DEFAULT_OUTPUT_PROMPT = """\
-You are in OUTPUT mode — COLLECTION. Gather missing context and render visualisations if needed. Do not produce any answer text yet.
+You are in OUTPUT mode - COLLECTION. Gather missing context and render visualisations if needed. Do not produce any answer text yet.
 
 Goal: {goal}
 
 {task_state}
+
+Available tools: {tool_names}
 """
 
 DEFAULT_OUTPUT_FINAL_PROMPT = """\
-Write the final answer.
+You are in OUTPUT mode — FINAL ANSWER PHASE.
+This is turn 2 of 2 in the output phase. All necessary data has been collected. Write the comprehensive final answer to the user now. You may NOT use any tools — only produce the final response text.
 
 Goal: {goal}
 """
@@ -230,6 +236,30 @@ Rules:
 # ──────────────────────────────────────────────────────────────────
 #  SSE STREAM PARSER
 # ──────────────────────────────────────────────────────────────────
+
+async def _parse_sse_payload(payload: str):
+    """Parse a single SSE data payload and yield structured events."""
+    try:
+        parsed = json.loads(payload)
+    except json.JSONDecodeError:
+        return
+    if not isinstance(parsed, dict):
+        return
+    choices = parsed.get("choices", [])
+    if not choices:
+        return
+    delta = choices[0].get("delta", {}) or {}
+    for rk in ("reasoning", "reasoning_content", "thinking"):
+        rv = delta.get(rk)
+        if rv:
+            yield {"type": "reasoning", "text": rv}
+    cv = delta.get("content")
+    if cv:
+        yield {"type": "content", "text": cv}
+    tc = delta.get("tool_calls")
+    if tc:
+        yield {"type": "tool_calls", "data": tc}
+
 
 async def stream_completion(request, body, user):
     """Stream OWUI completion, yielding structured events. Retries once on transient errors."""
@@ -273,24 +303,8 @@ async def stream_completion(request, body, user):
                 if not payload or payload == "[DONE]":
                     continue
 
-                try:
-                    parsed = json.loads(payload)
-                    if isinstance(parsed, dict):
-                        choices = parsed.get("choices", [])
-                        if choices:
-                            delta = choices[0].get("delta", {}) or {}
-                            for rk in ("reasoning", "reasoning_content", "thinking"):
-                                rv = delta.get(rk)
-                                if rv:
-                                    yield {"type": "reasoning", "text": rv}
-                            cv = delta.get("content")
-                            if cv:
-                                yield {"type": "content", "text": cv}
-                            tc = delta.get("tool_calls")
-                            if tc:
-                                yield {"type": "tool_calls", "data": tc}
-                except json.JSONDecodeError:
-                    pass
+                async for event in _parse_sse_payload(payload):
+                    yield event
 
         # Flush remaining buffer
         if sse_buffer.strip():
@@ -299,24 +313,8 @@ async def stream_completion(request, body, user):
                 if stripped.startswith("data:"):
                     payload = stripped[5:].lstrip()
                     if payload and payload != "[DONE]":
-                        try:
-                            parsed = json.loads(payload)
-                            if isinstance(parsed, dict):
-                                choices = parsed.get("choices", [])
-                                if choices:
-                                    delta = choices[0].get("delta", {}) or {}
-                                    for rk in ("reasoning", "reasoning_content", "thinking"):
-                                        rv = delta.get(rk)
-                                        if rv:
-                                            yield {"type": "reasoning", "text": rv}
-                                    cv = delta.get("content")
-                                    if cv:
-                                        yield {"type": "content", "text": cv}
-                                    tc = delta.get("tool_calls")
-                                    if tc:
-                                        yield {"type": "tool_calls", "data": tc}
-                        except json.JSONDecodeError:
-                            pass
+                        async for event in _parse_sse_payload(payload):
+                            yield event
 
     elif isinstance(response, dict):
         choices = response.get("choices", [])
@@ -467,7 +465,13 @@ class HelixAgentEngine:
         self._mcp_clients: Dict[str, Any] = {}
         self._extra_grace = 0
         self.consecutive_json_errors = 0
-        self._plan_questions_asked = 0  # Counter for ask_user calls in PLAN/REPLAN
+        self._plan_questions_asked = 0
+
+        # Throttling / debounce state
+        self._last_state_save_ts: float = 0.0
+        self._last_task_state_str: str = ""
+        self._last_state_save_hash: str = ""
+
         self._incoming_tools = list(incoming_tools) if incoming_tools else []
         self._incoming_tool_names = set()
         self._builtin_tools_names = set()
@@ -517,10 +521,16 @@ class HelixAgentEngine:
 
     # ── State Persistence (DB + File Attachments) ──
 
-    async def _save_state_to_file(self) -> None:
-        """Serialize agent state to a JSON file and bind it to the chat DB."""
+    async def _save_state_to_file(self, force: bool = False) -> None:
+        """Serialize agent state to a JSON file and bind it to the chat DB.
+
+        Writes are throttled: at most one every 2 seconds, and skipped if the
+        state payload is unchanged since the last successful save.
+        Call with force=True to bypass throttling (e.g. on termination).
+        """
         if not HAS_DB_PERSISTENCE or not self.chat_id or not self.request or not self.user:
             return
+
         try:
             state_data = {
                 "goal": self.goal,
@@ -531,8 +541,17 @@ class HelixAgentEngine:
                 "loop_count": self.loop_count,
                 "extra_grace": self._extra_grace,
             }
+            content = json.dumps(state_data, sort_keys=True, ensure_ascii=False).encode("utf-8")
+            payload_hash = hashlib.sha256(content).hexdigest()
+
+            now = asyncio.get_event_loop().time()
+            if not force:
+                if now - self._last_state_save_ts < 2.0:
+                    return
+                if payload_hash == self._last_state_save_hash:
+                    return
+
             filename = f"helix_state_{self.chat_id}.json"
-            content = json.dumps(state_data, ensure_ascii=False).encode("utf-8")
 
             file_upload = UploadFile(
                 file=io.BytesIO(content),
@@ -554,6 +573,10 @@ class HelixAgentEngine:
             if not file_id:
                 return
             file_info = {"file_id": str(file_id), "name": filename}
+
+            # Update throttling bookkeeping
+            self._last_state_save_ts = now
+            self._last_state_save_hash = payload_hash
 
             # Update internal metadata (prune old state files first)
             internal_files = self.metadata.get("__files__")
@@ -1336,7 +1359,7 @@ class HelixAgentEngine:
         failed_names = {f["task"] for f in self.failed_tasks}
         insert_idx = len(self.task_list)  # default: append
         for i, t in enumerate(self.task_list):
-            if any(f in t or t in f for f in failed_names):
+            if t in failed_names:
                 insert_idx = i
                 break
 
@@ -1410,7 +1433,7 @@ class HelixAgentEngine:
         if self.phase in (self.PHASE_PLAN, self.PHASE_REPLAN):
             self._plan_questions_asked += 1
             max_questions = getattr(self.user_valves, "MAX_PLAN_QUESTIONS", 3)
-            if self._plan_questions_asked >= max_questions:
+            if self._plan_questions_asked > max_questions:
                 return json.dumps({
                     "type": "error",
                     "response": (
@@ -1519,16 +1542,33 @@ class HelixAgentEngine:
         except ValueError as e:
             return json.dumps({"error": str(e)})
 
-        # Validate each tool exists in current phase
+        # Validate each tool exists in current phase AND validate args against schema
         missing = []
-        for c in calls:
-            if c["name"] not in self.phase_tools_dict:
-                missing.append(c["name"])
+        validation_errors = []
+        for i, c in enumerate(calls):
+            tool_name = c["name"]
+            tool_entry = self.phase_tools_dict.get(tool_name)
+            if not tool_entry:
+                missing.append(tool_name)
+                continue
+            spec = tool_entry.get("spec", {})
+            errs = self._validate_tool_args(spec, c.get("args", {}))
+            if errs:
+                validation_errors.append(
+                    {"index": i, "tool": tool_name, "errors": errs}
+                )
         if missing:
             available = ", ".join(sorted(self.phase_tools_dict.keys())[:20])
             phase_name = self.phase
             return json.dumps({
                 "error": f"[{phase_name}] The following tools are NOT available in this phase: {', '.join(missing)}. Available tools in this phase: {available}. Please only use tools listed for the current phase.",
+            })
+        if validation_errors:
+            error_lines = []
+            for err in validation_errors:
+                error_lines.append(f"- {err['tool']}: {', '.join(err['errors'])}")
+            return json.dumps({
+                "error": "Validation failed for one or more parallel tool calls:\n" + "\n".join(error_lines),
             })
 
         # Emit status for each parallel sub-call
@@ -2135,33 +2175,40 @@ class HelixAgentEngine:
     # ── Task State String ──
 
     async def emit_task_update(self, finalize_tasks=False):
-        """Emit task progress via Open WebUI's native task list UI.
+        """Emit task progress via Open WebUI's native task list UI, debounced.
 
-        When finalize_tasks is True, all remaining pending/in_progress tasks
-        are marked as completed so the TaskList UI is dismissed (it only
-        renders when at least one task is active).
+        Events are suppressed if the task state is unchanged since the last emit,
+        unless finalize_tasks is True, which forces an update.
         """
         if not self.task_list:
-            return
-        first_outstanding = next(
-            (i for i, t in enumerate(self.task_list)
-             if t not in self.completed_tasks
-             and not any(f["task"] == t for f in self.failed_tasks)),
-            None,
-        )
-        tasks = []
-        for i, task in enumerate(self.task_list):
-            if task in self.completed_tasks:
-                status = "completed"
-            elif any(f["task"] == task for f in self.failed_tasks):
-                status = "cancelled"
-            elif finalize_tasks:
-                status = "completed"
-            elif i == first_outstanding:
-                status = "in_progress"
-            else:
-                status = "pending"
-            tasks.append({"id": str(i + 1), "content": task, "status": status})
+            tasks = []
+        else:
+            first_outstanding = next(
+                (i for i, t in enumerate(self.task_list)
+                 if t not in self.completed_tasks
+                 and not any(f["task"] == t for f in self.failed_tasks)),
+                None,
+            )
+            tasks = []
+            for i, task in enumerate(self.task_list):
+                if task in self.completed_tasks:
+                    status = "completed"
+                elif any(f["task"] == task for f in self.failed_tasks):
+                    status = "cancelled"
+                elif finalize_tasks:
+                    status = "completed"
+                elif i == first_outstanding:
+                    status = "in_progress"
+                else:
+                    status = "pending"
+                tasks.append({"id": str(i + 1), "content": task, "status": status})
+
+        if not finalize_tasks:
+            state_key = json.dumps(tasks, sort_keys=True)
+            if state_key == self._last_task_state_str:
+                return
+            self._last_task_state_str = state_key
+
         if self.event_emitter:
             try:
                 await self.event_emitter({
@@ -2315,10 +2362,14 @@ class HelixAgentEngine:
                         f"[Helix] Delayed sync exhausted all {max_attempts} attempts."
                     )
 
-    async def _sync_produced_files_to_db(self):
-        """Deduplicate and bind all tool-generated files to the chat DB message."""
+    async def _sync_produced_files_to_db(self) -> bool:
+        """Deduplicate and bind all tool-generated files to the chat DB message.
+
+        Returns True if the sync succeeded (or there was nothing to sync),
+        False if a DB error occurred and a retry may be warranted.
+        """
         if not HAS_DB_PERSISTENCE or not self.chat_id or not self.message_id:
-            return
+            return True
 
         # Deduplicate by id/file_id/url
         seen = set()
@@ -2334,7 +2385,7 @@ class HelixAgentEngine:
             self.produced_files = unique_files.copy()
 
         if not unique_files:
-            return
+            return True
 
         try:
             await Chats.add_message_files_by_id_and_message_id(
@@ -2343,10 +2394,67 @@ class HelixAgentEngine:
                 unique_files,
             )
             logger.info(f"Synced {len(unique_files)} tool files to DB.")
+            return True
         except Exception as e:
             logger.warning(f"Tool file DB sync failed: {e}")
+            return False
 
     # ── Execute Tool ──
+
+    def _validate_tool_args(self, spec: dict, args: dict) -> list:
+        """Validate args against a tool's JSON schema spec. Returns list of error strings."""
+        errors = []
+        parameters = spec.get("parameters") or spec.get("inputSchema")
+        if not isinstance(parameters, dict):
+            return errors
+
+        properties = parameters.get("properties")
+        if not isinstance(properties, dict):
+            return errors
+
+        required = set(parameters.get("required", []) if isinstance(parameters.get("required"), list) else [])
+        for key in required:
+            if key not in args:
+                errors.append(f"Missing required argument '{key}'")
+
+        for key, value in args.items():
+            if key not in properties:
+                if parameters.get("additionalProperties") is False:
+                    errors.append(f"Unknown argument '{key}'")
+                continue
+
+            prop_schema = properties[key]
+            if not isinstance(prop_schema, dict):
+                continue
+
+            expected_type = prop_schema.get("type")
+            if expected_type and not self._check_json_type(value, expected_type):
+                errors.append(f"Argument '{key}' must be of type '{expected_type}', got '{type(value).__name__}'")
+
+            enum_values = prop_schema.get("enum")
+            if isinstance(enum_values, list) and value not in enum_values:
+                errors.append(f"Argument '{key}' must be one of {enum_values}, got '{value}'")
+
+        return errors
+
+    @staticmethod
+    def _check_json_type(value, expected_type: str) -> bool:
+        """Check if a Python value matches a JSON Schema type string."""
+        if expected_type == "string":
+            return isinstance(value, str)
+        if expected_type == "integer":
+            return isinstance(value, int) and not isinstance(value, bool)
+        if expected_type == "number":
+            return isinstance(value, (int, float)) and not isinstance(value, bool)
+        if expected_type == "boolean":
+            return isinstance(value, bool)
+        if expected_type == "array":
+            return isinstance(value, list)
+        if expected_type == "object":
+            return isinstance(value, dict)
+        if expected_type == "null":
+            return value is None
+        return True
 
     async def _execute_tool(self, tool_name, args, call_id):
         """Execute a single resolved tool from phase_tools_dict."""
@@ -2355,9 +2463,41 @@ class HelixAgentEngine:
             available = list(self.phase_tools_dict.keys())
             return f"Tool '{tool_name}' not found in current phase ({self.phase}). Available: {', '.join(available[:20])}", []
 
-        spec_params = target.get("spec", {}).get("parameters", {}).get("properties", {})
-        allowed_keys = set(spec_params.keys())
-        filtered_args = {k: v for k, v in args.items() if k in allowed_keys}
+        def _get_allowed_keys(spec: dict) -> set:
+            """Extract allowed arg keys from various tool schema shapes."""
+            parameters = spec.get("parameters") or spec.get("inputSchema")
+            if isinstance(parameters, dict):
+                props = parameters.get("properties")
+                if isinstance(props, dict):
+                    return set(props.keys())
+                # Handle JSON Schema top-level properties directly
+                if "properties" in parameters:
+                    top_props = parameters.get("properties")
+                    if isinstance(top_props, dict):
+                        return set(top_props.keys())
+                # Fallback: keys that aren't JSON Schema metadata keys
+                meta_keys = {"type", "required", "properties", "description", "title", "$defs", "additionalProperties"}
+                return {k for k in parameters.keys() if k not in meta_keys}
+            # Some schemas specify args as a dict under a key named "args" or "arguments"
+            for fallback_key in ("args", "arguments", "params", "input"):
+                fb = spec.get(fallback_key)
+                if isinstance(fb, dict):
+                    nested = fb.get("properties") or {}
+                    return set(nested.keys()) if isinstance(nested, dict) else set(fb.keys())
+            return set()
+
+        allowed_keys = _get_allowed_keys(target.get("spec", {}))
+        if allowed_keys:
+            filtered_args = {k: v for k, v in args.items() if k in allowed_keys}
+        else:
+            # If we can't determine schema, pass args through and rely on the tool to error
+            filtered_args = dict(args)
+
+        # ── Schema validation: check args against tool spec BEFORE execution ──
+        validation_errors = self._validate_tool_args(target.get("spec", {}), filtered_args)
+        if validation_errors:
+            error_msg = "\n".join(f"- {err}" for err in validation_errors)
+            return f"{tool_name} validation failed:\n{error_msg}", []
 
         callable_fn = target.get("callable")
         if callable_fn and inspect.iscoroutinefunction(callable_fn):
@@ -2422,6 +2562,19 @@ class HelixAgentEngine:
 
     # ── Phase System Prompt ──
 
+    def _render_prompt(self, template: str, **kwargs) -> str:
+        """Safely substitute known placeholders in a prompt template.
+
+        Uses str.replace() so any literal braces in user-provided custom
+        prompts (JSON examples, regex, shell variables) are left untouched.
+        """
+        result = template
+        for key, value in kwargs.items():
+            placeholder = f"{{{key}}}"
+            if placeholder in result:
+                result = result.replace(placeholder, str(value))
+        return result
+
     def _build_system_prompt(self):
         """Build system prompt based on current phase using Valves overrides."""
         tool_names = ", ".join(sorted(self.phase_tools_dict.keys()))
@@ -2430,37 +2583,61 @@ class HelixAgentEngine:
         base = ""
         try:
             if self.phase == self.PHASE_PLAN:
-                base = (self.valves.PLAN_PROMPT or DEFAULT_PLAN_PROMPT).format(tool_names=tool_names)
+                base = self._render_prompt(
+                    self.valves.PLAN_PROMPT or DEFAULT_PLAN_PROMPT,
+                    tool_names=tool_names,
+                )
             elif self.phase == self.PHASE_REPLAN:
-                base = DEFAULT_REPLAN_PROMPT.format(tool_names=tool_names, goal=self.goal)
+                base = self._render_prompt(
+                    DEFAULT_REPLAN_PROMPT,
+                    tool_names=tool_names,
+                    goal=self.goal,
+                )
             elif self.phase == self.PHASE_EXECUTE:
-                base = (self.valves.EXECUTE_PROMPT or DEFAULT_EXECUTE_PROMPT).format(tool_names=tool_names, task_state=task_state)
+                base = self._render_prompt(
+                    self.valves.EXECUTE_PROMPT or DEFAULT_EXECUTE_PROMPT,
+                    tool_names=tool_names,
+                    task_state=task_state,
+                )
             elif self.phase == self.PHASE_REVIEW:
-                base = (self.valves.REVIEW_PROMPT or DEFAULT_REVIEW_PROMPT).format(goal=self.goal, task_state=task_state, tool_names=tool_names)
+                base = self._render_prompt(
+                    self.valves.REVIEW_PROMPT or DEFAULT_REVIEW_PROMPT,
+                    goal=self.goal,
+                    task_state=task_state,
+                    tool_names=tool_names,
+                )
             elif self.phase == self.PHASE_OUTPUT:
                 if self._output_turn >= 2:
-                    base = DEFAULT_OUTPUT_FINAL_PROMPT.format(goal=self.goal, task_state=task_state)
+                    base = self._render_prompt(
+                        self.valves.OUTPUT_FINAL_PROMPT or DEFAULT_OUTPUT_FINAL_PROMPT,
+                        goal=self.goal,
+                    )
                 else:
-                    base = (self.valves.OUTPUT_PROMPT or DEFAULT_OUTPUT_PROMPT).format(goal=self.goal, task_state=task_state)
+                    base = self._render_prompt(
+                        self.valves.OUTPUT_PROMPT or DEFAULT_OUTPUT_PROMPT,
+                        goal=self.goal,
+                        task_state=task_state,
+                        tool_names=tool_names,
+                    )
             else:
-                base = DEFAULT_PLAN_PROMPT.format(tool_names=tool_names)
-        except (KeyError, IndexError, ValueError):
-            # User-provided prompt may have stray braces; fall back to default
+                base = self._render_prompt(DEFAULT_PLAN_PROMPT, tool_names=tool_names)
+        except Exception:
+            # Last-resort fallback if rendering itself somehow fails
             if self.phase == self.PHASE_PLAN:
-                base = DEFAULT_PLAN_PROMPT.format(tool_names=tool_names)
+                base = self._render_prompt(DEFAULT_PLAN_PROMPT, tool_names=tool_names)
             elif self.phase == self.PHASE_REPLAN:
-                base = DEFAULT_REPLAN_PROMPT.format(tool_names=tool_names, goal=self.goal)
+                base = self._render_prompt(DEFAULT_REPLAN_PROMPT, tool_names=tool_names, goal=self.goal)
             elif self.phase == self.PHASE_EXECUTE:
-                base = DEFAULT_EXECUTE_PROMPT.format(tool_names=tool_names, task_state=task_state)
+                base = self._render_prompt(DEFAULT_EXECUTE_PROMPT, tool_names=tool_names, task_state=task_state)
             elif self.phase == self.PHASE_REVIEW:
-                base = DEFAULT_REVIEW_PROMPT.format(goal=self.goal, task_state=task_state, tool_names=tool_names)
+                base = self._render_prompt(DEFAULT_REVIEW_PROMPT, goal=self.goal, task_state=task_state, tool_names=tool_names)
             elif self.phase == self.PHASE_OUTPUT:
                 if self._output_turn >= 2:
-                    base = DEFAULT_OUTPUT_FINAL_PROMPT.format(goal=self.goal, task_state=task_state)
+                    base = self._render_prompt(self.valves.OUTPUT_FINAL_PROMPT or DEFAULT_OUTPUT_FINAL_PROMPT, goal=self.goal)
                 else:
-                    base = DEFAULT_OUTPUT_PROMPT.format(goal=self.goal, task_state=task_state)
+                    base = self._render_prompt(DEFAULT_OUTPUT_PROMPT, goal=self.goal, task_state=task_state, tool_names=tool_names)
             else:
-                base = DEFAULT_PLAN_PROMPT.format(tool_names=tool_names)
+                base = self._render_prompt(DEFAULT_PLAN_PROMPT, tool_names=tool_names)
 
         base = base.replace("[USER_HOME]", os.path.expanduser("~"))
 
@@ -2872,6 +3049,8 @@ class HelixAgentEngine:
         self._output_parts = []
 
         while True:
+            effective_max = self.valves.MAX_ITERATIONS + self._extra_grace
+
             # ── OUTPUT phase hard limit: max 2 turns (tool prep + final text) ──
             if self.phase == self.PHASE_OUTPUT:
                 self._output_turn += 1
@@ -2881,7 +3060,6 @@ class HelixAgentEngine:
                     await self.emit_status("Output phase exceeded max turns", done=True)
                     return self._format_output()
 
-            effective_max = self.valves.MAX_ITERATIONS + self._extra_grace
             if self.loop_count >= effective_max:
                 await self.emit_output(f"\n[WARN] Max iterations ({effective_max}) reached.")
                 should_continue = False
@@ -2915,13 +3093,6 @@ class HelixAgentEngine:
                 self._transition_to(self.PHASE_EXECUTE)
                 await self.emit_task_update()
 
-            phase_icons = {
-                self.PHASE_PLAN: "[PLAN]",
-                self.PHASE_REPLAN: "[QPLN]",
-                self.PHASE_EXECUTE: "[EXEC]",
-                self.PHASE_REVIEW: "[REVU]",
-                self.PHASE_OUTPUT: "[OUT]",
-            }
             phase_name = {
                 self.PHASE_PLAN: "Plan",
                 self.PHASE_REPLAN: "Replan",
@@ -2929,7 +3100,6 @@ class HelixAgentEngine:
                 self.PHASE_REVIEW: "Review",
                 self.PHASE_OUTPUT: "Output",
             }
-            icon = phase_icons.get(self.phase, "[LOOP]")
             name = phase_name.get(self.phase, "Loop")
 
             effective_max = self.valves.MAX_ITERATIONS + self._extra_grace
@@ -3123,8 +3293,8 @@ class HelixAgentEngine:
                     result = args.get("result", "Task complete.")
                     success = args.get("success", True)
                     icon = "[OK]" if success else "[FAIL]"
-                    await self._save_state_to_file()
-                    await self.emit_task_update(finalize_tasks=True)
+                    await self._save_state_to_file(force=True)
+                    await self.emit_task_update(finalize_tasks=True)                    
                     if content:
                         await self.emit_output(content + "\n\n")
                     await self.emit_output(f"{icon} **Finished:** {result}")
@@ -3327,39 +3497,53 @@ class HelixAgentEngine:
                 else:
                     recent_calls.append(sig)
                     await self.emit_status(f"Running: {tool_name}...")
-                    result_str, result_files = await self._execute_tool(tool_name, args, call_id)
-                    # Track and persist tool-generated files safely
-                    new_files = await self._append_produced_files(result_files)
-                    if new_files and self.event_emitter:
-                        await self.event_emitter({
-                            "type": "chat:message:files",
-                            "data": {"files": new_files},
-                        })
-                    truncation_limit = self._get_truncation_limit()
-                    tool_result = smart_truncate(result_str, truncation_limit)
 
-                    # ── Consecutive tool-not-found tracking ──
-                    if "not found in current phase" in tool_result:
-                        self._consecutive_tool_misses[tool_name] = self._consecutive_tool_misses.get(tool_name, 0) + 1
-                        miss_count = self._consecutive_tool_misses[tool_name]
-                        max_errors = self.valves.MAX_CONSECUTIVE_ERRORS
-                        available_tools = ", ".join(sorted(self.phase_tools_dict.keys())[:30])
-                        warning_msg = (
-                            f"[WARN] Tool '{tool_name}' is not available in the current phase ({self.phase}). "
-                            f"Attempt {miss_count}. Available tools: {available_tools}. "
-                            f"Please check the tool name and use only tools listed for this phase."
-                        )
-                        should_stop = getattr(self.valves, "ENABLE_HARD_STOP_ON_ERRORS", False) and miss_count >= max_errors
-                        if should_stop:
-                            await self.emit_output(f"\n[ERROR] Tool '{tool_name}' unavailable {max_errors} times. Stopping.\n")
-                            await self.emit_task_update(finalize_tasks=True)
-                            await self.emit_status("Tool unavailable", done=True)
-                            return self._format_output()
-                        # Append a strong warning that the model will see in its next turn,
-                        # replacing the generic error with a more informative one.
-                        tool_result = warning_msg
-                    else:
-                        self._consecutive_tool_misses.clear()
+                    # ── Schema validation for single tool calls ──
+                    validation_failed = False
+                    target_tool = self.phase_tools_dict.get(tool_name)
+                    if target_tool:
+                        v_errs = self._validate_tool_args(target_tool.get("spec", {}), args)
+                        if v_errs:
+                            tool_result = (
+                                f"Validation error for `{tool_name}`:\n"
+                                + "\n".join(f"- {e}" for e in v_errs)
+                            )
+                            validation_failed = True
+
+                    if not validation_failed:
+                        result_str, result_files = await self._execute_tool(tool_name, args, call_id)
+                        # Track and persist tool-generated files safely
+                        new_files = await self._append_produced_files(result_files)
+                        if new_files and self.event_emitter:
+                            await self.event_emitter({
+                                "type": "chat:message:files",
+                                "data": {"files": new_files},
+                            })
+                        truncation_limit = self._get_truncation_limit()
+                        tool_result = smart_truncate(result_str, truncation_limit)
+
+                        # ── Consecutive tool-not-found tracking ──
+                        if "not found in current phase" in tool_result:
+                            self._consecutive_tool_misses[tool_name] = self._consecutive_tool_misses.get(tool_name, 0) + 1
+                            miss_count = self._consecutive_tool_misses[tool_name]
+                            max_errors = self.valves.MAX_CONSECUTIVE_ERRORS
+                            available_tools = ", ".join(sorted(self.phase_tools_dict.keys())[:30])
+                            warning_msg = (
+                                f"[WARN] Tool '{tool_name}' is not available in the current phase ({self.phase}). "
+                                f"Attempt {miss_count}. Available tools: {available_tools}. "
+                                f"Please check the tool name and use only tools listed for this phase."
+                            )
+                            should_stop = getattr(self.valves, "ENABLE_HARD_STOP_ON_ERRORS", False) and miss_count >= max_errors
+                            if should_stop:
+                                await self.emit_output(f"\n[ERROR] Tool '{tool_name}' unavailable {max_errors} times. Stopping.\n")
+                                await self.emit_task_update(finalize_tasks=True)
+                                await self.emit_status("Tool unavailable", done=True)
+                                return self._format_output()
+                            # Append a strong warning that the model will see in its next turn,
+                            # replacing the generic error with a more informative one.
+                            tool_result = warning_msg
+                        else:
+                            self._consecutive_tool_misses.clear()
 
                 self.history.append({
                     "role": "tool",
@@ -3396,13 +3580,13 @@ class HelixAgentEngine:
             return result
         except GeneratorExit:
             logger.info("Agent loop cancelled by user (GeneratorExit).")
-            await self._save_state_to_file()
+            await self._save_state_to_file(force=True)
             await self.emit_task_update(finalize_tasks=True)
             await self.emit_status("Cancelled", done=True)
             raise
         except asyncio.CancelledError:
             logger.info("Agent loop cancelled (CancelledError).")
-            await self._save_state_to_file()
+            await self._save_state_to_file(force=True)
             await self.emit_task_update(finalize_tasks=True)
             await self.emit_status("Cancelled", done=True)
             raise
@@ -3412,8 +3596,9 @@ class HelixAgentEngine:
             return f"\n[ERROR] Agent loop failed: {e}"
         finally:
             await self._disconnect_mcp_clients()
-            await self._sync_produced_files_to_db()
-            if HAS_DB_PERSISTENCE and self.chat_id and self.message_id:
+            sync_success = await self._sync_produced_files_to_db()
+            if not sync_success and HAS_DB_PERSISTENCE and self.chat_id and self.message_id:
+                # Only schedule backup retry when the immediate sync actually failed
                 snapshot = list(self.produced_files)
                 asyncio.get_running_loop().create_task(
                     self._delayed_sync_with_backoff(
@@ -3421,6 +3606,7 @@ class HelixAgentEngine:
                     )
                 )
             self._seen_file_ids.clear()
+            self.produced_files.clear()
 
     def _extract_task_list(self, text):
         if not text:
@@ -3582,7 +3768,11 @@ class Pipe:
         )
         OUTPUT_PROMPT: str = Field(
             default=DEFAULT_OUTPUT_PROMPT,
-            description="System prompt for OUTPUT phase — Turn 1 (collection / rendering allowed). Available placeholders: {goal}, {task_state}."
+            description="System prompt for OUTPUT phase — Turn 1 (collection / rendering / tool calls allowed). Available placeholders: {goal}, {task_state}, {tool_names}."
+        )
+        OUTPUT_FINAL_PROMPT: str = Field(
+            default=DEFAULT_OUTPUT_FINAL_PROMPT,
+            description="System prompt for OUTPUT phase — Turn 2 (final answer, NO tools). Available placeholders: {goal}."
         )
         CONTEXT_COMPRESSION_MODEL: str = Field(
             default="",
