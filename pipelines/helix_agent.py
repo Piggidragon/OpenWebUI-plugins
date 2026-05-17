@@ -97,9 +97,10 @@ What to do:
 2. Use your available tools to understand the scope (read files, search knowledge, etc.), but do NOT perform the actual task yet (e.g., do not write files, push code, or execute actions).
 3. Create a numbered task list that covers the entire goal.
 4. Each task should be a clear, actionable step.
-5. After creating the plan, call confirm_plan with the plan text to present it for review.
+5. If the goal involves writing code or creating files, include explicit verification tasks (e.g., syntax check, lint, run a quick test).
+6. After creating the plan, call confirm_plan with the plan text to present it for review.
 
-File paths: If the plan involves creating files, decide on a project folder name (short slug based on the goal) under `/home/userxy/agent/`. All files for this task must be written within that project folder.
+File paths: If the plan involves creating files, decide on a ONE project folder name (short slug based on the goal) under `[USER_HOME]/agent/`. ALL files for this task and any follow-up turns on the SAME topic must be written within that project folder. Do NOT write into the bare `[USER_HOME]/agent/` root.
 
 Plan format for confirm_plan:
 When calling confirm_plan, provide the plan parameter as a numbered list with one task per line:
@@ -117,7 +118,6 @@ Rules:
 - Call exactly ONE tool per step.
 - When done planning, call confirm_plan with the plan for confirmation.
 - If the request is inappropriate or impossible, call terminate with a brief explanation.
-- NEVER call replan in PLAN mode.
 - If a tool returns an error during planning (e.g., file not found), note the limitation in your plan. Do not call fix_plan for planning-stage errors.
 - If the user rejects your plan with feedback, revise the plan based on their feedback and call confirm_plan again with the updated plan. Do NOT repeat the same plan unchanged.
 - If the user cancels the plan, acknowledge it and stop.
@@ -143,15 +143,17 @@ What to do:
 4. If a task fails and cannot be recovered, call fail_task(index, reason) to mark it.
 5. Move on to the next task.
 
-File paths: Create a project folder under `/home/userxy/agent/` named after the current task/goal (use a short slug). All files for this project must be written within that folder. Do not scatter files across unrelated directories.
+File paths: All files MUST be written into the SAME project subfolder under `[USER_HOME]/agent/` (e.g. `[USER_HOME]/agent/website-redesign/`). Use a short slug based on the current task/goal. EVERY file created in this or follow-up turns for the SAME topic must go into that SAME project folder. NEVER scatter files across unrelated directories and NEVER write into the bare `[USER_HOME]/agent/` root.
+
+Code verification: If a task involves writing code, you MUST verify syntax before calling complete_task. Use appropriate validation tools (e.g. `python -m py_compile`, `bash -n`, `node --check`, a linter, or any available syntax-check tool). Only mark the task complete once the code passes validation or the validation failure has been documented.
 
 Rules:
-- Call exactly ONE tool per step.
+- Call exactly ONE tool per step OR use run_tools_parallel for multiple independent calls.
 - NEVER repeat identical failed tool calls (duplicate detection is active).
 - When all tasks are done, the system will move to review automatically. You may also call early_finish(reason) if you believe you're done early.
 - If a tool returns an error, analyze it and retry with corrected parameters. You do NOT need to call fix_plan for trivial errors.
 - Only call fix_plan if the same task fails repeatedly (3+ attempts) or if the task design was wrong.
-- Only call replan(mode='soft') if the entire approach is wrong. Use replan(mode='hard') only for complete strategy replacement.
+- Only call replan(reason, updated_tasks) if the entire approach is wrong and a new plan is needed. It will enter Replan mode where you must then call confirm_plan with the new tasks.
 - If you need to think step-by-step before acting, do so — reasoning will be captured in a collapsible block.
 - You MUST call complete_task(index) or fail_task(index, reason) after working on a task.
 - Use `run_tools_parallel` to call multiple independent tools at once for efficiency.
@@ -173,11 +175,12 @@ You MUST call exactly ONE of these tools:
 
 1. `proceed_to_output()` — Everything is done and correct. Move to the OUTPUT phase to generate the polished final answer.
 2. `fix_plan(reason, updated_tasks)` — Only minor fixes are needed (a task failed or needs a small correction). List just the new/corrected tasks.
-3. `replan(reason, updated_tasks, mode="soft")` — The overall strategy is broken and tasks need to be replaced entirely.
+3. `replan(reason, updated_tasks)` — The overall strategy is broken and tasks need to be replaced entirely. The agent will enter Replan mode and you must then call confirm_plan with the updated plan.
 
 Rules:
 - If there are only minor issues with individual tasks, ALWAYS prefer `fix_plan` over `replan`. Only use `replan` if the overall strategy is broken.
 - Be honest — don't call `proceed_to_output` if something is missing or wrong.
+- Check that code-related tasks have actually produced files in the correct project folder `[USER_HOME]/agent/<project>/` and, if a verification task exists, that it passed or was handled.
 - If the result is good enough, call `proceed_to_output`. Don't gold-plate.
 - Provide a brief reasoning for your assessment before calling the final tool.
 - You may only use the tools listed above.
@@ -197,10 +200,10 @@ Write the final answer.
 Goal: {goal}
 """
 
-DEFAULT_REPLAN_SKIP_PROMPT = """\
-You are in QUICK REPLAN mode. A previous session completed, and the user has a new request.
+DEFAULT_REPLAN_PROMPT = """\
+You are in REPLAN mode. A previous session completed or the approach needs to change, and a new task plan is required.
 
-PHASE: QUICK REPLAN
+PHASE: REPLAN
 
 Available tools: {tool_names}
 
@@ -208,26 +211,19 @@ Recent context (previous goal):
 {goal}
 
 What to do:
-1. Review the previous goal and the user's new request.
+1. Review the previous goal and the current request.
 2. Create a minimal, focused task plan (1-3 tasks) that addresses the new request in the context of what was already done.
-3. Call confirm_plan with the updated plan.
+3. If the goal involves writing code or creating files, include explicit verification tasks (e.g., syntax check, lint, run a quick test).
+4. Call confirm_plan with the updated plan.
+
+File paths: If the plan involves creating files, decide on a ONE project folder name (short slug based on the goal) under `[USER_HOME]/agent/`. ALL files for this task and any follow-up turns on the SAME topic must be written within that project folder. Do NOT write into the bare `[USER_HOME]/agent/` root.
 
 Plan format for confirm_plan:
-When calling confirm_plan, provide the plan parameter as a numbered list with one task per line:
-1. First task description
-2. Second task description
-
-Alternatively, you may provide the plan as JSON: {{"tasks": ["task 1", "task 2"]}}
+- Numbered list (1., 2., 3.) with short, specific action items.
 
 Rules:
-- Keep the plan short and actionable. 1-3 tasks maximum.
-- Re-use previous context where relevant.
-- Call exactly ONE tool per step.
-- When done, call confirm_plan to move to execution.
-- NEVER call terminate in QUICK REPLAN mode.
-- You may use the ask_user tool to ask the user a multiple-choice question if you need clarification.
-- You may only use the tools listed above.
-- ABSOLUTELY CRITICAL: You MUST call confirm_plan to finish QUICK REPLAN mode. Do NOT answer the user directly. Do NOT generate story text, code, or any other output. Only call tools.
+- You may call ask_user ONCE if the new request is ambiguous.
+- ABSOLUTELY CRITICAL: You MUST call confirm_plan to finish REPLAN mode. Do NOT answer the user directly. Do NOT generate story text, code, or any other output. Only call tools.
 """
 
 
@@ -419,20 +415,20 @@ class HelixAgentEngine:
     PHASE_EXECUTE = "execute"
     PHASE_REVIEW = "review"
     PHASE_OUTPUT = "output"
-    PHASE_REPLAN_SKIP = "replan_skip"  # Quick replan when previous session finished
+    PHASE_REPLAN = "replan"  # Replan when previous session finished
 
     MAX_HISTORY_MESSAGES = 100
-    MAX_REPLAN_SKIP_LOOPS = 3  # Safety net: max loops in quick replan phase
+    MAX_REPLAN_LOOPS = 3  # Safety net: max loops in replan phase
 
     # Internal tools that are ALWAYS available regardless of phase filters
     INTERNAL_TOOLS = {"terminate", "replan", "complete_task", "fail_task", "confirm_plan", "fix_plan", "proceed_to_output", "early_finish", "run_tools_parallel"}
 
     PHASE_INTERNAL_TOOLS = {
-        PHASE_PLAN:       {"terminate", "replan", "complete_task", "fail_task", "confirm_plan", "fix_plan"},
+        PHASE_PLAN:       {"terminate", "complete_task", "fail_task", "confirm_plan", "fix_plan"},
         PHASE_EXECUTE:    {"replan", "complete_task", "fail_task", "fix_plan", "early_finish", "run_tools_parallel"},
         PHASE_REVIEW:     {"proceed_to_output", "replan", "fix_plan"},
         PHASE_OUTPUT:     set(),
-        PHASE_REPLAN_SKIP:{"confirm_plan", "ask_user"},  # Quick replan has minimal internal tools
+        PHASE_REPLAN:    {"confirm_plan", "ask_user"},  # Replan phase has minimal internal tools
     }
 
     def __init__(self, request, user, body, event_emitter, event_call, metadata, valves, user_valves=None, incoming_tools=None):
@@ -471,7 +467,7 @@ class HelixAgentEngine:
         self._mcp_clients: Dict[str, Any] = {}
         self._extra_grace = 0
         self.consecutive_json_errors = 0
-        self._plan_questions_asked = 0  # Counter for ask_user calls in PLAN/REPLAN_SKIP
+        self._plan_questions_asked = 0  # Counter for ask_user calls in PLAN/REPLAN
         self._incoming_tools = list(incoming_tools) if incoming_tools else []
         self._incoming_tool_names = set()
         self._builtin_tools_names = set()
@@ -825,13 +821,12 @@ class HelixAgentEngine:
         self.all_tools_dict["replan"] = {
             "spec": {
                 "name": "replan",
-                "description": "Adjust the plan. Mode 'soft' (default) compresses history and keeps context for continuity. Mode 'hard' does a full reset with new task list.",
+                "description": "Restart planning. Use when the current approach is not working and you need to create a new plan. Preserves conversation history and context. After calling this tool, the agent will enter Replan mode where you must call confirm_plan with the updated task list.",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "reason": {"type": "string", "description": "What went wrong or what is missing"},
-                        "updated_tasks": {"type": "string", "description": "Updated task list as numbered steps (only what is still needed)"},
-                        "mode": {"type": "string", "enum": ["soft", "hard"], "description": "Replan mode: 'soft' (default) = compress history and keep context, 'hard' = full reset with new task list"},
+                        "reason": {"type": "string", "description": "What went wrong or why the plan needs to change"},
+                        "updated_tasks": {"type": "string", "description": "Updated task list as numbered steps (only what is still needed). If empty, existing non-completed tasks are kept."},
                     },
                     "required": ["reason"],
                 },
@@ -959,7 +954,7 @@ class HelixAgentEngine:
         self.all_tools_dict["ask_user"] = {
             "spec": {
                 "name": "ask_user",
-                "description": "Ask the user an interactive question with selectable options and optional custom free-text input. Use this ONLY when you need clarification or a decision from the user before you can continue planning. Available ONLY in PLAN and QUICK REPLAN phases. NOT available in EXECUTE, REVIEW or OUTPUT phases.",
+                "description": "Ask the user an interactive question with selectable options and optional custom free-text input. Use this ONLY when you need clarification or a decision from the user before you can continue planning.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -1228,8 +1223,8 @@ class HelixAgentEngine:
 
         if phase == self.PHASE_PLAN:
             allowlist = set(_comma_list(self.valves.PLAN_TOOLS))
-        elif phase == self.PHASE_REPLAN_SKIP:
-            allowlist = set(_comma_list(self.valves.PLAN_TOOLS))  # Same tools as PLAN for quick replan
+        elif phase == self.PHASE_REPLAN:
+            allowlist = set(_comma_list(self.valves.PLAN_TOOLS))  # Same tools as PLAN for replan
         elif phase == self.PHASE_EXECUTE:
             allowlist = set(_comma_list(self.valves.EXECUTE_TOOLS))
         elif phase == self.PHASE_REVIEW:
@@ -1251,9 +1246,9 @@ class HelixAgentEngine:
                     self.phase_tools_dict[name] = tool
                 continue
 
-            # ask_user is shown only in PLAN and REPLAN_SKIP phases (planning / clarification only)
+            # ask_user is shown only in PLAN and REPLAN phases (planning / clarification only)
             if name == "ask_user":
-                if phase in (self.PHASE_PLAN, self.PHASE_REPLAN_SKIP):
+                if phase in (self.PHASE_PLAN, self.PHASE_REPLAN):
                     self.phase_tools_dict[name] = tool
                 continue
 
@@ -1276,54 +1271,33 @@ class HelixAgentEngine:
     async def _tool_terminate(self, **kwargs):
         return json.dumps({"terminated": True, "result": kwargs.get("result", ""), "success": kwargs.get("success", True)})
 
-    # Soft or hard reset. Prefer soft mode to preserve compressed history.
-    async def _tool_replan(self, reason: str, updated_tasks: str, mode: str = "soft", **kwargs):
-        """Process a replan: update task list and compress or reset history."""
+    # Replan: transition to REPLAN phase to create a new plan while preserving context.
+    async def _tool_replan(self, reason: str, updated_tasks: str = "", **kwargs):
+        """Process a replan: transition to REPLAN phase for the LLM to create a new plan."""
         new_tasks = self._extract_task_list(updated_tasks) if updated_tasks else []
 
-        if mode == "soft":
-            # Soft replan: replace task list (or keep remaining), compress history
-            if new_tasks:
-                # Replace the task list entirely; old tasks are preserved in compressed history
-                self.task_list = new_tasks
-            else:
-                failed_task_names = {f["task"] for f in self.failed_tasks}
-                self.task_list = [
-                    t for t in self.task_list
-                    if t not in self.completed_tasks and t not in failed_task_names
-                ]
-            self.completed_tasks = []
-            self.failed_tasks = []
-            self.consecutive_json_errors = 0
-            # Grant 3 extra iterations without rewinding the persistent counter
-            self._extra_grace += 3
-            # Compress history via LLM when soft-replanning
-            await self._compress_history_llm()
+        # Update task list if new tasks were provided
+        if new_tasks:
+            self.task_list = new_tasks
         else:
-            # Hard replan: replace task list entirely, full history reset
-            if new_tasks:
-                self.task_list = new_tasks
-            else:
-                failed_task_names = {f["task"] for f in self.failed_tasks}
-                self.task_list = [
-                    t for t in self.task_list
-                    if t not in self.completed_tasks and t not in failed_task_names
-                ]
-            self.completed_tasks = []
-            self.failed_tasks = []
-            self.consecutive_json_errors = 0
-            self.loop_count = 0
-            self.history = [
-                {"role": "system", "content": self._build_system_prompt()},
-                {"role": "user", "content": self.goal},
+            # Keep only tasks that are not completed or failed
+            failed_task_names = {f["task"] for f in self.failed_tasks}
+            self.task_list = [
+                t for t in self.task_list
+                if t not in self.completed_tasks and t not in failed_task_names
             ]
 
-        if self.phase in (self.PHASE_REVIEW, self.PHASE_OUTPUT):
-            self._transition_to(self.PHASE_EXECUTE)
+        self.completed_tasks = []
+        self.failed_tasks = []
+        self.consecutive_json_errors = 0
 
+        # Transition to REPLAN phase
+        self._transition_to(self.PHASE_REPLAN)
+        self.loop_count = 0
+        self._plan_questions_asked = 0
         await self._save_state_to_file()
         await self.emit_task_update()
-        return json.dumps({"replan": True, "reason": reason, "updated_tasks": updated_tasks, "mode": mode})
+        return json.dumps({"replan": True, "reason": reason, "tasks": self.task_list})
 
     async def _tool_complete_task(self, **kwargs):
         idx = kwargs.get("index", -1)
@@ -1394,8 +1368,8 @@ class HelixAgentEngine:
         if uv and (getattr(uv, "YOLO_MODE", False) or not getattr(uv, "ENABLE_PLAN_APPROVAL", False)):
             return json.dumps({"action": "accept"})
 
-        # Auto-accept when in QUICK REPLAN phase to keep the skip flow fast
-        if self.phase == self.PHASE_REPLAN_SKIP:
+        # Auto-accept when in REPLAN phase to keep the skip flow fast
+        if self.phase == self.PHASE_REPLAN:
             return json.dumps({"action": "accept"})
 
         if not self.event_call:
@@ -1432,8 +1406,8 @@ class HelixAgentEngine:
         return json.dumps({"early_finish": False, "error": f"Cannot early_finish from {self.phase}"})
 
     async def _tool_ask_user(self, question: str, options: list, allow_custom: bool = True, **kwargs):
-        """Interactive user question tool. Only available during PLAN and QUICK REPLAN phases."""
-        if self.phase in (self.PHASE_PLAN, self.PHASE_REPLAN_SKIP):
+        """Interactive user question tool. Only available during PLAN and REPLAN phases."""
+        if self.phase in (self.PHASE_PLAN, self.PHASE_REPLAN):
             self._plan_questions_asked += 1
             max_questions = getattr(self.user_valves, "MAX_PLAN_QUESTIONS", 3)
             if self._plan_questions_asked >= max_questions:
@@ -2457,8 +2431,8 @@ class HelixAgentEngine:
         try:
             if self.phase == self.PHASE_PLAN:
                 base = (self.valves.PLAN_PROMPT or DEFAULT_PLAN_PROMPT).format(tool_names=tool_names)
-            elif self.phase == self.PHASE_REPLAN_SKIP:
-                base = DEFAULT_REPLAN_SKIP_PROMPT.format(tool_names=tool_names, goal=self.goal)
+            elif self.phase == self.PHASE_REPLAN:
+                base = DEFAULT_REPLAN_PROMPT.format(tool_names=tool_names, goal=self.goal)
             elif self.phase == self.PHASE_EXECUTE:
                 base = (self.valves.EXECUTE_PROMPT or DEFAULT_EXECUTE_PROMPT).format(tool_names=tool_names, task_state=task_state)
             elif self.phase == self.PHASE_REVIEW:
@@ -2474,8 +2448,8 @@ class HelixAgentEngine:
             # User-provided prompt may have stray braces; fall back to default
             if self.phase == self.PHASE_PLAN:
                 base = DEFAULT_PLAN_PROMPT.format(tool_names=tool_names)
-            elif self.phase == self.PHASE_REPLAN_SKIP:
-                base = DEFAULT_REPLAN_SKIP_PROMPT.format(tool_names=tool_names, goal=self.goal)
+            elif self.phase == self.PHASE_REPLAN:
+                base = DEFAULT_REPLAN_PROMPT.format(tool_names=tool_names, goal=self.goal)
             elif self.phase == self.PHASE_EXECUTE:
                 base = DEFAULT_EXECUTE_PROMPT.format(tool_names=tool_names, task_state=task_state)
             elif self.phase == self.PHASE_REVIEW:
@@ -2487,6 +2461,8 @@ class HelixAgentEngine:
                     base = DEFAULT_OUTPUT_PROMPT.format(goal=self.goal, task_state=task_state)
             else:
                 base = DEFAULT_PLAN_PROMPT.format(tool_names=tool_names)
+
+        base = base.replace("[USER_HOME]", os.path.expanduser("~"))
 
         # Prepend skill prompt if resolved (available in all phases)
         if self._skill_prompt:
@@ -2855,28 +2831,28 @@ class HelixAgentEngine:
             self.history.append({"role": "user", "content": user_msg})
             self._filter_tools_for_phase(self.phase)
             await self.emit_task_update()
-        elif self.goal and not self.task_list and self.phase == self.PHASE_REPLAN_SKIP:
-            # Interrupted Quick Replan (task_list empty because confirm_plan not yet called)
-            logger.info("Resuming interrupted Quick Replan phase.")
+        elif self.goal and not self.task_list and self.phase == self.PHASE_REPLAN:
+            # Interrupted Replan (task_list empty because confirm_plan not yet called)
+            logger.info("Resuming interrupted Replan phase.")
             self.loop_count = 0
             self._plan_questions_asked = 0
             if user_msg not in self.goal:
                 self.goal = self.goal + "\n\nNEW REQUEST:\n" + user_msg
             self.history.append({"role": "user", "content": user_msg})
-            self._filter_tools_for_phase(self.PHASE_REPLAN_SKIP)
+            self._filter_tools_for_phase(self.PHASE_REPLAN)
             await self.emit_task_update()
         elif self.goal and self.task_list and not has_remaining_tasks and self.user_valves and getattr(self.user_valves, "SKIP_PLAN_ON_RESUME", True):
-            # Previous session finished. Use Quick Replan phase to let the agent plan the new request.
-            logger.info("Previous session finished; entering Quick Replan phase.")
+            # Previous session finished. Use Replan phase to let the agent plan the new request.
+            logger.info("Previous session finished; entering Replan phase.")
             self.loop_count = 0
             self._plan_questions_asked = 0
             self.task_list = []
             self.completed_tasks = []
             self.failed_tasks = []
             self.goal = self.goal + "\n\nNEW REQUEST:\n" + user_msg
-            self.phase = self.PHASE_REPLAN_SKIP
+            self.phase = self.PHASE_REPLAN
             self.history.append({"role": "user", "content": user_msg})
-            self._filter_tools_for_phase(self.PHASE_REPLAN_SKIP)
+            self._filter_tools_for_phase(self.PHASE_REPLAN)
             await self.emit_task_update()
         else:
             # Fresh session: reset state and start from PLAN
@@ -2932,23 +2908,23 @@ class HelixAgentEngine:
             self.loop_count += 1
             recent_calls = recent_calls[-30:]
 
-            # Safety-net for REPLAN_SKIP: max 3 loops, then fallback to single-task EXECUTE
-            if self.phase == self.PHASE_REPLAN_SKIP and self.loop_count >= self.MAX_REPLAN_SKIP_LOOPS:
-                logger.warning("REPLAN_SKIP reached %d loops; falling back to single-task EXECUTE.", self.MAX_REPLAN_SKIP_LOOPS)
+            # Safety-net for REPLAN: max 3 loops, then fallback to single-task EXECUTE
+            if self.phase == self.PHASE_REPLAN and self.loop_count >= self.MAX_REPLAN_LOOPS:
+                logger.warning("REPLAN reached %d loops; falling back to single-task EXECUTE.", self.MAX_REPLAN_LOOPS)
                 self.task_list = [user_msg]
                 self._transition_to(self.PHASE_EXECUTE)
                 await self.emit_task_update()
 
             phase_icons = {
                 self.PHASE_PLAN: "[PLAN]",
-                self.PHASE_REPLAN_SKIP: "[QPLN]",
+                self.PHASE_REPLAN: "[QPLN]",
                 self.PHASE_EXECUTE: "[EXEC]",
                 self.PHASE_REVIEW: "[REVU]",
                 self.PHASE_OUTPUT: "[OUT]",
             }
             phase_name = {
                 self.PHASE_PLAN: "Plan",
-                self.PHASE_REPLAN_SKIP: "Quick Replan",
+                self.PHASE_REPLAN: "Replan",
                 self.PHASE_EXECUTE: "Execute",
                 self.PHASE_REVIEW: "Review",
                 self.PHASE_OUTPUT: "Output",
@@ -3036,7 +3012,7 @@ class HelixAgentEngine:
                 else:
                     # No tool calls and no XML rescue
                     # PLAN phase: enforce that the model must call confirm_plan.
-                    if self.phase in (self.PHASE_PLAN, self.PHASE_REPLAN_SKIP):
+                    if self.phase in (self.PHASE_PLAN, self.PHASE_REPLAN):
                         self.history.append({
                             "role": "assistant",
                             "content": content or "",
@@ -3159,7 +3135,6 @@ class HelixAgentEngine:
                 if tool_name == "replan":
                     reason = args.get("reason", "Plan needs adjustment")
                     updated = args.get("updated_tasks", "")
-                    mode = args.get("mode", "soft")
 
                     if not updated or not self._extract_task_list(updated):
                         # No new tasks provided -- check if any remaining tasks exist
@@ -3176,16 +3151,15 @@ class HelixAgentEngine:
 
                     recent_calls = []
                     self._consecutive_tool_misses.clear()
-                    result_json = await self._tool_replan(reason=reason, updated_tasks=updated, mode=mode)
+                    result_json = await self._tool_replan(reason=reason, updated_tasks=updated)
                     self.history.append({
                         "role": "tool",
                         "content": result_json,
                         "tool_call_id": call_id,
                         "name": tool_name,
                     })
-                    mode_label = "soft" if mode == "soft" else "hard"
-                    await self.emit_output(f"\n[RPLN] **Re-planning ({mode_label}):** {reason}\n")
-                    await self.emit_status(f"[RPLN] Re-planning ({mode_label}): {reason}")
+                    await self.emit_output(f"\n[RPLN] **Re-planning:** {reason}\n")
+                    await self.emit_status(f"[RPLN] Re-planning: {reason}")
                     continue
 
                 # ── Handle complete_task ──
@@ -3646,7 +3620,7 @@ class Pipe:
         )
         SKIP_PLAN_ON_RESUME: bool = Field(
             default=True,
-            description="When the previous session is finished, skip the full PLAN phase for a new user request and jump straight to a Quick Replan. Set to False to always start fresh with full PLAN phase.",
+            description="When the previous session is finished, skip the full PLAN phase for a new user request and jump straight to a Replan. Set to False to always start fresh with full PLAN phase.",
         )
         MAX_PLAN_QUESTIONS: int = Field(
             default=3,
