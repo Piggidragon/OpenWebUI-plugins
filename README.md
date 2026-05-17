@@ -34,6 +34,7 @@ Full read/write access to GitHub repositories, issues, pull requests and workflo
 - Trigger and monitor GitHub Actions workflows
 
 **User Valves:**
+
 | Valve | Default | Controls |
 |-------|---------|----------|
 | `ENABLE_CONTENT` | on | Read access to repos, files, branches, commits |
@@ -64,6 +65,7 @@ Shows a confirmation dialog before irreversible operations (file/directory delet
 Searches the entire GitHub universe — public repositories, code, issues, pull requests, commits, users and topics — right from Open WebUI. Works without a token for public searches, or with a token for higher rate limits and private repository access.
 
 **Functions:**
+
 | Function | Description |
 |----------|-------------|
 | `github_search(query, search_type)` | Main search across all types |
@@ -88,48 +90,82 @@ Pipelines are custom processing flows that run server-side in Open WebUI. Each p
 
 ---
 
-### `helix_agent.py` — Helix Agent (v4.6.1)
+### `helix_agent.py` — Helix Agent (v0.22.0)
 
-A single-model Plan → Execute → Review → Replan loop with per-phase tool control.
+A single-model **Plan → Execute → Review → Output** loop with a **Replan** phase for course correction. Per-phase tool filtering controls which tools the LLM sees at each step.
 
 **How it works:**
-1. **Plan** — The model creates a task list and calls `confirm_plan`.
-2. **Execute** — The model works through tasks, calling tools and marking them complete/failed.
-3. **Review** — Once all tasks are done, the model calls `terminate` to deliver the final result.
-4. **Replan** — If tasks need adjusting, the model calls `replan` or `fix_plan` and loops back to Execute.
+1. **Plan** — The model analyses the request and creates a numbered task list, then calls `confirm_plan` to present it.
+2. **Execute** — The model works through tasks one at a time, calling tools and marking them `complete_task` or `fail_task`. It may call `replan` or `fix_plan` if the approach needs adjusting.
+3. **Review** — After all tasks are done, the model calls one of: `proceed_to_output()` (move to Output), `fix_plan(reason, updated_tasks)` (minor fixes), or `replan(reason, updated_tasks)` (major rework → enters Replan phase).
+4. **Replan** — If `replan` is called, the model enters Replan mode and must call `confirm_plan` with the revised task list before returning to Execute.
+5. **Output** — The model gathers any missing context or renders visualisations, then writes the final answer.
+
+**Internal control tools** (always available):
+
+| Tool | Available in | Purpose |
+|------|--------------|---------|
+| `confirm_plan` | Plan, Replan | Present the task plan for approval |
+| `complete_task` | Execute | Mark a task as done |
+| `fail_task` | Execute | Mark a task as failed with a reason |
+| `fix_plan` | Execute, Review | Request minor plan corrections |
+| `replan` | Execute, Review | Enter Replan phase for major strategy changes |
+| `early_finish` | Execute | Skip to Review early |
+| `proceed_to_output` | Review | Move to the Output phase |
+| `run_tools_parallel` | Execute | Call multiple independent tools at once |
 
 **Key features:**
-- **Per-phase tool filtering** — only expose relevant tools to the LLM at each phase (configurable via Valves).
+- **Per-phase tool filtering** — only expose relevant tools to the LLM at each phase (Plan / Execute / Review / Output / Replan). Configurable via Valves.
 - **Native OWUI task list UI** — real-time task progress via `chat:message:tasks` events (pending, in_progress, completed, cancelled). No HTML hacks.
 - **Task finalization** — on termination, remaining tasks are marked completed so the task list UI dismisses cleanly.
 - **Plan confirmation** — optional modal popup (UserValves: `ENABLE_PLAN_APPROVAL`, `YOLO_MODE`).
+- **LLM-based context compression** — history and goal are compressed independently using a configurable model (`CONTEXT_COMPRESSION_MODEL`). History is compressed mid-loop when `HISTORY_COMPRESSION_THRESHOLD` is exceeded; goal is compressed asynchronously after each run.
+- **MCP support** — resolves and calls MCP server tools via OpenWebUI's `MCPClient`.
+- **Skills support** — resolves user skills from model metadata and injects them into the system prompt.
+- **Debug mode** — messages "show tools", "show mcp", or "show skills" return the available items directly without any LLM call.
 - **Context window management** — adaptive history truncation preserving tool-call pair integrity.
 - **Iteration limit** — configurable max loop iterations with a Continue/Cancel dialog.
 - **System prompt refresh** — the LLM always sees up-to-date task state after mutations.
 - **DB-backed state persistence** — agent state is serialized to a JSON file attachment and synced to the OpenWebUI chat/message DB. Recovers from deep DB history scan across parent message chains.
 - **Robust file persistence** — tool-generated files are tracked, deduplicated, and synced to the DB with exponential backoff retry.
-- **RAG search** — built-in semantic search over attached large files.
+- **Knowledge bases** — native OpenWebUI vector search via model metadata.
+- **File handling** — `add_file_context` + `chat_completion_files_handler` for native multimodal/text file injection.
 - **Graceful shutdown** — handles `GeneratorExit`/`CancelledError`, saves state, and syncs files before exiting.
 
 **Admin Valves (Valves):**
+
 | Valve | Default | Description |
 |-------|---------|-------------|
-| `AGENT_MODEL` | (empty) | Model ID for Helix Agent. Leave empty to use the selected model. Must support function calling. |
+| `DEBUG_MODE` | false | Enable debug mode. Messages "show tools", "show mcp", or "show skills" return the available items directly without any LLM call. |
+| `AGENT_MODEL` | (empty) | Model ID for Helix Agent. Must support function calling. Examples: gpt-4o, claude-3.5-sonnet, gemini-2.0-flash. Leave empty to use the selected model. |
 | `MAX_ITERATIONS` | 100 | Maximum Helix Agent iterations before stopping. |
-| `MAX_TOOL_RESULT_CHARS` | 4200 | Max characters for tool results before truncation. |
+| `MAX_TOOL_RESULT_CHARS` | 12000 | Max characters for tool results before truncation. |
 | `TOOL_TIMEOUT` | 90 | Timeout in seconds for individual tool execution. 0 to disable. |
-| `PLAN_TOOLS` | (empty) | Comma-separated tools allowed in PLAN phase. Empty = all tools. |
-| `EXECUTE_TOOLS` | (empty) | Comma-separated tools allowed in EXECUTE phase. Empty = all tools. |
-| `REVIEW_TOOLS` | (empty) | Comma-separated tools allowed in REVIEW phase. Empty = all tools. |
-| `PLAN_PROMPT` | (built-in) | Custom PLAN system prompt. Placeholders: `{tool_names}`. Leave empty to use the built-in default. |
-| `EXECUTE_PROMPT` | (built-in) | Custom EXECUTE system prompt. Placeholders: `{tool_names}`, `{task_state}`. Leave empty to use the built-in default. |
-| `REVIEW_PROMPT` | (built-in) | Custom REVIEW system prompt. Placeholders: `{goal}`, `{task_state}`, `{tool_names}`. Leave empty to use the built-in default. |
+| `ENABLE_HARD_STOP_ON_ERRORS` | false | If True, hard-stop after `MAX_CONSECUTIVE_ERRORS` consecutive tool call failures. If False, the model receives the error and can self-correct. |
+| `MAX_CONSECUTIVE_ERRORS` | 3 | Number of consecutive errors that triggers a hard stop when `ENABLE_HARD_STOP_ON_ERRORS` is True. |
+| `MAX_ATTACHMENT_SIZE_MB` | 5 | Maximum allowed size of individual attached files in MB. 0 to disable the size check. |
+| `PLAN_TOOLS` | (read-only set) | Comma-separated tools allowed in PLAN phase. Empty = all tools. |
+| `EXECUTE_TOOLS` | (broad set) | Comma-separated tools allowed in EXECUTE phase. Empty = all tools. |
+| `REVIEW_TOOLS` | (read-only + exec set) | Comma-separated tools allowed in REVIEW phase. Empty = all tools. |
+| `OUTPUT_TOOLS` | (rendering + read-only set) | Comma-separated tools allowed in OUTPUT phase. Empty = all tools. |
+| `PLAN_PROMPT` | (built-in) | Custom PLAN system prompt. Placeholder: `{tool_names}`. |
+| `EXECUTE_PROMPT` | (built-in) | Custom EXECUTE system prompt. Placeholders: `{tool_names}`, `{task_state}`. |
+| `REVIEW_PROMPT` | (built-in) | Custom REVIEW system prompt. Placeholders: `{goal}`, `{task_state}`, `{tool_names}`. |
+| `OUTPUT_PROMPT` | (built-in) | Custom OUTPUT system prompt — Turn 1 (collection / rendering). Placeholders: `{goal}`, `{task_state}`. |
+| `CONTEXT_COMPRESSION_MODEL` | (empty) | Model ID for context compression. Falls back to `AGENT_MODEL`. Consider smaller models like gemini-2.5-flash for cost efficiency. |
+| `HISTORY_COMPRESSION_THRESHOLD` | 30000 | Trigger history compression mid-loop when total history chars exceed this. |
+| `GOAL_COMPRESSION_THRESHOLD` | 3000 | Compress goal asynchronously after each run when chars exceed this. |
+| `COMPRESSION_INTERVAL` | 5 | Minimum loop iterations between consecutive history compressions. |
+| `KEEP_RECENT_MESSAGES` | 6 | Number of recent messages to always keep uncompressed. Older messages are candidates for compression. |
 
 **User Valves (UserValves):**
+
 | Valve | Default | Description |
 |-------|---------|-------------|
 | `ENABLE_PLAN_APPROVAL` | true | Show plan confirmation popup before execution. When off, plans are auto-approved without asking the user. |
 | `YOLO_MODE` | false | Skip all user confirmations. Auto-approve plans and ignore iteration limits. |
+| `SKIP_PLAN_ON_RESUME` | true | When the previous session is finished, skip the full PLAN phase for a new user request and jump straight to Replan. Set to False to always start fresh with a full PLAN phase. |
+| `MAX_PLAN_QUESTIONS` | 3 | Maximum number of clarification questions (`ask_user`) the agent may ask per planning phase before it is forced to finalise the plan. |
 
 ---
 
