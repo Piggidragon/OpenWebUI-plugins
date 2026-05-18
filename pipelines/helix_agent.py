@@ -1,7 +1,7 @@
 """
 title: Helix Agent
 author: Piggidragon
-version: 0.22.1
+version: 0.22.2
 description: >
   Helix Agent — OpenWebUI-native agent loop with modular per-phase tool control.
 
@@ -3738,25 +3738,25 @@ class HelixAgentEngine:
 
 class Pipe:
     class Valves(BaseModel):
-        DEBUG_MODE: bool = Field(
-            default=False,
-            description="Enable debug mode. When on, messages 'show tools', 'show mcp', or 'show skills' return the available items directly without any LLM call.",
-        )
+        # ── 1. Model ──
         AGENT_MODEL: str = Field(
             default="",
-            description="Model ID for Helix Agent. The model MUST support function calling (tool use). Examples: gpt-4o, claude-3.5-sonnet, gemini-2.0-flash."
+            description="Model ID for Helix Agent. The model MUST support native tool calling."
         )
+        CONTEXT_COMPRESSION_MODEL: str = Field(
+            default="",
+            description="Model ID for context compression. If empty, falls back to AGENT_MODEL.",
+        )
+
+        # ── 2. Iteration & Loop Safety ──
         MAX_ITERATIONS: int = Field(
             default=100,
             description="Maximum Helix Agent iterations before stopping."
         )
-        MAX_TOOL_RESULT_CHARS: int = Field(
-            default=12000,
-            description="Max characters for tool results before truncation. Increased from 4200 because context compression now handles long tool outputs gracefully.",
-        )
-        TOOL_TIMEOUT: int = Field(
-            default=90,
-            description="Timeout in seconds for individual tool execution. Set to 0 to disable."
+        MAX_REPLAN_LOOPS: int = Field(
+            default=3,
+            ge=0,
+            description="Safety cap: after this many REPLAN loops the agent falls back to single-task EXECUTE.",
         )
         ENABLE_HARD_STOP_ON_ERRORS: bool = Field(
             default=False,
@@ -3766,26 +3766,44 @@ class Pipe:
             default=3,
             description="Number of consecutive errors that triggers a hard stop when ENABLE_HARD_STOP_ON_ERRORS is True."
         )
-        MAX_ATTACHMENT_SIZE_MB: int = Field(
-            default=5,
-            description="Maximum allowed size of individual attached files in megabytes. Files larger than this will trigger an error at the start of the conversation, suggesting the user upload them to a Knowledge Base instead. Set to 0 to disable the size check."
-        )
-        PLAN_APPROVAL_TIMEOUT: int = Field(
-            default=600,
-            ge=0,
-            description="Timeout in seconds for the plan approval modal. After this time the plan is auto-approved.",
-        )
-        ITERATION_LIMIT_TIMEOUT: int = Field(
-            default=300,
-            ge=0,
-            description="Timeout in seconds for the iteration limit Continue/Cancel modal. After this time the agent auto-stops.",
-        )
         LLM_RETRY_COUNT: int = Field(
             default=1,
             ge=0,
             description="Number of retries for transient LLM API errors (ConnectionError, TimeoutError). Set to 0 to disable retries.",
         )
+        TOOL_TIMEOUT: int = Field(
+            default=90,
+            description="Timeout in seconds for individual tool execution. Set to 0 to disable."
+        )
 
+        # ── 3. Context & Memory ──
+        CONTEXT_LENGTH: int = Field(
+            default=128000,
+            ge=1000,
+            description="Context window length in tokens. A single valve that drives all adaptive compression thresholds.",
+        )
+        CHARS_PER_TOKEN_ESTIMATE: float = Field(
+            default=3.5,
+            ge=1.0,
+            description="Estimated characters per token for the active model. Used to convert token-based context limits (CONTEXT_LENGTH) into character-based internal thresholds.",
+        )
+        COMPRESSION_INTERVAL: int = Field(
+            default=5,
+            ge=1,
+            description="Minimum loop iterations between consecutive history compressions to avoid token thrashing.",
+        )
+        KEEP_RECENT_MESSAGES: int = Field(
+            default=6,
+            ge=2,
+            description="Number of recent messages to always keep uncompressed in history. Older messages are candidates for compression.",
+        )
+        MAX_HISTORY_MESSAGES: int = Field(
+            default=100,
+            ge=10,
+            description="Maximum total conversation messages retained in context. Older messages are dropped while keeping tool-call pairs intact.",
+        )
+
+        # ── 4. Phase Tools & Prompts ──
         PLAN_TOOLS: str = Field(
             default=(
                 "read_file, calculate_timestamp, fetch_url, get_current_timestamp, "
@@ -3855,54 +3873,53 @@ class Pipe:
             default=DEFAULT_OUTPUT_PROMPT,
             description="System prompt for OUTPUT phase — Turn 1 (rendering / visualisation). Only rendering/visualisation tools are called here. Available placeholders: {goal}, {task_state}, {tool_names}.",
         )
-        CONTEXT_COMPRESSION_MODEL: str = Field(
-            default="",
-            description="Model ID for context compression. If empty, falls back to AGENT_MODEL. Consider smaller models like gemini-2.5-flash for cost efficiency.",
+
+        # ── 5. Safety & Limits ──
+        MAX_TOOL_RESULT_CHARS: int = Field(
+            default=12000,
+            description="Max characters for tool results before truncation. This valve is character-based (not token-based) so that tool output limits remain directly inspectable and predictable.",
         )
-        CONTEXT_LENGTH: int = Field(
-            default=128000,
-            ge=1000,
-            description="Context window length in tokens. A single valve that drives all adaptive compression thresholds.",
-        )
-        CHARS_PER_TOKEN_ESTIMATE: float = Field(
-            default=3.5,
-            ge=1.0,
-            description="Estimated characters per token for the active model. Used to convert token-based context limits (CONTEXT_LENGTH) into character-based internal thresholds.",
-        )
-        COMPRESSION_INTERVAL: int = Field(
+        MAX_ATTACHMENT_SIZE_MB: int = Field(
             default=5,
-            ge=1,
-            description="Minimum loop iterations between consecutive history compressions to avoid token thrashing.",
+            description="Maximum allowed size of individual attached files in megabytes. Files larger than this will trigger an error at the start of the conversation, suggesting the user upload them to a Knowledge Base instead. Set to 0 to disable the size check."
         )
-        KEEP_RECENT_MESSAGES: int = Field(
-            default=6,
-            ge=2,
-            description="Number of recent messages to always keep uncompressed in history. Older messages are candidates for compression.",
-        )
-        MAX_HISTORY_MESSAGES: int = Field(
-            default=100,
-            ge=10,
-            description="Maximum total conversation messages retained in context. Older messages are dropped while keeping tool-call pairs intact.",
-        )
-        MAX_REPLAN_LOOPS: int = Field(
-            default=3,
+        PLAN_APPROVAL_TIMEOUT: int = Field(
+            default=600,
             ge=0,
-            description="Safety cap: after this many REPLAN loops the agent falls back to single-task EXECUTE.",
+            description="Timeout in seconds for the plan approval modal. After this time the plan is auto-approved.",
+        )
+        ITERATION_LIMIT_TIMEOUT: int = Field(
+            default=300,
+            ge=0,
+            description="Timeout in seconds for the iteration limit Continue/Cancel modal. After this time the agent auto-stops.",
+        )
+
+        # ── 6. Debug ──
+        DEBUG_MODE: bool = Field(
+            default=False,
+            description="Enable debug mode. When on, messages 'show tools', 'show mcp', or 'show skills' return the available items directly without any LLM call.",
         )
 
     class UserValves(BaseModel):
-        ENABLE_PLAN_APPROVAL: bool = Field(
-            default=True,
-            description="Enable plan confirmation UI. When off, plans are auto-approved without asking the user.",
-        )
+        # ── 1. Behaviour ──
         YOLO_MODE: bool = Field(
             default=False,
             description="Skip all user confirmations. Auto-approve plans and ignore iteration limits.",
+        )
+        ENABLE_PLAN_APPROVAL: bool = Field(
+            default=True,
+            description="Enable plan confirmation UI. When off, plans are auto-approved without asking the user.",
         )
         SKIP_PLAN_ON_RESUME: bool = Field(
             default=True,
             description="When the previous session is finished, skip the full PLAN phase for a new user request and jump straight to a Replan. Set to False to always start fresh with full PLAN phase.",
         )
+        SKIP_OUTPUT_RENDERING: bool = Field(
+            default=True,
+            description="If True, skip the OUTPUT phase turn 1 (rendering/visualization collection) and go straight to the final summary turn 2. Useful when no rendering/visualization tools are configured.",
+        )
+
+        # ── 2. Limits ──
         MAX_PLAN_QUESTIONS: int = Field(
             default=3,
             description="Maximum number of clarification questions (ask_user) the agent may ask per planning phase before it is forced to finalise the plan.",
@@ -3911,10 +3928,6 @@ class Pipe:
             default=12000,
             ge=-1,
             description="Max characters for individual tool results before truncation. Admin default is 12000; users may override to a personal preference. Set to -1 to use admin default, 0 to disable truncation entirely.",
-        )
-        SKIP_OUTPUT_RENDERING: bool = Field(
-            default=True,
-            description="If True, skip the OUTPUT phase turn 1 (rendering/visualization collection) and go straight to the final summary turn 2. Useful when no rendering/visualization tools are configured.",
         )
 
     def __init__(self):
