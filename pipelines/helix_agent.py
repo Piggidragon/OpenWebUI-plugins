@@ -2408,13 +2408,12 @@ class HelixAgentEngine:
         if phase == self.PHASE_OUTPUT:
             self._output_turn = 0
             self._output_rendering_skipped = False
-            # Skip rendering turn if user enabled and no OUTPUT_TOOLS are configured
+            # Skip rendering turn if user enabled and display_file is not available in __tools__
             skip_rendering = getattr(self.user_valves, "SKIP_OUTPUT_RENDERING", True)
-            output_tools = _comma_list(self.valves.OUTPUT_TOOLS)
-            if skip_rendering and not output_tools:
+            if skip_rendering and "display_file" not in self._incoming_tools:
                 self._output_rendering_skipped = True
                 self._output_turn = 1  # Start at 1 so the first loop iteration is treated as turn 2 (final)
-                asyncio.create_task(self.emit_status("Skipping OUTPUT rendering (no rendering tools configured)"))
+                asyncio.create_task(self.emit_status("Skipping OUTPUT rendering (display_file not available)"))
         # Rebuild filtered tools for new phase
         self._filter_tools_for_phase(phase)
 
@@ -3497,10 +3496,13 @@ class Pipe:
         # ── 4. Phase Tools & Prompts ──
         PLAN_TOOLS: str = Field(
             default=(
-                "read_file, calculate_timestamp, fetch_url, get_current_timestamp, "
+                "calculate_timestamp, fetch_url, get_current_timestamp, get_process_status, "
                 "glob_search, grep_search, list_files, list_knowledge_bases, list_memories, "
-                "query_knowledge_bases, query_knowledge_files, search_knowledge_bases, search_knowledge_files, search_memories, search_notes, "
-                "search_papers, search_web, view_chat, view_knowledge_file, view_note, view_skill"
+                "list_processes, query_knowledge_bases, query_knowledge_files, read_file, "
+                "search_calendar_events, search_channel_messages, search_channels, search_chats, "
+                "search_knowledge_bases, search_knowledge_files, search_memories, search_notes, "
+                "search_web, view_channel_message, view_channel_thread, view_chat, "
+                "view_knowledge_file, view_note, view_skill"
             ),
             description=(
                 "Comma-separated tool names allowed in PLAN phase. "
@@ -3510,16 +3512,16 @@ class Pipe:
         )
         EXECUTE_TOOLS: str = Field(
             default=(
-                "add_memory, delete_memory, list_memories, replace_memory_content, search_memories, "
-                "bash_command, run_command, get_process_status, list_processes, "
-                "read_file, write_file, copy_file, move_file, delete_file, make_directory, compress_files, edit_file, "
-                "glob_search, grep_search, list_files, "
-                "fetch_url, get_current_timestamp, calculate_timestamp, "
-                "search_web, search_papers, search_notes, search_knowledge_bases, search_knowledge_files, search_memories, "
-                "search_chats, view_chat, view_note, view_knowledge_file, view_skill, "
-                "query_knowledge_bases, query_knowledge_files, list_knowledge_bases, list_memories, "
-                "calculate, render_visualization, display_file, show_map, get_weather_forecast, "
-                "github_create_branch, github_create_or_update_file, github_create_pull_request"
+                "calculate_timestamp, create_calendar_event, delete_calendar_event, "
+                "fetch_url, get_current_timestamp, get_process_status, "
+                "glob_search, grep_search, kill_process, list_files, list_knowledge_bases, "
+                "list_memories, list_processes, query_knowledge_bases, query_knowledge_files, "
+                "read_file, replace_file_content, replace_note_content, run_command, "
+                "search_calendar_events, search_channel_messages, search_channels, search_chats, "
+                "search_knowledge_bases, search_knowledge_files, search_memories, "
+                "search_notes, search_web, send_process_input, update_calendar_event, "
+                "view_channel_message, view_channel_thread, view_chat, "
+                "view_knowledge_file, view_note, view_skill, write_file, write_note"
             ),
             description=(
                 "Comma-separated tool names allowed in EXECUTE phase. "
@@ -3528,11 +3530,14 @@ class Pipe:
         ),
         REVIEW_TOOLS: str = Field(
             default=(
-                "read_file, calculate_timestamp, fetch_url, get_current_timestamp, get_process_status, run_command, "
-                "glob_search, grep_search, list_files, list_knowledge_bases, list_memories, list_processes, "
-                "query_knowledge_bases, query_knowledge_files, "
-                "search_chats, search_knowledge_bases, search_knowledge_files, search_memories, search_notes, search_web, "
-                "view_chat, view_knowledge_file, view_note, view_skill"
+                "calculate_timestamp, fetch_url, get_current_timestamp, get_process_status, "
+                "glob_search, grep_search, list_files, list_knowledge_bases, list_memories, "
+                "list_processes, query_knowledge_bases, query_knowledge_files, read_file, "
+                "run_command, search_calendar_events, search_channel_messages, search_channels, "
+                "search_chats, search_knowledge_bases, search_knowledge_files, "
+                "search_memories, search_notes, search_web, "
+                "view_channel_message, view_channel_thread, view_chat, "
+                "view_knowledge_file, view_note, view_skill"
             ),
             description=(
                 "Comma-separated tool names allowed in REVIEW phase. "
@@ -3541,10 +3546,10 @@ class Pipe:
             )
         )
         OUTPUT_TOOLS: str = Field(
-            default="",
+            default="display_file",
             description=(
-                "Comma-separated rendering/visualization tool names allowed in OUTPUT phase turn 1 (e.g. show_map, render_visualization). "
-                "Leave EMPTY (default) to allow NO tools — the rendering turn will be skipped if the user has SKIP_OUTPUT_RENDERING enabled."
+                "Comma-separated rendering/visualization tool names allowed in OUTPUT phase turn 1. "
+                "Default is display_file for rendering produced files."
             )
         )
 
