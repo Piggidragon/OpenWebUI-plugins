@@ -1,7 +1,7 @@
 """
 title: Helix Agent
 author: Piggidragon
-version: 0.24.2
+    version: 0.24.3
 description: >
   Helix Agent - OpenWebUI-native agent loop with modular per-phase tool control.
 
@@ -696,9 +696,9 @@ class HelixAgentEngine:
         self._total_output_tokens += output_tokens
 
     def _format_token_status(self) -> str:
-        """Return a concise token status string."""
-        total = self._total_input_tokens + self._total_output_tokens
-        return f"Tokens: {total} (in {self._total_input_tokens} / out {self._total_output_tokens})"
+        """Return a concise token status string showing current context size."""
+        tokens = self._total_history_tokens()
+        return f"Tokens: {tokens}"
 
     def _get_history_compression_threshold(self) -> int:
         """Return token threshold at which history compression should trigger.
@@ -1024,6 +1024,11 @@ class HelixAgentEngine:
         self.failed_tasks = []
         self.task_list = []
         self.consecutive_json_errors = 0
+
+        # Reset token counters for the new plan session
+        self._total_input_tokens = 0
+        self._total_output_tokens = 0
+        self._total_tool_calls = 0
 
         # Transition to REPLAN phase
         self._transition_to(self.PHASE_REPLAN)
@@ -2742,6 +2747,9 @@ class HelixAgentEngine:
             self.failed_tasks = []
             self.loop_count = 0
             self._plan_questions_asked = 0
+            self._total_input_tokens = 0
+            self._total_output_tokens = 0
+            self._total_tool_calls = 0
             self._filter_tools_for_phase(self.PHASE_PLAN)
             self.history = [last_user_msg_raw if last_user_msg_raw else {"role": "user", "content": user_msg}]
 
@@ -3270,7 +3278,7 @@ class HelixAgentEngine:
                 )
             total = self._total_input_tokens + self._total_output_tokens
             if total > 0 or self._total_tool_calls > 0:
-                summary = f"\n[Session Tokens] Total: {total} (in {self._total_input_tokens} / out {self._total_output_tokens}) | Tools: {self._total_tool_calls} | Loops: {self.loop_count}"
+                summary = f"\n[Session Tokens] Total: {total} | Tools: {self._total_tool_calls} | Loops: {self.loop_count}"
                 await self.emit_output(summary)
                 await self.emit_status(f"Session: {self._format_token_status()}", done=True)
             self._seen_file_ids.clear()
@@ -3342,13 +3350,11 @@ class Pipe:
 
         PLAN_TOOLS: str = Field(
             default=(
-                "calculate_timestamp, fetch_url, get_current_timestamp, get_process_status, "
+                "calculate_timestamp, get_current_timestamp, get_process_status, "
                 "glob_search, grep_search, list_files, list_knowledge_bases, list_memories, "
-                "list_processes, query_knowledge_bases, query_knowledge_files, read_file, "
+                "list_processes, view_skill"
                 "search_calendar_events, search_channel_messages, search_channels, search_chats, "
-                "search_knowledge_bases, search_knowledge_files, search_memories, search_notes, "
-                "search_web, view_channel_message, view_channel_thread, view_chat, "
-                "view_knowledge_file, view_note, view_skill"
+                "search_knowledge_bases, search_knowledge_files, search_memories, search_notes"
             ),
             description=(
                 "Comma-separated tool names allowed in PLAN phase. "
@@ -3377,12 +3383,12 @@ class Pipe:
         )
         REVIEW_TOOLS: str = Field(
             default=(
-                "calculate_timestamp, fetch_url, get_current_timestamp, get_process_status, "
+                "calculate_timestamp, get_current_timestamp, get_process_status, "
                 "glob_search, grep_search, list_files, list_knowledge_bases, list_memories, "
                 "list_processes, query_knowledge_bases, query_knowledge_files, read_file, "
                 "run_command, search_calendar_events, search_channel_messages, search_channels, "
                 "search_chats, search_knowledge_bases, search_knowledge_files, "
-                "search_memories, search_notes, search_web, "
+                "search_memories, search_notes, "
                 "view_channel_message, view_channel_thread, view_chat, "
                 "view_knowledge_file, view_note, view_skill"
             ),
