@@ -95,7 +95,7 @@ Rules:
 - Use `run_tools_parallel` for multiple independent tool calls to speed up information gathering.
 - If the request is inappropriate or impossible, call terminate with a brief explanation.
 - If a tool returns an error during planning, note the limitation in your plan.
-- Use the ask_user tool ONLY if you need clarification (e.g., ambiguous request, missing details).
+- Use the ask_user tool ONLY if you need clarification (e.g., ambiguous request, missing details). You may ask up to 3 questions; after that you must proceed with your best plan.
 - If the user rejects your plan, revise it based on their feedback and call confirm_plan again. Do NOT repeat the same plan unchanged.
 """
 
@@ -123,7 +123,7 @@ Rules:
 - When all tasks are done, the system will move to review automatically.
 - If a tool returns an error, analyze it and retry with corrected parameters. You do NOT need to call fix_plan for trivial errors.
 - Only call fix_plan if the same task fails repeatedly (3+ attempts) or if the task design was wrong. Provide updated_tasks as a JSON string: {"tasks": ["task 1", "task 2"]}. List just the new/corrected tasks.
-- Only call replan(reason) if the entire approach is wrong and a new plan is needed.
+- Only call replan(reason) if the overall strategy is broken and a new plan is needed.
 - You MUST call complete_task(index) or fail_task(index, reason) after working on a task.
 """
 
@@ -147,7 +147,7 @@ What to do:
 
 Rules:
 - ALWAYS verify before deciding. Don't guess -- read files, run checks, inspect outputs.
-- If there are only minor issues with individual tasks, ALWAYS prefer `fix_plan` over `replan`. Only use `replan` if the overall strategy is broken.
+- If there are only minor issues with the individual tasks, ALWAYS prefer `fix_plan` over `replan`. Only use `replan` if the overall strategy is broken.
 - Be honest -- don't call `proceed_to_output` if something is missing or wrong.
 - If the result is good enough, call `proceed_to_output`. Don't gold-plate.
 - Provide a brief reasoning for your assessment before calling the final tool.
@@ -204,9 +204,10 @@ What to do:
 File paths: If the plan involves creating files, decide on a ONE project folder name (short slug based on the goal) under `[USER_HOME]/agent/`. ALL files for this task and any follow-up turns on the SAME topic must be written within that project folder. Do NOT write into the bare `[USER_HOME]/agent/` root.
 
 Rules:
+- Focus purely on planning -- do NOT attempt to perform the task or execute actions.
 - Use `run_tools_parallel` for multiple independent tool calls to speed up information gathering.
-- You may call ask_user ONCE if the new request is ambiguous.
-- ABSOLUTELY CRITICAL: You MUST call confirm_plan to finish REPLAN mode. Do NOT answer the user directly. Do NOT generate story text, code, or any other output. Only call tools.
+- Use the ask_user tool ONLY if you need clarification (e.g., ambiguous request, missing details). You may ask up to 3 questions; after that you must proceed with your best plan.
+- You MUST call confirm_plan to finish REPLAN mode. Do NOT answer the user directly. Do NOT generate story text, code, or any other output. Only call tools.
 """
 
 
