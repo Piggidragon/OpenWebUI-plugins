@@ -1,7 +1,7 @@
 """
 title: Helix Agent
 author: Piggidragon
-version: 0.22.0
+version: 0.22.1
 description: >
   Helix Agent — OpenWebUI-native agent loop with modular per-phase tool control.
 
@@ -13,7 +13,7 @@ description: >
   - Context window management with adaptive history truncation and tool-call pair integrity
   - LLM-based conversational context compression: goal and history are compressed independently
     using a configurable compression model (falls back to AGENT_MODEL). Compression happens
-    blocking within the loop when HISTORY_COMPRESSION_THRESHOLD is exceeded, and asynchronously
+    blocking within the loop when token-based compression threshold is exceeded, and asynchronously
     for goal after each agent run. History compression produces an assistant summary message
     that preserves the conversational flow.
 
@@ -32,7 +32,7 @@ description: >
   - Knowledge bases: native OpenWebUI vector search via model metadata
   - MCP support: resolves and calls MCP server tools via OpenWebUI's MCPClient
   - Skills support: resolves user skills from model metadata and injects them into the system prompt
-  - Context compression: configurable thresholds, separate compression model, recursive compression allowed
+   - Context compression: single CONTEXT_LENGTH valve (tokens) drives adaptive history and goal compression via an estimated character-to-token ratio
 requirements: open-webui>=0.9.1
 """
 
@@ -190,7 +190,11 @@ Rules:
 """
 
 DEFAULT_OUTPUT_PROMPT = """\
-You are in OUTPUT mode - COLLECTION. Gather missing context and render visualisations if needed. Do not produce any answer text yet.
+You are in OUTPUT mode — RENDERING / VISUALISATION TURN.
+This is turn 1 of 2 in the output phase.
+
+Your ONLY job here is to call rendering or visualisation tools (e.g. render_visualization, show_map, display_file) if any are available and useful to illustrate the results for the user.
+Do NOT write summary text or answer the user yet. That happens in turn 2.
 
 Goal: {goal}
 
@@ -270,10 +274,9 @@ async def _parse_sse_payload(payload: str):
         yield {"type": "tool_calls", "data": tc}
 
 
-async def stream_completion(request, body, user):
-    """Stream OWUI completion, yielding structured events. Retries once on transient errors."""
+async def stream_completion(request, body, user, max_retries: int = 1):
+    """Stream OWUI completion, yielding structured events. Retries on transient errors."""
     body["stream"] = True
-    max_retries = 1
     last_error = None
 
     for attempt in range(max_retries + 1):
@@ -423,9 +426,6 @@ class HelixAgentEngine:
     PHASE_REVIEW = "review"
     PHASE_OUTPUT = "output"
     PHASE_REPLAN = "replan"  # Replan when previous session finished
-
-    MAX_HISTORY_MESSAGES = 100
-    MAX_REPLAN_LOOPS = 3  # Safety net: max loops in replan phase
 
     # Internal tools that are ALWAYS available regardless of phase filters
     INTERNAL_TOOLS = {"terminate", "replan", "complete_task", "fail_task", "confirm_plan", "fix_plan", "proceed_to_output", "early_finish", "run_tools_parallel"}
@@ -707,9 +707,39 @@ class HelixAgentEngine:
     async def emit_output(self, text):
         self._output_parts.append(text)
 
+    @property
+    def _is_yolo_mode(self) -> bool:
+        """Return True if YOLO mode is enabled (all safety limits ignored)."""
+        return self.user_valves is not None and getattr(self.user_valves, "YOLO_MODE", False)
+
     def _total_history_chars(self) -> int:
         """Return total character count of all messages in self.history."""
         return sum(len(str(m.get("content", ""))) for m in self.history)
+
+    def _estimate_tokens(self, text: str) -> int:
+        """Estimate token count from character count using configured chars-per-token ratio."""
+        if not text:
+            return 0
+        ratio = getattr(self.valves, "CHARS_PER_TOKEN_ESTIMATE", 3.5)
+        return max(1, round(len(text) / ratio))
+
+    def _total_history_tokens(self) -> int:
+        """Return estimated token count of all messages in self.history."""
+        return sum(self._estimate_tokens(str(m.get("content", ""))) for m in self.history)
+
+    def _get_history_compression_threshold(self) -> int:
+        """Return **token** threshold at which history compression should trigger.
+        Derived from CONTEXT_LENGTH (tokens) * 0.70.
+        """
+        ctx = getattr(self.valves, "CONTEXT_LENGTH", 128000)
+        return int(ctx * 0.70)
+
+    def _get_goal_compression_threshold(self) -> int:
+        """Return **token** threshold at which goal compression should trigger.
+        Derived from CONTEXT_LENGTH (tokens) * 0.05.
+        """
+        ctx = getattr(self.valves, "CONTEXT_LENGTH", 128000)
+        return int(ctx * 0.05)
 
     def get_current_files(self) -> list:
         """Return a deduplicated list of all known files (metadata + produced + DB canonical)."""
@@ -1288,8 +1318,10 @@ class HelixAgentEngine:
             if allowlist:
                 if name in allowlist:
                     self.phase_tools_dict[name] = tool
-            else:
+            elif phase != self.PHASE_OUTPUT:
+                # Non-OUTPUT phases: empty allowlist means ALL non-internal tools
                 self.phase_tools_dict[name] = tool
+            # OUTPUT phase: empty allowlist means NO non-internal tools (strict rendering control)
 
         # Build OpenAI-format tool specs
         self.phase_tools_specs = [
@@ -1413,7 +1445,8 @@ class HelixAgentEngine:
         if not tasks_data:
             tasks_data = [{"task_id": "T1", "description": plan_text}]
 
-        js = self._build_plan_approval_js(tasks_data)
+        timeout_s = getattr(self.valves, "PLAN_APPROVAL_TIMEOUT", 600)
+        js = self._build_plan_approval_js(tasks_data, timeout_s=timeout_s)
         try:
             raw = await self.event_call({"type": "execute", "data": {"code": js}})
         except Exception as e:
@@ -2665,6 +2698,14 @@ class HelixAgentEngine:
         # Reset output turn counter when entering OUTPUT phase
         if phase == self.PHASE_OUTPUT:
             self._output_turn = 0
+            self._output_rendering_skipped = False
+            # Skip rendering turn if user enabled and no OUTPUT_TOOLS are configured
+            skip_rendering = getattr(self.user_valves, "SKIP_OUTPUT_RENDERING", True)
+            output_tools = _comma_list(self.valves.OUTPUT_TOOLS)
+            if skip_rendering and not output_tools:
+                self._output_rendering_skipped = True
+                self._output_turn = 1  # Start at 1 so the first loop iteration is treated as turn 2 (final)
+                asyncio.create_task(self.emit_status("Skipping OUTPUT rendering (no rendering tools configured)"))
         # Rebuild filtered tools for new phase
         self._filter_tools_for_phase(phase)
 
@@ -2672,10 +2713,11 @@ class HelixAgentEngine:
 
     def _manage_context_window(self, messages):
         """Trim history to MAX_HISTORY_MESSAGES while keeping tool call pairs intact."""
-        if len(messages) <= self.MAX_HISTORY_MESSAGES:
+        max_history = getattr(self.valves, "MAX_HISTORY_MESSAGES", 100)
+        if len(messages) <= max_history:
             return messages
 
-        to_remove = len(messages) - self.MAX_HISTORY_MESSAGES
+        to_remove = len(messages) - max_history
         # Build head: goal (always preserved) – system prompt is injected separately
         head = messages[:1]
         # Non-state messages after head, split into removed and tail
@@ -2717,7 +2759,11 @@ class HelixAgentEngine:
         return head + tail
 
     def _get_truncation_limit(self):
-        return self.valves.MAX_TOOL_RESULT_CHARS
+        # User override wins over admin default; -1 = use admin default, 0 = disabled
+        user_limit = getattr(self.user_valves, "MAX_TOOL_RESULT_CHARS", -1) if self.user_valves else -1
+        if user_limit == -1:
+            return self.valves.MAX_TOOL_RESULT_CHARS
+        return user_limit
 
     async def _call_compression_model(self, messages: list) -> str:
         """Call LLM for context compression. Uses CONTEXT_COMPRESSION_MODEL or falls back to AGENT_MODEL."""
@@ -2767,11 +2813,11 @@ class HelixAgentEngine:
         Returns True if compression happened, False otherwise.
         """
         keep_recent = getattr(self.valves, "KEEP_RECENT_MESSAGES", 6)
-        threshold = getattr(self.valves, "HISTORY_COMPRESSION_THRESHOLD", 30000)
+        threshold = self._get_history_compression_threshold()
 
-        # Calculate total chars in history
-        total_chars = sum(len(str(m.get("content", ""))) for m in self.history)
-        if total_chars <= threshold:
+        # Calculate total tokens in history
+        total_tokens = self._total_history_tokens()
+        if total_tokens <= threshold:
             return False
 
         if len(self.history) <= keep_recent + 1:
@@ -2782,7 +2828,8 @@ class HelixAgentEngine:
         recent_messages = self.history[-keep_recent:]
 
         # Emit status: compression started
-        await self.emit_status(f"Compressing history ({total_chars} chars)...", done=False)
+        old_tokens = sum(self._estimate_tokens(str(m.get("content", ""))) for m in old_messages)
+        await self.emit_status(f"Compressing history ({old_tokens} tokens)...", done=False)
 
         # Format old messages for compression prompt
         conversation_text = self._format_messages_for_compression(old_messages)
@@ -2804,9 +2851,10 @@ class HelixAgentEngine:
             await self.emit_status("Compression failed, continuing...", done=True)
             return False
 
-        compressed_chars = len(compressed)
-        saved = total_chars - compressed_chars - sum(len(str(m.get("content", ""))) for m in recent_messages)
-        saved_pct = round((saved / total_chars) * 100) if total_chars else 0
+        compressed_tokens = self._estimate_tokens(compressed)
+        recent_tokens = sum(self._estimate_tokens(str(m.get("content", ""))) for m in recent_messages)
+        saved = old_tokens - compressed_tokens
+        saved_pct = round((saved / total_tokens) * 100) if total_tokens else 0
 
         # Build the compressed assistant message
         compressed_msg = {
@@ -2817,13 +2865,14 @@ class HelixAgentEngine:
         # Replace history: compressed msg + recent messages
         self.history = [compressed_msg] + recent_messages
 
-        await self.emit_status(f"History compressed: saved {saved_pct}% ({saved} chars)", done=True)
+        await self.emit_status(f"History compressed: saved {saved_pct}% ({saved} tokens)", done=True)
         return True
 
     async def _compress_goal_if_needed(self):
         """Compress the goal after the agent run completes if it exceeds the threshold."""
-        threshold = getattr(self.valves, "GOAL_COMPRESSION_THRESHOLD", 3000)
-        if len(self.goal) <= threshold:
+        threshold = self._get_goal_compression_threshold()
+        goal_tokens = self._estimate_tokens(self.goal)
+        if goal_tokens <= threshold:
             return
 
         prompt = [
@@ -2839,11 +2888,12 @@ class HelixAgentEngine:
 
         compressed = await self._call_compression_model(prompt)
         if compressed and len(compressed) < len(self.goal):
-            original_len = len(self.goal)
+            original_tokens = self._estimate_tokens(self.goal)
             self.goal = compressed
-            saved = original_len - len(compressed)
-            saved_pct = round((saved / original_len) * 100)
-            logger.info(f"Goal compressed: saved {saved_pct}% ({saved} chars)")
+            new_tokens = self._estimate_tokens(self.goal)
+            saved = original_tokens - new_tokens
+            saved_pct = round((saved / original_tokens) * 100)
+            logger.info(f"Goal compressed: saved {saved_pct}% ({saved} tokens)")
 
 
 
@@ -3064,18 +3114,29 @@ class HelixAgentEngine:
             # ── OUTPUT phase hard limit: max 2 turns (tool prep + final text) ──
             if self.phase == self.PHASE_OUTPUT:
                 self._output_turn += 1
-                if self._output_turn > 2:
+                if self._output_turn == 1:
+                    # Check if Turn 1 has any actual rendering tools configured
+                    has_rendering_tools = any(
+                        name not in self.INTERNAL_TOOLS
+                        for name in self.phase_tools_dict.keys()
+                    )
+                    if not has_rendering_tools:
+                        # No rendering tools available — skip Turn 1 and go straight to Final Summary
+                        self._output_turn = 2
+                        await self.emit_status("No rendering tools configured — skipping OUTPUT turn 1")
+                if self._output_turn > 2 and not self._is_yolo_mode:
                     # Safety net: exceeded max output turns, return immediately
                     await self.emit_task_update(finalize_tasks=True)
                     await self.emit_status("Output phase exceeded max turns", done=True)
                     return self._format_output()
 
-            if self.loop_count >= effective_max:
+            if self.loop_count >= effective_max and not self._is_yolo_mode:
                 await self.emit_output(f"\n[WARN] Max iterations ({effective_max}) reached.")
                 should_continue = False
                 if self.event_call and not (self.user_valves and getattr(self.user_valves, "YOLO_MODE", False)):
                     try:
-                        js = self._build_iteration_limit_js(self.loop_count, effective_max)
+                        timeout_s = getattr(self.valves, "ITERATION_LIMIT_TIMEOUT", 300)
+                        js = self._build_iteration_limit_js(self.loop_count, effective_max, timeout_s=timeout_s)
                         raw = await self.event_call({"type": "execute", "data": {"code": js}})
                         raw_str = raw if isinstance(raw, str) else (raw.get("result") or raw.get("value") or "{}") if raw else "{}"
                         try:
@@ -3096,9 +3157,10 @@ class HelixAgentEngine:
             self.loop_count += 1
             recent_calls = recent_calls[-30:]
 
-            # Safety-net for REPLAN: max 3 loops, then fallback to single-task EXECUTE
-            if self.phase == self.PHASE_REPLAN and self.loop_count >= self.MAX_REPLAN_LOOPS:
-                logger.warning("REPLAN reached %d loops; falling back to single-task EXECUTE.", self.MAX_REPLAN_LOOPS)
+            # Safety-net for REPLAN: max loops, then fallback to single-task EXECUTE
+            max_replan_loops = getattr(self.valves, "MAX_REPLAN_LOOPS", 3)
+            if self.phase == self.PHASE_REPLAN and self.loop_count >= max_replan_loops and not self._is_yolo_mode:
+                logger.warning("REPLAN reached %d loops; falling back to single-task EXECUTE.", max_replan_loops)
                 self.task_list = [user_msg]
                 self._transition_to(self.PHASE_EXECUTE)
                 await self.emit_task_update()
@@ -3119,7 +3181,8 @@ class HelixAgentEngine:
             self.history = self._manage_context_window(self.history)
 
             # ── Context Compression: check threshold and compress if needed ──
-            if self._total_history_chars() > self.valves.HISTORY_COMPRESSION_THRESHOLD:
+            total_tokens = self._total_history_tokens()
+            if total_tokens > self._get_history_compression_threshold():
                 if self.loop_count - getattr(self, "_last_compression_loop", 0) >= self.valves.COMPRESSION_INTERVAL:
                     compressed = await self._compress_history_llm()
                     if compressed:
@@ -3159,7 +3222,8 @@ class HelixAgentEngine:
             tc_dict = {}
             content_chunks = []
 
-            async for event in stream_completion(self.request, completion_body, self.user):
+            max_llm_retries = getattr(self.valves, "LLM_RETRY_COUNT", 1)
+            async for event in stream_completion(self.request, completion_body, self.user, max_retries=max_llm_retries):
                 etype = event.get("type")
                 if etype == "error":
                     await self.emit_output(f"\n[ERROR] LLM Error: {event.get('text', 'Unknown')}")
@@ -3256,7 +3320,7 @@ class HelixAgentEngine:
                 except json.JSONDecodeError:
                     self.consecutive_json_errors += 1
                     max_errors = self.valves.MAX_CONSECUTIVE_ERRORS
-                    should_stop = getattr(self.valves, "ENABLE_HARD_STOP_ON_ERRORS", False) and self.consecutive_json_errors >= max_errors
+                    should_stop = getattr(self.valves, "ENABLE_HARD_STOP_ON_ERRORS", False) and self.consecutive_json_errors >= max_errors and not self._is_yolo_mode
                     error_detail = f"Error: Invalid JSON in tool arguments for '{tool_name}'. The arguments provided were: {raw_args}. Please ensure they are a valid JSON object with exactly the keys expected by this tool."
                     if should_stop:
                         await self.emit_output(f"\n[ERROR] JSON parse failed {max_errors} times. Stopping.\n")
@@ -3530,6 +3594,10 @@ class HelixAgentEngine:
                                 "data": {"files": new_files},
                             })
                         truncation_limit = self._get_truncation_limit()
+                        if truncation_limit and result_str and len(result_str) > truncation_limit:
+                            await self.emit_status(
+                                f"Truncated call {tool_name} because result was {len(result_str)}/{truncation_limit} chars"
+                            )
                         tool_result = smart_truncate(result_str, truncation_limit)
 
                         # ── Consecutive tool-not-found tracking ──
@@ -3702,6 +3770,21 @@ class Pipe:
             default=5,
             description="Maximum allowed size of individual attached files in megabytes. Files larger than this will trigger an error at the start of the conversation, suggesting the user upload them to a Knowledge Base instead. Set to 0 to disable the size check."
         )
+        PLAN_APPROVAL_TIMEOUT: int = Field(
+            default=600,
+            ge=0,
+            description="Timeout in seconds for the plan approval modal. After this time the plan is auto-approved.",
+        )
+        ITERATION_LIMIT_TIMEOUT: int = Field(
+            default=300,
+            ge=0,
+            description="Timeout in seconds for the iteration limit Continue/Cancel modal. After this time the agent auto-stops.",
+        )
+        LLM_RETRY_COUNT: int = Field(
+            default=1,
+            ge=0,
+            description="Number of retries for transient LLM API errors (ConnectionError, TimeoutError). Set to 0 to disable retries.",
+        )
 
         PLAN_TOOLS: str = Field(
             default=(
@@ -3749,18 +3832,10 @@ class Pipe:
             )
         )
         OUTPUT_TOOLS: str = Field(
-            default=(
-                "show_map, get_weather_forecast, render_visualization, "
-                "list_files, read_file, display_file, grep_search, glob_search, "
-                "list_processes, get_process_status, get_current_timestamp, calculate_timestamp, "
-                "list_knowledge_bases, list_memories, search_knowledge_bases, query_knowledge_bases, "
-                "search_knowledge_files, query_knowledge_files, view_knowledge_file, "
-                "search_chats, search_memories, view_chat, search_notes, view_note, view_skill"
-            ),
+            default="",
             description=(
-                "Comma-separated tool names allowed in OUTPUT phase. "
-                "Leave EMPTY to allow ALL tools. "
-                "Default includes rendering/output tools and read-only helpers."
+                "Comma-separated rendering/visualization tool names allowed in OUTPUT phase turn 1 (e.g. show_map, render_visualization). "
+                "Leave EMPTY (default) to allow NO tools — the rendering turn will be skipped if the user has SKIP_OUTPUT_RENDERING enabled."
             )
         )
 
@@ -3778,21 +3853,21 @@ class Pipe:
         )
         OUTPUT_PROMPT: str = Field(
             default=DEFAULT_OUTPUT_PROMPT,
-            description="System prompt for OUTPUT phase — Turn 1 (collection / rendering / tool calls allowed). Available placeholders: {goal}, {task_state}, {tool_names}."
+            description="System prompt for OUTPUT phase — Turn 1 (rendering / visualisation). Only rendering/visualisation tools are called here. Available placeholders: {goal}, {task_state}, {tool_names}.",
         )
         CONTEXT_COMPRESSION_MODEL: str = Field(
             default="",
             description="Model ID for context compression. If empty, falls back to AGENT_MODEL. Consider smaller models like gemini-2.5-flash for cost efficiency.",
         )
-        HISTORY_COMPRESSION_THRESHOLD: int = Field(
-            default=30000,
+        CONTEXT_LENGTH: int = Field(
+            default=128000,
             ge=1000,
-            description="If total history chars exceed this, trigger compression mid-loop. Default ~30k chars ≈ 7.5k tokens.",
+            description="Context window length in tokens. A single valve that drives all adaptive compression thresholds.",
         )
-        GOAL_COMPRESSION_THRESHOLD: int = Field(
-            default=3000,
-            ge=500,
-            description="If goal string chars exceed this, compress goal after the agent run completes. Default ~3k chars ≈ 750 tokens.",
+        CHARS_PER_TOKEN_ESTIMATE: float = Field(
+            default=3.5,
+            ge=1.0,
+            description="Estimated characters per token for the active model. Used to convert token-based context limits (CONTEXT_LENGTH) into character-based internal thresholds.",
         )
         COMPRESSION_INTERVAL: int = Field(
             default=5,
@@ -3803,6 +3878,16 @@ class Pipe:
             default=6,
             ge=2,
             description="Number of recent messages to always keep uncompressed in history. Older messages are candidates for compression.",
+        )
+        MAX_HISTORY_MESSAGES: int = Field(
+            default=100,
+            ge=10,
+            description="Maximum total conversation messages retained in context. Older messages are dropped while keeping tool-call pairs intact.",
+        )
+        MAX_REPLAN_LOOPS: int = Field(
+            default=3,
+            ge=0,
+            description="Safety cap: after this many REPLAN loops the agent falls back to single-task EXECUTE.",
         )
 
     class UserValves(BaseModel):
@@ -3821,6 +3906,15 @@ class Pipe:
         MAX_PLAN_QUESTIONS: int = Field(
             default=3,
             description="Maximum number of clarification questions (ask_user) the agent may ask per planning phase before it is forced to finalise the plan.",
+        )
+        MAX_TOOL_RESULT_CHARS: int = Field(
+            default=12000,
+            ge=-1,
+            description="Max characters for individual tool results before truncation. Admin default is 12000; users may override to a personal preference. Set to -1 to use admin default, 0 to disable truncation entirely.",
+        )
+        SKIP_OUTPUT_RENDERING: bool = Field(
+            default=True,
+            description="If True, skip the OUTPUT phase turn 1 (rendering/visualization collection) and go straight to the final summary turn 2. Useful when no rendering/visualization tools are configured.",
         )
 
     def __init__(self):
