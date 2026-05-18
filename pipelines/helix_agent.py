@@ -1,7 +1,7 @@
 """
 title: Helix Agent
 author: Piggidragon
-version: 0.23.1
+version: 0.23.2
 description: >
   Helix Agent — OpenWebUI-native agent loop with modular per-phase tool control.
 
@@ -308,7 +308,7 @@ async def stream_completion(request, body, user, max_retries: int = 1):
 # ──────────────────────────────────────────────────────────────────
 
 def smart_truncate(text, max_chars):
-    if not text or len(text) <= max_chars:
+    if not text or max_chars <= 0 or len(text) <= max_chars:
         return text
     for sep in (". ", ".\n", "\n\n", "\n"):
         idx = text[:max_chars].rfind(sep)
@@ -431,6 +431,7 @@ class HelixAgentEngine:
         self._files_lock = asyncio.Lock()
         self._consecutive_tool_misses: Dict[str, int] = {}
         self._output_turn = 0
+        self._output_rendering_skipped = False
         self._seen_file_ids: Set[str] = set()
         self._output_parts = []
         self.loop_count = 0
@@ -439,6 +440,8 @@ class HelixAgentEngine:
         self.consecutive_json_errors = 0
         self._replan_reason = ""
         self._plan_questions_asked = 0
+        self._extra_grace = 0
+        self._last_compression_loop = 0
 
         # Throttling / debounce state
         self._last_state_save_ts: float = 0.0
@@ -904,17 +907,6 @@ class HelixAgentEngine:
             "type": "function",
         }
 
-    def _get_model_features(self, model_info):
-        info = model_info.get("info", {}) or {}
-        meta = info.get("meta", {}) or {}
-        params = info.get("params", {}) or {}
-        features = {}
-        for block in (meta, params):
-            if isinstance(block.get("features"), dict):
-                for fk, fv in block["features"].items():
-                    features[fk] = bool(fv)
-        return features
-
     # ── Skills & MCP Helpers ──
 
     async def _resolve_model_skills(self, model_info: dict) -> tuple[list[str], str]:
@@ -1021,6 +1013,7 @@ class HelixAgentEngine:
         self._replan_reason = reason
         self.completed_tasks = []
         self.failed_tasks = []
+        self.task_list = []
         self.consecutive_json_errors = 0
 
         # Transition to REPLAN phase
@@ -1131,6 +1124,12 @@ class HelixAgentEngine:
 
     async def _tool_ask_user(self, question: str, options: list, allow_custom: bool = True, **kwargs):
         """Interactive user question tool. Only available during PLAN and REPLAN phases."""
+        if not self.event_call:
+            return json.dumps({"type": "error", "response": "Interactive input not available in this context.", "skipped": True})
+
+        if not options or not isinstance(options, list):
+            return json.dumps({"type": "error", "response": "Provide at least one option.", "skipped": True})
+
         if self.phase in (self.PHASE_PLAN, self.PHASE_REPLAN):
             self._plan_questions_asked += 1
             max_questions = getattr(self.user_valves, "MAX_PLAN_QUESTIONS", 3)
@@ -1144,12 +1143,6 @@ class HelixAgentEngine:
                     ),
                     "skipped": True,
                 })
-
-        if not self.event_call:
-            return json.dumps({"type": "error", "response": "Interactive input not available in this context.", "skipped": True})
-
-        if not options or not isinstance(options, list):
-            return json.dumps({"type": "error", "response": "Provide at least one option.", "skipped": True})
 
         opts = [str(o) for o in options[:8]]
         if not opts:
@@ -1419,7 +1412,7 @@ class HelixAgentEngine:
             flexShrink:'0',fontSize:'15px',color:col.btnPrimary,
             opacity:'0',transition:'opacity 0.12s',display:'none',
           }});
-          check.textContent = '\u2713';
+          check.textContent = 'x';
 
           btn.appendChild(keyBadge); btn.appendChild(textBlock); btn.appendChild(check);
 
@@ -1461,7 +1454,7 @@ class HelixAgentEngine:
 
           const customInput = document.createElement('input');
           customInput.type = 'text';
-          customInput.placeholder = 'Or type a custom answer\u2026';
+          customInput.placeholder = 'Or type a custom answer...';
           Object.assign(customInput.style, {{
             flex:'1',background:col.input,border:'1.5px solid '+col.inputBorder,
             borderRadius:'8px',padding:'10px 12px',color:col.text,
@@ -1472,7 +1465,7 @@ class HelixAgentEngine:
           customInput.addEventListener('focus', ()=>{{ customInput.style.borderColor=col.btnPrimary; }});
           customInput.addEventListener('blur', ()=>{{ customInput.style.borderColor=customInput.value?col.btnPrimary:col.inputBorder; }});
           customInput.addEventListener('keydown', function(e){{
-            if (e.key==='Enter' \u0026\u0026 customInput.value.trim()){{
+            if (e.key==='Enter' && customInput.value.trim()){{
               e.stopPropagation();
               finish({{type:'custom',value:customInput.value.trim()}});
             }}
@@ -1487,7 +1480,7 @@ class HelixAgentEngine:
             flexShrink:'0',transition:'opacity 0.12s, transform 0.1s',
             fontFamily:'inherit',
           }});
-          sendBtn.textContent = '\u21b5';
+          sendBtn.textContent = '->';
           sendBtn.addEventListener('mouseenter', ()=>{{ sendBtn.style.transform='scale(1.08)'; }});
           sendBtn.addEventListener('mouseleave', ()=>{{ sendBtn.style.transform=''; }});
           sendBtn.addEventListener('click', ()=>{{
@@ -1572,7 +1565,7 @@ class HelixAgentEngine:
         const header = document.createElement('div');
         Object.assign(header.style, {{ display:'flex',alignItems:'flex-start',gap:'12px' }});
         const iconBlock = document.createElement('div');
-        iconBlock.textContent = '\uD83D\uDCCB';
+        iconBlock.textContent = '[]';
         Object.assign(iconBlock.style, {{ fontSize:'22px',flexShrink:'0',marginTop:'2px' }});
         const titleText = document.createElement('p');
         Object.assign(titleText.style, {{
@@ -1774,7 +1767,7 @@ class HelixAgentEngine:
         const header = document.createElement('div');
         Object.assign(header.style, {{ display:'flex',alignItems:'flex-start',gap:'12px' }});
         const iconBlock = document.createElement('div');
-        iconBlock.textContent = '\u26A0\uFE0F';
+        iconBlock.textContent = '!';
         Object.assign(iconBlock.style, {{ fontSize:'22px',flexShrink:'0',marginTop:'2px' }});
         const titleText = document.createElement('p');
         Object.assign(titleText.style, {{
@@ -1938,7 +1931,7 @@ class HelixAgentEngine:
                 lines.append(f"  - {f['task']}: {f['reason']}")
         return "\n".join(lines)
 
-    # ── File Context Preparation (planner_v3 parity) ──
+    # ── File Context Preparation ──
 
     async def _apply_file_prep(self, msgs: list) -> list:
         """Mirror OWUI middleware: add_file_context then chat_completion_files_handler."""
@@ -2397,6 +2390,9 @@ class HelixAgentEngine:
         return head + tail
 
     def _get_truncation_limit(self):
+        # Admin switch: completely disable truncation
+        if not getattr(self.valves, "ENABLE_TOOL_TRUNCATION", True):
+            return 0
         # User override wins over admin default; -1 = use admin default, 0 = disabled
         user_limit = getattr(self.user_valves, "MAX_TOOL_RESULT_CHARS", -1) if self.user_valves else -1
         if user_limit == -1:
@@ -3011,7 +3007,7 @@ class HelixAgentEngine:
                         "tool_call_id": call_id,
                         "name": tool_name,
                     })
-                    if self.completed_tasks and len(self.completed_tasks) >= len(self.task_list):
+                    if (len(self.completed_tasks) + len(self.failed_tasks)) >= len(self.task_list):
                         self._transition_to(self.PHASE_REVIEW)
                     continue
 
@@ -3224,7 +3220,7 @@ class HelixAgentEngine:
                 })
 
             # Auto-transition to REVIEW
-            if self.phase == self.PHASE_EXECUTE and self.completed_tasks and len(self.completed_tasks) >= len(self.task_list):
+            if self.phase == self.PHASE_EXECUTE and (len(self.completed_tasks) + len(self.failed_tasks)) >= len(self.task_list):
                 self._transition_to(self.PHASE_REVIEW)
 
             # OUTPUT phase: after tool calls in turn 1, continue to turn 2 (no tools)
@@ -3439,6 +3435,10 @@ class Pipe:
         )
 
         # ── 5. Safety & Limits ──
+        ENABLE_TOOL_TRUNCATION: bool = Field(
+            default=True,
+            description="If True, tool results are truncated to MAX_TOOL_RESULT_CHARS. If False, truncation is completely disabled and full tool results are passed to the LLM regardless of size.",
+        )
         MAX_TOOL_RESULT_CHARS: int = Field(
             default=12000,
             description="Max characters for tool results before truncation. This valve is character-based (not token-based) so that tool output limits remain directly inspectable and predictable.",
@@ -3514,7 +3514,7 @@ class Pipe:
         __files__: list = None,
         __chat_id__: str = None,
         __message_id__: str = None,
-        __tools__: list = None,
+        __tools__: dict = None,
         **kwargs,
     ):
         if __request__ is None:
