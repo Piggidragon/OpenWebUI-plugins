@@ -200,8 +200,17 @@ Available tools: {tool_names}
 """
 
 DEFAULT_OUTPUT_FINAL_PROMPT = """\
-You are in OUTPUT mode — FINAL ANSWER PHASE.
-This is turn 2 of 2 in the output phase. All necessary data has been collected. Write the comprehensive final answer to the user now. You may NOT use any tools — only produce the final response text.
+You are in OUTPUT mode — FINAL SUMMARY PHASE.
+This is turn 2 of 2 in the output phase. You may NOT use any tools.
+
+Task:
+Write a concise 3-5 sentence summary for the user that covers:
+1. What was accomplished during this session (completed tasks).
+2. Which files were created or modified.
+3. Any failed tasks and why (if applicable).
+4. Where the user can find the results (project folder under `[USER_HOME]/agent/`).
+
+Do NOT reproduce file contents, code, or large text blocks here. All results are already persisted in files. Keep the reply short and focused.
 
 Goal: {goal}
 """
@@ -2609,8 +2618,9 @@ class HelixAgentEngine:
             elif self.phase == self.PHASE_OUTPUT:
                 if self._output_turn >= 2:
                     base = self._render_prompt(
-                        self.valves.OUTPUT_FINAL_PROMPT or DEFAULT_OUTPUT_FINAL_PROMPT,
+                        DEFAULT_OUTPUT_FINAL_PROMPT,
                         goal=self.goal,
+                        task_state=task_state,
                     )
                 else:
                     base = self._render_prompt(
@@ -2633,7 +2643,7 @@ class HelixAgentEngine:
                 base = self._render_prompt(DEFAULT_REVIEW_PROMPT, goal=self.goal, task_state=task_state, tool_names=tool_names)
             elif self.phase == self.PHASE_OUTPUT:
                 if self._output_turn >= 2:
-                    base = self._render_prompt(self.valves.OUTPUT_FINAL_PROMPT or DEFAULT_OUTPUT_FINAL_PROMPT, goal=self.goal)
+                    base = self._render_prompt(DEFAULT_OUTPUT_FINAL_PROMPT, goal=self.goal, task_state=task_state)
                 else:
                     base = self._render_prompt(DEFAULT_OUTPUT_PROMPT, goal=self.goal, task_state=task_state, tool_names=tool_names)
             else:
@@ -3769,10 +3779,6 @@ class Pipe:
         OUTPUT_PROMPT: str = Field(
             default=DEFAULT_OUTPUT_PROMPT,
             description="System prompt for OUTPUT phase — Turn 1 (collection / rendering / tool calls allowed). Available placeholders: {goal}, {task_state}, {tool_names}."
-        )
-        OUTPUT_FINAL_PROMPT: str = Field(
-            default=DEFAULT_OUTPUT_FINAL_PROMPT,
-            description="System prompt for OUTPUT phase — Turn 2 (final answer, NO tools). Available placeholders: {goal}."
         )
         CONTEXT_COMPRESSION_MODEL: str = Field(
             default="",
