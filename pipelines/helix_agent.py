@@ -91,7 +91,7 @@ Rules:
 - Focus purely on planning -- do NOT attempt to perform the task or execute actions.
 - You may use available tools to gather context and inspect files or code relevant to the goal.
 - If the request is simple (1-2 tasks), still list them explicitly.
-- Use `run_tools_parallel` for multiple independent tool calls to speed up information gathering.
+- Use `run_tools_parallel` for multiple independent tool calls to speed up information gathering. NEVER use it for internal Helix tools (confirm_plan, ask_user, terminate, replan, fix_plan, complete_task, fail_task, proceed_to_output).
 - If the request is inappropriate or impossible, call terminate with a brief explanation.
 - If a tool returns an error during planning, note the limitation in your plan.
 - Use the ask_user tool ONLY if you need clarification (e.g., ambiguous request, missing details). You may ask up to 3 questions; after that you must proceed with your best plan.
@@ -117,7 +117,7 @@ File paths: All files MUST be written into the SAME project subfolder under `[US
 Code verification: If a task involves writing code, you MUST verify syntax before calling complete_task. Use appropriate validation tools (e.g. `python -m py_compile`, `bash -n`, `node --check`, a linter, or any available syntax-check tool). Only mark the task complete once the code passes validation or the validation failure has been documented.
 
 Rules:
-- Use `run_tools_parallel` for multiple independent tool calls to speed up execution.
+- Use `run_tools_parallel` for multiple independent tool calls to speed up execution. NEVER use it for internal Helix tools (complete_task, fail_task, fix_plan, replan, proceed_to_output, terminate).
 - NEVER repeat identical failed tool calls (duplicate detection is active).
 - When all tasks are done, the system will move to review automatically.
 - If a tool returns an error, analyze it and retry with corrected parameters. You do NOT need to call fix_plan for trivial errors.
@@ -150,7 +150,7 @@ Rules:
 - Be honest -- don't call `proceed_to_output` if something is missing or wrong.
 - If the result is good enough, call `proceed_to_output`. Don't gold-plate.
 - Provide a brief reasoning for your assessment before calling the final tool.
-- You may use `run_tools_parallel` for multiple independent verification calls.
+- You may use `run_tools_parallel` for multiple independent verification calls. NEVER use it for internal Helix tools (fix_plan, replan, proceed_to_output).
 """
 
 DEFAULT_OUTPUT_PROMPT = """\
@@ -237,7 +237,7 @@ File paths: If the plan involves creating files, decide on a ONE project folder 
 
 Rules:
 - Focus purely on planning -- do NOT attempt to perform the task or execute actions.
-- Use `run_tools_parallel` for multiple independent tool calls to speed up information gathering.
+- Use `run_tools_parallel` for multiple independent tool calls to speed up information gathering. NEVER use it for internal Helix tools (confirm_plan, ask_user, terminate, replan, fix_plan, complete_task, fail_task, proceed_to_output).
 - Use the ask_user tool ONLY if you need clarification (e.g., ambiguous request, missing details). You may ask up to 3 questions; after that you must proceed with your best plan.
 - You MUST call confirm_plan to finish REPLAN mode. Do NOT answer the user directly. Do NOT generate story text, code, or any other output. Only call tools.
 """
@@ -1090,6 +1090,7 @@ class HelixAgentEngine:
         self._transition_to(self.PHASE_REPLAN)
         self.loop_count = 0
         self._plan_questions_asked = 0
+        self._extra_grace = 0
         await self._save_state_to_file()
         await self.emit_task_update()
         return json.dumps({"replan": True, "reason": reason})
@@ -1285,11 +1286,18 @@ class HelixAgentEngine:
                 "type": "chat:message:files",
                 "data": {"files": new_files},
             })
+        # Apply per-call truncation (same logic as single tool calls)
+        truncation_limit = self._get_truncation_limit()
+        if truncation_limit and result_str and len(result_str) > truncation_limit:
+            await self.emit_status(
+                f"Truncated parallel call {tool_name} because result was {len(result_str)}/{truncation_limit} chars"
+            )
+        truncated_result = smart_truncate(result_str, truncation_limit)
         # Try to parse JSON result back to native type for cleaner aggregation
-        parsed_result = result_str
-        if isinstance(result_str, str):
+        parsed_result = truncated_result
+        if isinstance(truncated_result, str):
             try:
-                parsed_result = json.loads(result_str)
+                parsed_result = json.loads(truncated_result)
             except json.JSONDecodeError:
                 pass
         return {
@@ -1305,6 +1313,13 @@ class HelixAgentEngine:
             calls = self._normalize_parallel_calls(tool_calls)
         except ValueError as e:
             return json.dumps({"error": str(e)})
+
+        # Reject any Helix internal tools inside run_tools_parallel
+        internal_in_parallel = [c["name"] for c in calls if c["name"] in self.INTERNAL_TOOLS]
+        if internal_in_parallel:
+            return json.dumps({
+                "error": f"run_tools_parallel may NOT contain internal Helix tools: {', '.join(internal_in_parallel)}. These MUST be called individually, not inside a parallel batch.",
+            })
 
         # Validate each tool exists in current phase AND validate args against schema
         missing = []
@@ -2601,8 +2616,8 @@ class HelixAgentEngine:
         # Build the compressed context message as a system message
         # so it does not interfere with assistant/tool conversation flow.
         compressed_msg = {
-            "role": "system",
-            "content": f"=== Compressed Context ===\n{compressed}",
+            "role": "assistant",
+            "content": f"[Compressed Context Summary]\n{compressed}",
         }
 
         # Replace history: compressed system msg + recent messages
@@ -3026,6 +3041,18 @@ class HelixAgentEngine:
                     await self.emit_task_update(finalize_tasks=True)
                     await self.emit_status("Done", done=True)
                     return self._format_output()
+                # REVIEW phase: enforce that the model must call a transition tool.
+                if self.phase == self.PHASE_REVIEW:
+                    self.history.append({
+                        "role": "assistant",
+                        "content": content or "",
+                    })
+                    self.history.append({
+                        "role": "user",
+                        "content": "SYSTEM: You produced text but did not call any tools. In REVIEW phase you MUST call exactly one of: proceed_to_output(), fix_plan(reason, updated_tasks), or replan(reason). Do NOT output text—call the appropriate tool.",
+                    })
+                    await self.emit_output(f"\n[WARN] No tool call produced in REVIEW phase. Re-prompting to enforce transition tool.\n")
+                    continue
                 if content and self.task_list and len(self.completed_tasks) < len(self.task_list):
                     # Tasks remain: inject continuation prompt instead of terminating
                     self.history.append({
@@ -3039,12 +3066,7 @@ class HelixAgentEngine:
                     await self.emit_output(f"\n[WARN] No tool call produced. Re-prompting to continue.\n")
                     continue
                 if content:
-                    parsed = json.loads(content)
-                    summary = parsed.get("summary", "")
-                    if summary:
-                        await self.emit_output(summary)
-                    else:
-                        await self.emit_output(content)
+                    await self.emit_output(content)
                 await self.emit_status("Done", done=True)
                 return self._format_output()
 
@@ -3055,6 +3077,7 @@ class HelixAgentEngine:
                 "tool_calls": tool_calls_list,
             })
 
+            _pending_phase_transition = None
             for tc in tool_calls_list:
                 fn = tc.get("function", {})
                 tool_name = fn.get("name", "")
@@ -3128,7 +3151,7 @@ class HelixAgentEngine:
                         "name": tool_name,
                     })
                     if (len(self.completed_tasks) + len(self.failed_tasks)) >= len(self.task_list):
-                        self._transition_to(self.PHASE_REVIEW)
+                        _pending_phase_transition = self.PHASE_REVIEW
                     continue
 
                 # ── Handle fail_task ──
@@ -3145,7 +3168,7 @@ class HelixAgentEngine:
                     })
                     # Auto-transition to REVIEW if all tasks are done or failed
                     if self.failed_tasks and len(self.completed_tasks) + len(self.failed_tasks) >= len(self.task_list):
-                        self._transition_to(self.PHASE_REVIEW)
+                        _pending_phase_transition = self.PHASE_REVIEW
                     continue
 
                 # ── Handle proceed_to_output ──
@@ -3153,6 +3176,7 @@ class HelixAgentEngine:
                     result_json = await self._tool_proceed_to_output(**args)
                     result_data = json.loads(result_json)
                     if result_data.get("proceed_to_output"):
+                        _pending_phase_transition = self.PHASE_OUTPUT
                         await self.emit_output(f"\n[OUT] **Proceeding to output generation...**\n")
                         await self.emit_status("[OUT] Moving to output phase...")
                     else:
@@ -3181,7 +3205,7 @@ class HelixAgentEngine:
                         "name": tool_name,
                     })
                     if self.phase in (self.PHASE_REVIEW, self.PHASE_OUTPUT):
-                        self._transition_to(self.PHASE_EXECUTE)
+                        _pending_phase_transition = self.PHASE_EXECUTE
                     continue
 
                 # ── Handle confirm_plan ──
@@ -3225,7 +3249,7 @@ class HelixAgentEngine:
                     # Accept (or unknown safe fallback) → extract tasks, transition
                     plan_text = args.get("plan", content or "")
                     self.task_list = self._extract_task_list(plan_text or content or "")
-                    self._transition_to(self.PHASE_EXECUTE)
+                    _pending_phase_transition = self.PHASE_EXECUTE
                     await self._save_state_to_file()
                     await self.emit_task_update()
                     self.history.append({
@@ -3340,9 +3364,13 @@ class HelixAgentEngine:
                     "name": tool_name,
                 })
 
-            # Auto-transition to REVIEW
-            if self.phase == self.PHASE_EXECUTE and (len(self.completed_tasks) + len(self.failed_tasks)) >= len(self.task_list):
-                self._transition_to(self.PHASE_REVIEW)
+            # Apply deferred phase transitions after all tool calls in this assistant message
+            if _pending_phase_transition:
+                self._transition_to(_pending_phase_transition)
+            else:
+                # Auto-transition to REVIEW when all tasks are done in EXECUTE phase
+                if self.phase == self.PHASE_EXECUTE and (len(self.completed_tasks) + len(self.failed_tasks)) >= len(self.task_list):
+                    self._transition_to(self.PHASE_REVIEW)
 
             # OUTPUT phase: after tool calls in turn 1, continue to turn 2 (no tools)
             if self.phase == self.PHASE_OUTPUT and self._output_turn == 1:
