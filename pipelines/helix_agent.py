@@ -1,7 +1,7 @@
 """
 title: Helix Agent
 author: Piggidragon
-version: 0.24.0
+version: 0.24.1
 description: >
   Helix Agent — OpenWebUI-native agent loop with modular per-phase tool control.
 
@@ -3260,7 +3260,7 @@ class HelixAgentEngine:
                     tasks = args.get("tasks", [])
                     if not isinstance(tasks, list):
                         tasks = []
-                    self.task_list = [str(t) for t in tasks] if tasks else self._extract_task_list(content or "")
+                    self.task_list = [str(t) for t in tasks] if tasks else ["Complete the user's request"]
                     _pending_phase_transition = self.PHASE_EXECUTE
                     await self._save_state_to_file()
                     await self.emit_task_update()
@@ -3429,33 +3429,6 @@ class HelixAgentEngine:
                 await self.emit_status(f"Session: {self._format_token_status()}", done=True)
             self._seen_file_ids.clear()
             self.produced_files.clear()
-
-    def _extract_task_list(self, text):
-        if not text:
-            return ["Complete the user's request"]
-
-        # Plan must now be JSON only: {"tasks": ["task1", "task2"]}
-        try:
-            data = json.loads(text)
-            if isinstance(data, dict) and "tasks" in data:
-                tasks = [t.get("description", t) if isinstance(t, dict) else str(t) for t in data["tasks"]]
-                return tasks if tasks else ["Complete the user's request"]
-        except (json.JSONDecodeError, TypeError):
-            pass
-
-        # Try to extract a JSON block from within the text
-        json_match = re.search(r'\{[^}]*"tasks"\s*:\s*\[.*?\]\s*\}', text, re.DOTALL)
-        if json_match:
-            try:
-                data = json.loads(json_match.group(0))
-                if isinstance(data, dict) and "tasks" in data:
-                    tasks = [t.get("description", t) if isinstance(t, dict) else str(t) for t in data["tasks"]]
-                    return tasks if tasks else ["Complete the user's request"]
-            except (json.JSONDecodeError, TypeError):
-                pass
-
-        return ["Complete the user's request"]
-
 
 class Pipe:
     class Valves(BaseModel):
