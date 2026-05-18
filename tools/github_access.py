@@ -6,7 +6,7 @@ description: >
   branches, commits, and GitHub Actions workflows - directly from OpenWebUI.
   Uses the GitHub REST API with your Personal Access Token.
   Enforces a branch->file->PR workflow; no direct writes to main.
-version: 2.2.0
+version: 2.2.1
 """
 
 import base64
