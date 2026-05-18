@@ -61,7 +61,6 @@ from open_webui.models.skills import Skills
 
 logger = logging.getLogger(__name__)
 
-# v4.6+: OpenWebUI DB-backed state persistence
 try:
     from open_webui.models.chats import Chats
     from open_webui.routers.files import upload_file_handler, Files
@@ -340,28 +339,6 @@ def strip_thinking(text):
     return text.strip()
 
 
-def extract_xml_tool_calls(text):
-    """Attempt to extract tool calls from hallucinated XML <ToolCall> blocks."""
-    calls = []
-    pattern = re.compile(
-        r"<ToolCall>\s*<name>\s*(.*?)\s*</name>\s*<arguments>\s*(.*?)\s*</arguments>\s*</ToolCall>",
-        re.DOTALL | re.IGNORECASE
-    )
-    for i, m in enumerate(pattern.finditer(text)):
-        name = m.group(1).strip()
-        args_str = m.group(2).strip()
-        try:
-            args = json.loads(args_str)
-        except (json.JSONDecodeError, ValueError):
-            args = {}
-        calls.append({
-            "id": f"call_xml_{uuid.uuid4().hex[:12]}",
-            "type": "function",
-            "function": {"name": name, "arguments": json.dumps(args) if isinstance(args, dict) else args_str},
-            "index": i,
-        })
-    return calls
-
 
 def strip_html(text):
     """Remove HTML tags and decode common entities for plain-text display."""
@@ -514,6 +491,7 @@ class HelixAgentEngine:
                 "phase": self.phase,
                 "loop_count": self.loop_count,
                 "extra_grace": self._extra_grace,
+                "history": self.history,
             }
             content = json.dumps(state_data, sort_keys=True, ensure_ascii=False).encode("utf-8")
             payload_hash = hashlib.sha256(content).hexdigest()
@@ -655,9 +633,12 @@ class HelixAgentEngine:
             self.completed_tasks = data.get("completed", [])
             self.failed_tasks = data.get("failed", [])
             self.phase = data.get("phase", self.PHASE_PLAN)
-            self.goal = data.get("goal", self.goal)
+            self.goal = data.get("goal") if "goal" in data else self.goal
             self.loop_count = data.get("loop_count", 0)
             self._extra_grace = data.get("extra_grace", 0)
+            self.history = data.get("history", self.history)
+            # Resynchronize compression loop counter to avoid immediate compression after recovery
+            self._last_compression_loop = self.loop_count
             logger.info("Helix state recovered from file attachment.")
         except Exception as e:
             logger.warning(f"State recovery from file failed: {e}")
@@ -2158,27 +2139,12 @@ class HelixAgentEngine:
             return f"Tool '{tool_name}' not found in current phase ({self.phase}). Available: {', '.join(available[:20])}", []
 
         def _get_allowed_keys(spec: dict) -> set:
-            """Extract allowed arg keys from various tool schema shapes."""
+            """Extract allowed arg keys from OpenAI or MCP tool schema."""
             parameters = spec.get("parameters") or spec.get("inputSchema")
-            if isinstance(parameters, dict):
-                props = parameters.get("properties")
-                if isinstance(props, dict):
-                    return set(props.keys())
-                # Handle JSON Schema top-level properties directly
-                if "properties" in parameters:
-                    top_props = parameters.get("properties")
-                    if isinstance(top_props, dict):
-                        return set(top_props.keys())
-                # Fallback: keys that aren't JSON Schema metadata keys
-                meta_keys = {"type", "required", "properties", "description", "title", "$defs", "additionalProperties"}
-                return {k for k in parameters.keys() if k not in meta_keys}
-            # Some schemas specify args as a dict under a key named "args" or "arguments"
-            for fallback_key in ("args", "arguments", "params", "input"):
-                fb = spec.get(fallback_key)
-                if isinstance(fb, dict):
-                    nested = fb.get("properties") or {}
-                    return set(nested.keys()) if isinstance(nested, dict) else set(fb.keys())
-            return set()
+            if not isinstance(parameters, dict):
+                return set()
+            props = parameters.get("properties")
+            return set(props.keys()) if isinstance(props, dict) else set()
 
         allowed_keys = _get_allowed_keys(target.get("spec", {}))
         if allowed_keys:
@@ -2258,61 +2224,43 @@ class HelixAgentEngine:
         task_state = self._build_task_state()
 
         base = ""
-        try:
-            if self.phase == self.PHASE_PLAN:
+        if self.phase == self.PHASE_PLAN:
+            base = self._render_prompt(
+                self.valves.PLAN_PROMPT or DEFAULT_PLAN_PROMPT,
+            )
+        elif self.phase == self.PHASE_REPLAN:
+            base = self._render_prompt(
+                DEFAULT_REPLAN_PROMPT,
+                goal=self.goal,
+                reason=self._replan_reason,
+                task_state=task_state,
+            )
+        elif self.phase == self.PHASE_EXECUTE:
+            base = self._render_prompt(
+                self.valves.EXECUTE_PROMPT or DEFAULT_EXECUTE_PROMPT,
+                task_state=task_state,
+            )
+        elif self.phase == self.PHASE_REVIEW:
+            base = self._render_prompt(
+                self.valves.REVIEW_PROMPT or DEFAULT_REVIEW_PROMPT,
+                goal=self.goal,
+                task_state=task_state,
+            )
+        elif self.phase == self.PHASE_OUTPUT:
+            if self._output_turn >= 2:
                 base = self._render_prompt(
-                    self.valves.PLAN_PROMPT or DEFAULT_PLAN_PROMPT,
-                )
-            elif self.phase == self.PHASE_REPLAN:
-                base = self._render_prompt(
-                    DEFAULT_REPLAN_PROMPT,
+                    DEFAULT_OUTPUT_FINAL_PROMPT,
                     goal=self.goal,
-                    reason=self._replan_reason,
                     task_state=task_state,
                 )
-            elif self.phase == self.PHASE_EXECUTE:
+            else:
                 base = self._render_prompt(
-                    self.valves.EXECUTE_PROMPT or DEFAULT_EXECUTE_PROMPT,
-                    task_state=task_state,
-                )
-            elif self.phase == self.PHASE_REVIEW:
-                base = self._render_prompt(
-                    self.valves.REVIEW_PROMPT or DEFAULT_REVIEW_PROMPT,
+                    self.valves.OUTPUT_PROMPT or DEFAULT_OUTPUT_PROMPT,
                     goal=self.goal,
                     task_state=task_state,
                 )
-            elif self.phase == self.PHASE_OUTPUT:
-                if self._output_turn >= 2:
-                    base = self._render_prompt(
-                        DEFAULT_OUTPUT_FINAL_PROMPT,
-                        goal=self.goal,
-                        task_state=task_state,
-                    )
-                else:
-                    base = self._render_prompt(
-                        self.valves.OUTPUT_PROMPT or DEFAULT_OUTPUT_PROMPT,
-                        goal=self.goal,
-                        task_state=task_state,
-                    )
-            else:
-                base = self._render_prompt(DEFAULT_PLAN_PROMPT)
-        except Exception:
-            # Last-resort fallback if rendering itself somehow fails
-            if self.phase == self.PHASE_PLAN:
-                base = self._render_prompt(DEFAULT_PLAN_PROMPT)
-            elif self.phase == self.PHASE_REPLAN:
-                base = self._render_prompt(DEFAULT_REPLAN_PROMPT, goal=self.goal, reason=self._replan_reason, task_state=task_state)
-            elif self.phase == self.PHASE_EXECUTE:
-                base = self._render_prompt(DEFAULT_EXECUTE_PROMPT, task_state=task_state)
-            elif self.phase == self.PHASE_REVIEW:
-                base = self._render_prompt(DEFAULT_REVIEW_PROMPT, goal=self.goal, task_state=task_state)
-            elif self.phase == self.PHASE_OUTPUT:
-                if self._output_turn >= 2:
-                    base = self._render_prompt(DEFAULT_OUTPUT_FINAL_PROMPT, goal=self.goal, task_state=task_state)
-                else:
-                    base = self._render_prompt(DEFAULT_OUTPUT_PROMPT, goal=self.goal, task_state=task_state)
-            else:
-                base = self._render_prompt(DEFAULT_PLAN_PROMPT)
+        else:
+            base = self._render_prompt(DEFAULT_PLAN_PROMPT)
 
         base = base.replace("[USER_HOME]", os.path.expanduser("~"))
 
@@ -2440,6 +2388,72 @@ class HelixAgentEngine:
                 lines.append(f"[{role.capitalize()}]\n{content}")
         return "\n\n".join(lines)
 
+    @staticmethod
+    def _find_safe_compression_split(messages: list, keep_recent: int) -> int:
+        """Find an index to split messages so that tool-call pairs are never broken.
+
+        The split must never land inside a tool-call sequence.  Specifically:
+        - If a message with role 'tool' would be cut off, its preceding assistant
+          message (the one containing the matching tool_calls) must also be kept.
+        - If an assistant message with tool_calls is at the split boundary,
+          all of its corresponding 'tool' result messages must also be kept.
+
+        Returns the split index (number of messages to include in the OLD part).
+        """
+        if len(messages) <= keep_recent + 1:
+            return 0
+
+        # Start from a naive split point
+        split_idx = len(messages) - keep_recent
+
+        # Gather all tool_call IDs from assistant messages at/before the boundary
+        assistant_call_ids = set()
+        for i in range(split_idx):
+            msg = messages[i]
+            if msg.get("role") == "assistant" and msg.get("tool_calls"):
+                for tc in msg["tool_calls"]:
+                    tc_id = tc.get("id")
+                    if tc_id:
+                        assistant_call_ids.add(tc_id)
+
+        # Find tool result messages that fall AFTER the split but whose
+        # assistant call was BEFORE the split -> move split forward
+        while split_idx < len(messages):
+            msg = messages[split_idx]
+            if msg.get("role") == "tool":
+                tc_id = msg.get("tool_call_id")
+                if tc_id and tc_id in assistant_call_ids:
+                    # This tool result belongs to an assistant BEFORE the split,
+                    # so we must keep it -> move split forward
+                    split_idx += 1
+                    continue
+            # If the message at split_idx is an assistant with tool_calls,
+            # ensure all its tool results are after the split too.
+            # If some tool results are BEFORE the split, we can't leave a
+            # dangling assistant call either -> move split back
+            if msg.get("role") == "assistant" and msg.get("tool_calls"):
+                missing_tool = False
+                for tc in msg["tool_calls"]:
+                    tc_id = tc.get("id")
+                    if tc_id:
+                        # Look for the matching tool result in the old part
+                        found_in_old = any(
+                            m.get("role") == "tool" and m.get("tool_call_id") == tc_id
+                            for m in messages[:split_idx]
+                        )
+                        if found_in_old:
+                            missing_tool = True
+                            break
+                if missing_tool:
+                    # Can't split here because the old part already contains
+                    # a tool result for this assistant. Move split forward to
+                    # include this assistant in the new part.
+                    split_idx += 1
+                    continue
+            break
+
+        return split_idx
+
     async def _compress_history_llm(self) -> bool:
         """
         Blocking LLM-based history compression.
@@ -2458,8 +2472,13 @@ class HelixAgentEngine:
             return False
 
         # Split: old messages (to compress) + recent messages (keep intact)
-        old_messages = self.history[:-keep_recent]
-        recent_messages = self.history[-keep_recent:]
+        # Use a safe split that never breaks tool-call pairs.
+        split_idx = self._find_safe_compression_split(self.history, keep_recent)
+        old_messages = self.history[:split_idx]
+        recent_messages = self.history[split_idx:]
+
+        if not old_messages:
+            return False
 
         # Emit status: compression started
         old_tokens = sum(self._estimate_tokens(str(m.get("content", ""))) for m in old_messages)
@@ -2490,13 +2509,14 @@ class HelixAgentEngine:
         saved = old_tokens - compressed_tokens
         saved_pct = round((saved / total_tokens) * 100) if total_tokens else 0
 
-        # Build the compressed assistant message
+        # Build the compressed context message as a system message
+        # so it does not interfere with assistant/tool conversation flow.
         compressed_msg = {
-            "role": "assistant",
+            "role": "system",
             "content": f"=== Compressed Context ===\n{compressed}",
         }
 
-        # Replace history: compressed msg + recent messages
+        # Replace history: compressed system msg + recent messages
         self.history = [compressed_msg] + recent_messages
 
         await self.emit_status(f"History compressed: saved {saved_pct}% ({saved} tokens)", done=True)
@@ -2639,8 +2659,8 @@ class HelixAgentEngine:
             for file_info in incoming_files:
                 if not isinstance(file_info, dict):
                     continue
-                file_size = None
-                if HAS_DB_PERSISTENCE:
+                file_size = file_info.get("size")
+                if file_size is None and HAS_DB_PERSISTENCE:
                     fid = file_info.get("file_id") or file_info.get("id")
                     if fid:
                         try:
@@ -2651,13 +2671,6 @@ class HelixAgentEngine:
                                     file_size = os.path.getsize(fpath)
                         except Exception:
                             pass
-                if file_size is None:
-                    upload_dir = getattr(self.request.app.state, "UPLOAD_DIR", None)
-                    fname = file_info.get("name") or file_info.get("filename") or file_info.get("file_id") or file_info.get("id")
-                    if upload_dir and fname:
-                        fpath = os.path.join(upload_dir, fname)
-                        if os.path.exists(fpath):
-                            file_size = os.path.getsize(fpath)
                 if file_size and file_size > max_bytes:
                     oversized.append((file_info.get("name", "unknown"), file_size))
             if oversized:
@@ -2666,12 +2679,7 @@ class HelixAgentEngine:
                     f"**Error: File(s) too large ({max_size_mb} MB max)**\n\n"
                     f"The following attached file(s) exceed the maximum allowed size ({max_size_mb} MB):\n"
                     f"{items}\n\n"
-                    f"**Please upload large documents to a Knowledge Base instead.**\n"
-                    f"1. Go to your Workspace/Knowledge settings\n"
-                    f"2. Create or select a Knowledge Base\n"
-                    f"3. Upload the file there\n"
-                    f"4. Link the Knowledge Base to this model\n"
-                    f"5. Try again"
+                    f"Please upload large documents to a Knowledge Base instead."
                 )
                 await self.emit_status("File too large", done=True)
                 return err
@@ -2878,55 +2886,50 @@ class HelixAgentEngine:
             content = strip_thinking("".join(content_chunks).strip())
 
             if not tc_dict:
-                # Try XML tool call rescue for hallucinated <ToolCall> blocks
-                xml_calls = extract_xml_tool_calls(content or "")
-                if xml_calls:
-                    tc_dict = {tc["index"]: tc for tc in xml_calls}
-                else:
-                    # No tool calls and no XML rescue
-                    # PLAN phase: enforce that the model must call confirm_plan.
-                    if self.phase in (self.PHASE_PLAN, self.PHASE_REPLAN):
+                # No tool calls produced
+                # PLAN phase: enforce that the model must call confirm_plan.
+                if self.phase in (self.PHASE_PLAN, self.PHASE_REPLAN):
+                    self.history.append({
+                        "role": "assistant",
+                        "content": content or "",
+                    })
+                    self.history.append({
+                        "role": "user",
+                        "content": "SYSTEM: You produced text but did not call any tools. You MUST call the confirm_plan tool with the plan to proceed. Do NOT output the plan as text—call the tool.",
+                    })
+                    await self.emit_output(f"\n[WARN] No tool call produced in {self.phase} phase. Re-prompting to enforce confirm_plan.\n")
+                    continue
+                # OUTPUT phase: never emit text in Turn 1, always proceed to Turn 2
+                if self.phase == self.PHASE_OUTPUT:
+                    if self._output_turn == 1:
+                        # Turn 1 with no tools: skip text and proceed to Turn 2
                         self.history.append({
                             "role": "assistant",
                             "content": content or "",
                         })
-                        self.history.append({
-                            "role": "user",
-                            "content": "SYSTEM: You produced text but did not call any tools. You MUST call the confirm_plan tool with the plan to proceed. Do NOT output the plan as text—call the tool.",
-                        })
-                        await self.emit_output(f"\n[WARN] No tool call produced in {self.phase} phase. Re-prompting to enforce confirm_plan.\n")
                         continue
-                    # OUTPUT phase: never emit text in Turn 1, always proceed to Turn 2
-                    if self.phase == self.PHASE_OUTPUT:
-                        if self._output_turn == 1:
-                            # Turn 1 with no tools: skip text and proceed to Turn 2
-                            self.history.append({
-                                "role": "assistant",
-                                "content": content or "",
-                            })
-                            continue
-                        # Turn 2: emit final text and return
-                        if content:
-                            await self.emit_output(content)
-                        await self.emit_task_update(finalize_tasks=True)
-                        await self.emit_status("Done", done=True)
-                        return self._format_output()
-                    if content and self.task_list and len(self.completed_tasks) < len(self.task_list):
-                        # Tasks remain: inject continuation prompt instead of terminating
-                        self.history.append({
-                            "role": "assistant",
-                            "content": content,
-                        })
-                        self.history.append({
-                            "role": "user",
-                            "content": "SYSTEM: You produced text but did not call any tools. You have unfinished tasks. Continue working by calling the appropriate tool. Do NOT just describe what to do — call a tool.",
-                        })
-                        await self.emit_output(f"\n[WARN] No tool call produced. Re-prompting to continue.\n")
-                        continue
+                    # Turn 2: emit final text and return
                     if content:
                         await self.emit_output(content)
+                    await self.emit_task_update(finalize_tasks=True)
                     await self.emit_status("Done", done=True)
                     return self._format_output()
+                if content and self.task_list and len(self.completed_tasks) < len(self.task_list):
+                    # Tasks remain: inject continuation prompt instead of terminating
+                    self.history.append({
+                        "role": "assistant",
+                        "content": content,
+                    })
+                    self.history.append({
+                        "role": "user",
+                        "content": "SYSTEM: You produced text but did not call any tools. You have unfinished tasks. Continue working by calling the appropriate tool. Do NOT just describe what to do — call a tool.",
+                    })
+                    await self.emit_output(f"\n[WARN] No tool call produced. Re-prompting to continue.\n")
+                    continue
+                if content:
+                    await self.emit_output(content)
+                await self.emit_status("Done", done=True)
+                return self._format_output()
 
             tool_calls_list = list(tc_dict.values())
             self.history.append({
