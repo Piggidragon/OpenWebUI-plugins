@@ -168,31 +168,51 @@ Use `run_tools_parallel` if you are calling multiple independent rendering/visua
 Only rendering/visualisation tools configured for the OUTPUT phase are available.
 """
 
-OUTPUT_FINAL_JSON_SCHEMA = """\
-You MUST respond as a single JSON object with this exact schema:
-{
-  "summary": "string: 3-5 sentence summary of what was accomplished, files created/modified, failed tasks (if any), and where to find results",
-  "files_created": ["string: relative path under agent/"],
-  "files_modified": ["string: relative path under agent/"],
-  "failed_tasks": ["string: brief description of any failed tasks and why"],
-  "status": "string: one of completed|partial|failed"
+OUTPUT_FINAL_JSON_SCHEMA = {
+    "type": "json_schema",
+    "json_schema": {
+        "name": "output_final_summary",
+        "strict": True,
+        "schema": {
+            "type": "object",
+            "properties": {
+                "summary": {
+                    "type": "string",
+                    "description": "3-5 sentence summary of what was accomplished, files created/modified, failed tasks (if any), and where to find results"
+                },
+                "files_created": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Relative paths of files created under agent/"
+                },
+                "files_modified": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Relative paths of files modified under agent/"
+                },
+                "failed_tasks": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "Brief descriptions of any failed tasks and why"
+                },
+                "status": {
+                    "type": "string",
+                    "enum": ["completed", "partial", "failed"],
+                    "description": "Overall session status"
+                }
+            },
+            "required": ["summary", "files_created", "files_modified", "failed_tasks", "status"],
+            "additionalProperties": False
+        }
+    }
 }
-"""
 
 DEFAULT_OUTPUT_FINAL_PROMPT = """\
 You are in OUTPUT mode — FINAL SUMMARY PHASE.
 This is turn 2 of 2 in the output phase. You may NOT use any tools.
 
-Task:
-Write a concise 3-5 sentence summary for the user that covers:
-1. What was accomplished during this session (completed tasks).
-2. Which files were created or modified.
-3. Any failed tasks and why (if applicable).
-4. Where the user can find the results (project folder under `[USER_HOME]/agent/`).
-
-Do NOT reproduce file contents, code, or large text blocks here. All results are already persisted in files. Keep the reply short and focused.
-
-{output_schema}
+Your response MUST conform to the provided JSON schema.
+Do NOT reproduce file contents, code, or large text blocks here. All results are already persisted in files. Keep the summary concise and focused.
 
 Goal: {goal}
 """
@@ -432,6 +452,12 @@ class HelixAgentEngine:
         self._plan_questions_asked = 0
         self._extra_grace = 0
         self._last_compression_loop = 0
+
+        # Token tracking state
+        self._total_input_tokens = 0
+        self._total_output_tokens = 0
+        self._total_tool_calls = 0
+        self._estimated_cost_usd = 0.0
 
         # Throttling / debounce state
         self._last_state_save_ts: float = 0.0
@@ -685,6 +711,56 @@ class HelixAgentEngine:
     def _total_history_tokens(self) -> int:
         """Return estimated token count of all messages in self.history."""
         return sum(self._estimate_tokens(str(m.get("content", ""))) for m in self.history)
+
+    def _total_history_tokens(self) -> int:
+        """Return estimated token count of all messages in self.history."""
+        return sum(self._estimate_tokens(str(m.get("content", ""))) for m in self.history)
+
+    # ── Token Tracking ──
+
+    def _track_tokens(self, input_tokens: int, output_tokens: int):
+        """Accumulate session-wide token usage and estimate cost."""
+        self._total_input_tokens += input_tokens
+        self._total_output_tokens += output_tokens
+        self._estimated_cost_usd = self._calculate_cost(
+            self._total_input_tokens, self._total_output_tokens
+        )
+
+    def _calculate_cost(self, input_tokens: int, output_tokens: int) -> float:
+        """Estimate USD cost from token counts. Falls back to model metadata if valve overrides are 0."""
+        input_price = 0.0
+        output_price = 0.0
+        valve_input = getattr(self.valves, "TOKEN_COST_INPUT_PER_1M", 0.0)
+        valve_output = getattr(self.valves, "TOKEN_COST_OUTPUT_PER_1M", 0.0)
+        if valve_input > 0 and valve_output > 0:
+            input_price = valve_input
+            output_price = valve_output
+        else:
+            # Try model metadata from app_models
+            try:
+                model_info = self.app_models.get(self.body.get("model", ""), {})
+                meta = model_info.get("info", {}).get("meta", {})
+                if meta:
+                    if valve_input <= 0:
+                        input_price = meta.get("input_cost", 0.0)
+                    else:
+                        input_price = valve_input
+                    if valve_output <= 0:
+                        output_price = meta.get("output_cost", 0.0)
+                    else:
+                        output_price = valve_output
+            except Exception:
+                pass
+        return (input_tokens * input_price / 1_000_000) + (output_tokens * output_price / 1_000_000)
+
+    def _format_token_status(self) -> str:
+        """Return a concise token/cost string for live status messages."""
+        total = self._total_input_tokens + self._total_output_tokens
+        if self._estimated_cost_usd > 0:
+            cost_str = f" (${self._estimated_cost_usd:.4f})"
+        else:
+            cost_str = ""
+        return f"Tokens: {total} (in {self._total_input_tokens} / out {self._total_output_tokens}){cost_str}"
 
     def _get_history_compression_threshold(self) -> int:
         """Return **token** threshold at which history compression should trigger.
@@ -2261,14 +2337,10 @@ class HelixAgentEngine:
             )
         elif self.phase == self.PHASE_OUTPUT:
             if self._output_turn >= 2:
-                output_schema_block = ""
-                if getattr(self.valves, "ENABLE_STRUCTURED_OUTPUT", True):
-                    output_schema_block = OUTPUT_FINAL_JSON_SCHEMA
                 base = self._render_prompt(
                     DEFAULT_OUTPUT_FINAL_PROMPT,
                     goal=self.goal,
                     task_state=task_state,
-                    output_schema=output_schema_block,
                 )
             else:
                 base = self._render_prompt(
@@ -2829,7 +2901,8 @@ class HelixAgentEngine:
             name = phase_name.get(self.phase, "Loop")
 
             effective_max = self.valves.MAX_ITERATIONS + self._extra_grace
-            await self.emit_status(f"Mode: {name}, Loop: {self.loop_count}/{effective_max}")
+            token_status = f", {self._format_token_status()}" if self._total_input_tokens > 0 or self._total_output_tokens > 0 else ""
+            await self.emit_status(f"Mode: {name}, Loop: {self.loop_count}/{effective_max}{token_status}")
 
 
             self.history = self._manage_context_window(self.history)
@@ -2846,6 +2919,14 @@ class HelixAgentEngine:
             system_prompt = self._build_system_prompt()
             call_messages = [{"role": "system", "content": system_prompt}] + [m for m in self.history if m.get("role") != "system"]
 
+            # ── Token Tracking: estimate input tokens (messages + tools specs) ──
+            input_tokens_this_call = sum(
+                self._estimate_tokens(str(m.get("content", ""))) for m in call_messages
+            ) + sum(
+                self._estimate_tokens(json.dumps(t.get("function", {}), ensure_ascii=False)) for t in (self.phase_tools_specs or [])
+            )
+            self._track_tokens(input_tokens=input_tokens_this_call, output_tokens=0)
+
             completion_body = {
                 **self.body,
                 "model": model,
@@ -2857,6 +2938,8 @@ class HelixAgentEngine:
             # In OUTPUT phase turn 2, remove tools to force pure text output
             if self.phase == self.PHASE_OUTPUT and self._output_turn >= 2:
                 completion_body["tools"] = None
+                # ── Structured Output: Enforce JSON schema for OUTPUT Turn 2 ──
+                completion_body["response_format"] = OUTPUT_FINAL_JSON_SCHEMA
 
             # Inject model knowledge for native OpenWebUI vector search
             mk = getattr(self, "_model_knowledge", None)
@@ -2902,6 +2985,13 @@ class HelixAgentEngine:
 
             content = strip_thinking("".join(content_chunks).strip())
 
+            # ── Token Tracking: estimate output tokens (content + tool call arguments) ──
+            output_text = content + " ".join(
+                json.dumps(tc.get("function", {}).get("arguments", ""), ensure_ascii=False)
+                for tc in tc_dict.values()
+            )
+            self._track_tokens(input_tokens=0, output_tokens=self._estimate_tokens(output_text))
+
             if not tc_dict:
                 # No tool calls produced
                 # PLAN phase: enforce that the model must call confirm_plan.
@@ -2925,9 +3015,14 @@ class HelixAgentEngine:
                             "content": content or "",
                         })
                         continue
-                    # Turn 2: emit final text and return
+                    # Turn 2: parse structured JSON and emit summary
                     if content:
-                        await self.emit_output(content)
+                        parsed = json.loads(content)
+                        summary = parsed.get("summary", "")
+                        if summary:
+                            await self.emit_output(summary)
+                        else:
+                            await self.emit_output(content)
                     await self.emit_task_update(finalize_tasks=True)
                     await self.emit_status("Done", done=True)
                     return self._format_output()
@@ -2944,21 +3039,10 @@ class HelixAgentEngine:
                     await self.emit_output(f"\n[WARN] No tool call produced. Re-prompting to continue.\n")
                     continue
                 if content:
-                    # ── Structured Output: Try to parse JSON for OUTPUT Turn 2 ──
-                    if self.phase == self.PHASE_OUTPUT and self._output_turn >= 2 and getattr(self.valves, "ENABLE_STRUCTURED_OUTPUT", True):
-                        try:
-                            parsed = json.loads(content)
-                            if isinstance(parsed, dict):
-                                summary = parsed.get("summary", "")
-                                if summary:
-                                    await self.emit_output(summary)
-                                else:
-                                    await self.emit_output(content)
-                            else:
-                                await self.emit_output(content)
-                        except json.JSONDecodeError:
-                            # If JSON parsing fails, fall back to raw content
-                            await self.emit_output(content)
+                    parsed = json.loads(content)
+                    summary = parsed.get("summary", "")
+                    if summary:
+                        await self.emit_output(summary)
                     else:
                         await self.emit_output(content)
                 await self.emit_status("Done", done=True)
@@ -3224,8 +3308,7 @@ class HelixAgentEngine:
                                 f"Truncated call {tool_name} because result was {len(result_str)}/{truncation_limit} chars"
                             )
                         tool_result = smart_truncate(result_str, truncation_limit)
-                        if self._token_tracking_enabled:
-                            self._total_tool_calls += 1
+                        self._total_tool_calls += 1
 
                         # ── Consecutive tool-not-found tracking ──
                         if "not found in current phase" in tool_result:
@@ -3297,6 +3380,13 @@ class HelixAgentEngine:
                         self.chat_id, self.message_id, snapshot
                     )
                 )
+            # ── Token Tracking: emit final summary ──
+            total = self._total_input_tokens + self._total_output_tokens
+            cost_str = f" (${self._estimated_cost_usd:.4f})" if self._estimated_cost_usd > 0 else ""
+            if total > 0 or self._total_tool_calls > 0:
+                summary = f"\n[Session Tokens] Total: {total} (in {self._total_input_tokens} / out {self._total_output_tokens}){cost_str} | Tools: {self._total_tool_calls} | Loops: {self.loop_count}"
+                await self.emit_output(summary)
+                await self.emit_status(f"Session: {self._format_token_status()}", done=True)
             self._seen_file_ids.clear()
             self.produced_files.clear()
 
@@ -3496,7 +3586,19 @@ class Pipe:
             description="Timeout in seconds for the iteration limit Continue/Cancel modal. After this time the agent auto-stops.",
         )
 
-        # ── 6. Debug ──
+        # ── 6. Token Tracking ──
+        TOKEN_COST_INPUT_PER_1M: float = Field(
+            default=0.0,
+            ge=0,
+            description="Override price per 1M input tokens (USD). Used when the model metadata does not provide a native input cost. 0.0 = use model metadata if available, otherwise cost stays 0.",
+        )
+        TOKEN_COST_OUTPUT_PER_1M: float = Field(
+            default=0.0,
+            ge=0,
+            description="Override price per 1M output tokens (USD). Used when the model metadata does not provide a native output cost. 0.0 = use model metadata if available, otherwise cost stays 0.",
+        )
+
+        # ── 7. Debug ──
         DEBUG_MODE: bool = Field(
             default=False,
             description="Enable debug mode. When on, messages 'show tools' return the available items directly without any LLM call.",
