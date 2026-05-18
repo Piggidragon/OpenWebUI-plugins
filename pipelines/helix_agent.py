@@ -457,7 +457,6 @@ class HelixAgentEngine:
         self._total_input_tokens = 0
         self._total_output_tokens = 0
         self._total_tool_calls = 0
-        self._estimated_cost_usd = 0.0
 
         # Throttling / debounce state
         self._last_state_save_ts: float = 0.0
@@ -712,55 +711,17 @@ class HelixAgentEngine:
         """Return estimated token count of all messages in self.history."""
         return sum(self._estimate_tokens(str(m.get("content", ""))) for m in self.history)
 
-    def _total_history_tokens(self) -> int:
-        """Return estimated token count of all messages in self.history."""
-        return sum(self._estimate_tokens(str(m.get("content", ""))) for m in self.history)
-
     # ── Token Tracking ──
 
     def _track_tokens(self, input_tokens: int, output_tokens: int):
-        """Accumulate session-wide token usage and estimate cost."""
+        """Accumulate session-wide token usage."""
         self._total_input_tokens += input_tokens
         self._total_output_tokens += output_tokens
-        self._estimated_cost_usd = self._calculate_cost(
-            self._total_input_tokens, self._total_output_tokens
-        )
-
-    def _calculate_cost(self, input_tokens: int, output_tokens: int) -> float:
-        """Estimate USD cost from token counts. Falls back to model metadata if valve overrides are 0."""
-        input_price = 0.0
-        output_price = 0.0
-        valve_input = getattr(self.valves, "TOKEN_COST_INPUT_PER_1M", 0.0)
-        valve_output = getattr(self.valves, "TOKEN_COST_OUTPUT_PER_1M", 0.0)
-        if valve_input > 0 and valve_output > 0:
-            input_price = valve_input
-            output_price = valve_output
-        else:
-            # Try model metadata from app_models
-            try:
-                model_info = self.app_models.get(self.body.get("model", ""), {})
-                meta = model_info.get("info", {}).get("meta", {})
-                if meta:
-                    if valve_input <= 0:
-                        input_price = meta.get("input_cost", 0.0)
-                    else:
-                        input_price = valve_input
-                    if valve_output <= 0:
-                        output_price = meta.get("output_cost", 0.0)
-                    else:
-                        output_price = valve_output
-            except Exception:
-                pass
-        return (input_tokens * input_price / 1_000_000) + (output_tokens * output_price / 1_000_000)
 
     def _format_token_status(self) -> str:
-        """Return a concise token/cost string for live status messages."""
+        """Return a concise token status string."""
         total = self._total_input_tokens + self._total_output_tokens
-        if self._estimated_cost_usd > 0:
-            cost_str = f" (${self._estimated_cost_usd:.4f})"
-        else:
-            cost_str = ""
-        return f"Tokens: {total} (in {self._total_input_tokens} / out {self._total_output_tokens}){cost_str}"
+        return f"Tokens: {total} (in {self._total_input_tokens} / out {self._total_output_tokens})"
 
     def _get_history_compression_threshold(self) -> int:
         """Return **token** threshold at which history compression should trigger.
@@ -3422,9 +3383,8 @@ class HelixAgentEngine:
                 )
             # ── Token Tracking: emit final summary ──
             total = self._total_input_tokens + self._total_output_tokens
-            cost_str = f" (${self._estimated_cost_usd:.4f})" if self._estimated_cost_usd > 0 else ""
             if total > 0 or self._total_tool_calls > 0:
-                summary = f"\n[Session Tokens] Total: {total} (in {self._total_input_tokens} / out {self._total_output_tokens}){cost_str} | Tools: {self._total_tool_calls} | Loops: {self.loop_count}"
+                summary = f"\n[Session Tokens] Total: {total} (in {self._total_input_tokens} / out {self._total_output_tokens}) | Tools: {self._total_tool_calls} | Loops: {self.loop_count}"
                 await self.emit_output(summary)
                 await self.emit_status(f"Session: {self._format_token_status()}", done=True)
             self._seen_file_ids.clear()
@@ -3599,19 +3559,7 @@ class Pipe:
             description="Timeout in seconds for the iteration limit Continue/Cancel modal. After this time the agent auto-stops.",
         )
 
-        # ── 6. Token Tracking ──
-        TOKEN_COST_INPUT_PER_1M: float = Field(
-            default=0.0,
-            ge=0,
-            description="Override price per 1M input tokens (USD). Used when the model metadata does not provide a native input cost. 0.0 = use model metadata if available, otherwise cost stays 0.",
-        )
-        TOKEN_COST_OUTPUT_PER_1M: float = Field(
-            default=0.0,
-            ge=0,
-            description="Override price per 1M output tokens (USD). Used when the model metadata does not provide a native output cost. 0.0 = use model metadata if available, otherwise cost stays 0.",
-        )
-
-        # ── 7. Debug ──
+        # ── 6. Debug ──
         DEBUG_MODE: bool = Field(
             default=False,
             description="Enable debug mode. When on, messages 'show tools' return the available items directly without any LLM call.",
