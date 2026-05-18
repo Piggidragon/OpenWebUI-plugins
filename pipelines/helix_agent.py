@@ -1,13 +1,13 @@
 """
 title: Helix Agent
 author: Piggidragon
-version: 0.24.1
+version: 0.24.2
 description: >
-  Helix Agent — OpenWebUI-native agent loop with modular per-phase tool control.
+  Helix Agent - OpenWebUI-native agent loop with modular per-phase tool control.
 
   Architecture:
   - SINGLE model loop (Plan -> Execute -> Review -> Replan -> Execute...)
-  - Per-phase tool filtering via Valves — only relevant tools exposed to the LLM at each phase
+  - Per-phase tool filtering via Valves - only relevant tools exposed to the LLM at each phase
   - Internal control tools (terminate, replan, fix_plan, complete_task, fail_task, confirm_plan) always available
   - Uses OpenWebUI native tool infrastructure (__tools__ param)
   - Context window management with adaptive history truncation and tool-call pair integrity
@@ -70,9 +70,9 @@ try:
 except Exception:
     HAS_DB_PERSISTENCE = False
 
-# ──────────────────────────────────────────────────────────────────
+# ------------------------------------------------------------------
 #  DEFAULT PROMPTS (overridable via Valves)
-# ──────────────────────────────────────────────────────────────────
+# ------------------------------------------------------------------
 
 DEFAULT_PLAN_PROMPT = """\
 You are in PLAN mode. Your job is to understand the user's request and create a clear, actionable task plan.
@@ -154,7 +154,7 @@ Rules:
 """
 
 DEFAULT_OUTPUT_PROMPT = """\
-You are in OUTPUT mode -- RENDERING / VISUALISATION TURN.
+You are in OUTPUT mode - RENDERING / VISUALISATION TURN.
 This is turn 1 of 2 in the output phase.
 
 Your ONLY job here is to call rendering or visualisation tools (e.g. display_file) if any are available and useful to illustrate the results for the user.
@@ -208,7 +208,7 @@ OUTPUT_FINAL_JSON_SCHEMA = {
 }
 
 DEFAULT_OUTPUT_FINAL_PROMPT = """\
-You are in OUTPUT mode — FINAL SUMMARY PHASE.
+You are in OUTPUT mode - FINAL SUMMARY PHASE.
 This is turn 2 of 2 in the output phase. You may NOT use any tools.
 
 Your response MUST conform to the provided JSON schema.
@@ -243,10 +243,9 @@ Rules:
 """
 
 
-# ──────────────────────────────────────────────────────────────────
+# ------------------------------------------------------------------
 #  SSE STREAM PARSER
-# ──────────────────────────────────────────────────────────────────
-
+# ------------------------------------------------------------------
 async def _parse_sse_payload(payload: str):
     """Parse a single SSE data payload and yield structured events."""
     try:
@@ -335,9 +334,9 @@ async def stream_completion(request, body, user, max_retries: int = 1):
                 yield {"type": "content", "text": msg["content"]}
 
 
-# ──────────────────────────────────────────────────────────────────
+# ------------------------------------------------------------------
 #  HELPERS
-# ──────────────────────────────────────────────────────────────────
+# ------------------------------------------------------------------
 
 def smart_truncate(text, max_chars):
     if not text or max_chars <= 0 or len(text) <= max_chars:
@@ -389,12 +388,12 @@ def _comma_list(val: str) -> List[str]:
     return [x.strip() for x in val.split(",") if x.strip()]
 
 
-# ──────────────────────────────────────────────────────────────────
+# ------------------------------------------------------------------
 #  AGENT LOOP ENGINE
-# ──────────────────────────────────────────────────────────────────
+# ------------------------------------------------------------------
 
 class HelixAgentEngine:
-    """Helix Agent — single-model agent loop with per-phase tool filtering."""
+    """Helix Agent - single-model agent loop with per-phase tool filtering."""
 
     PHASE_PLAN = "plan"
     PHASE_EXECUTE = "execute"
@@ -508,7 +507,7 @@ class HelixAgentEngine:
             filtered.append(part)
         return "".join(filtered)
 
-    # ── State Persistence (DB + File Attachments) ──
+    # -- State Persistence (DB + File Attachments) --
 
     async def _save_state_to_file(self, force: bool = False) -> None:
         """Serialize agent state to a JSON file and bind it to the chat DB.
@@ -711,7 +710,7 @@ class HelixAgentEngine:
         """Return estimated token count of all messages in self.history."""
         return sum(self._estimate_tokens(str(m.get("content", ""))) for m in self.history)
 
-    # ── Token Tracking ──
+    # -- Token Tracking --
 
     def _track_tokens(self, input_tokens: int, output_tokens: int):
         """Accumulate session-wide token usage."""
@@ -931,7 +930,7 @@ class HelixAgentEngine:
                         "options": {
                             "type": "array",
                             "items": {"type": "string"},
-                            "description": "List of 2–6 options for the user to pick from.",
+                            "description": "List of 2-6 options for the user to pick from.",
                         },
                         "allow_custom": {
                             "type": "boolean",
@@ -946,7 +945,7 @@ class HelixAgentEngine:
             "type": "function",
         }
 
-    # ── Skills & MCP Helpers ──
+    # -- Skills & MCP Helpers --
 
     async def _resolve_model_skills(self, model_info: dict) -> tuple[list[str], str]:
         """Resolve skillIds from model metadata and fetch user skills from DB."""
@@ -993,7 +992,7 @@ class HelixAgentEngine:
 
         return skill_ids, skill_prompt
 
-    # ── Phase-aware Tool Filtering ──
+    # -- Phase-aware Tool Filtering --
 
     def _filter_tools_for_phase(self, phase: str):
         """Build phase_tools_dict from all_tools_dict based on Valves config."""
@@ -1041,7 +1040,7 @@ class HelixAgentEngine:
             if isinstance(t, dict) and "spec" in t
         ]
 
-    # ── Internal Tools ──
+    # -- Internal Tools --
 
     async def _tool_terminate(self, **kwargs):
         return json.dumps({"terminated": True, "result": kwargs.get("result", ""), "success": kwargs.get("success", True)})
@@ -1212,7 +1211,7 @@ class HelixAgentEngine:
             return json.dumps({"type": "skip", "response": "User skipped the question.", "skipped": True})
         return json.dumps({"type": "unknown", "response": f"User response: {raw_str}", "skipped": False})
 
-    # ── Parallel Tool Execution ──
+    # -- Parallel Tool Execution --
 
     def _normalize_parallel_calls(self, tool_calls: list) -> list:
         """Normalize and validate parallel tool call items."""
@@ -1786,7 +1785,7 @@ class HelixAgentEngine:
       }});
     }})();"""
 
-    # ── Iteration Limit UI ──
+    # -- Iteration Limit UI --
 
     def _build_iteration_limit_js(self, current_iter, max_iter, timeout_s: int = 300) -> str:
         """Build a Continue/Cancel modal for iteration limit reached."""
@@ -1922,7 +1921,7 @@ class HelixAgentEngine:
       }});
     }})();"""
 
-    # ── Task State String ──
+    # -- Task State String --
 
     async def emit_task_update(self, finalize_tasks=False):
         """Emit task progress via Open WebUI's native task list UI, debounced.
@@ -1987,14 +1986,14 @@ class HelixAgentEngine:
                 lines.append(f"  - {f['task']}: {f['reason']}")
         return "\n".join(lines)
 
-    # ── File Context Preparation ──
+    # -- File Context Preparation --
 
     async def _apply_file_prep(self, msgs: list) -> list:
         """Mirror OWUI middleware: add_file_context then chat_completion_files_handler."""
         if not self.request or not self.user or not self.pipe_metadata:
             return msgs
 
-        # 1. add_file_context — injects text-file content into messages
+        # 1. add_file_context - injects text-file content into messages
         prep = copy.deepcopy(msgs)
         try:
             prep = await add_file_context(prep, self.chat_id, self.user)
@@ -2002,7 +2001,7 @@ class HelixAgentEngine:
         except Exception as e:
             logger.warning("add_file_context failed: %s", e)
 
-        # 2. chat_completion_files_handler — converts remaining attachments to multimodal blocks
+        # 2. chat_completion_files_handler - converts remaining attachments to multimodal blocks
         try:
             udump = self.user.model_dump() if hasattr(self.user, "model_dump") else {}
             extra = {
@@ -2023,7 +2022,7 @@ class HelixAgentEngine:
 
         return prep
 
-    # ── File Persistence (tools → DB sync) ──
+    # -- File Persistence (tools -> DB sync) --
 
     async def _append_produced_files(self, raw_files: list) -> list:
         """Deduplicate and append tool-generated files under lock. Return unique new files."""
@@ -2149,7 +2148,7 @@ class HelixAgentEngine:
             logger.warning(f"Tool file DB sync failed: {e}")
             return False
 
-    # ── Execute Tool ──
+    # -- Execute Tool --
 
     def _validate_tool_args(self, spec: dict, args: dict) -> list:
         """Validate args against a tool's JSON schema spec. Returns list of error strings."""
@@ -2228,7 +2227,7 @@ class HelixAgentEngine:
             # If we can't determine schema, pass args through and rely on the tool to error
             filtered_args = dict(args)
 
-        # ── Schema validation: check args against tool spec BEFORE execution ──
+        # -- Schema validation: check args against tool spec BEFORE execution --
         validation_errors = self._validate_tool_args(target.get("spec", {}), filtered_args)
         if validation_errors:
             error_msg = "\n".join(f"- {err}" for err in validation_errors)
@@ -2279,7 +2278,7 @@ class HelixAgentEngine:
             logger.error(f"Tool execution error ({tool_name}): {e}")
             return f"Error executing {tool_name}: {e}", []
 
-    # ── Phase System Prompt ──
+    # -- Phase System Prompt --
 
     def _render_prompt(self, template: str, **kwargs) -> str:
         """Safely substitute known placeholders in a prompt template.
@@ -2344,7 +2343,7 @@ class HelixAgentEngine:
             base = f"{self._skill_prompt}\n\n{base}"
         return base
 
-    # ── Phase Transitions ──
+    # -- Phase Transitions --
 
     def _transition_to(self, phase):
         """Transition to a new phase: update tools, system prompt, state."""
@@ -2363,7 +2362,7 @@ class HelixAgentEngine:
         # Rebuild filtered tools for new phase
         self._filter_tools_for_phase(phase)
 
-    # ── Context Window Management ──
+    # -- Context Window Management --
 
     def _manage_context_window(self, messages):
         """Trim history to MAX_HISTORY_MESSAGES while keeping tool call pairs intact."""
@@ -2372,7 +2371,7 @@ class HelixAgentEngine:
             return messages
 
         to_remove = len(messages) - max_history
-        # Build head: goal (always preserved) – system prompt is injected separately
+        # Build head: goal (always preserved) - system prompt is injected separately
         head = messages[:1]
         # Non-state messages after head, split into removed and tail
         non_state = messages[1:]
@@ -2457,7 +2456,7 @@ class HelixAgentEngine:
             elif role == "assistant" and msg.get("tool_calls"):
                 content = msg.get("content", "")
                 tool_names = ", ".join(tc.get("function", {}).get("name", "?") for tc in msg.get("tool_calls", []))
-                lines.append(f"[Assistant: calling tools → {tool_names}]\n{content}")
+                lines.append(f"[Assistant: calling tools -> {tool_names}]\n{content}")
             else:
                 content = strip_html(msg.get("content", ""))
                 lines.append(f"[{role.capitalize()}]\n{content}")
@@ -2626,7 +2625,7 @@ class HelixAgentEngine:
 
 
 
-    # ── Main Loop ──
+    # -- Main Loop --
 
     async def _run_impl(self, user_msg, last_user_msg_raw, model):
         await self.resolve_tools()
@@ -2715,7 +2714,7 @@ class HelixAgentEngine:
         # Attempt DB-backed state recovery at start of turn
         await self._recover_state_from_files(self.body if isinstance(self.body, dict) else {})
 
-        # ── Attachment size guard ──
+        # -- Attachment size guard --
         max_size_mb = getattr(self.valves, "MAX_ATTACHMENT_SIZE_MB", 5)
         if max_size_mb > 0 and self.request:
             max_bytes = max_size_mb * 1024 * 1024
@@ -2823,7 +2822,7 @@ class HelixAgentEngine:
         while True:
             effective_max = self.valves.MAX_ITERATIONS + self._extra_grace
 
-            # ── OUTPUT phase hard limit: max 2 turns (tool prep + final text) ──
+            # -- OUTPUT phase hard limit: max 2 turns (tool prep + final text) --
             if self.phase == self.PHASE_OUTPUT:
                 self._output_turn += 1
                 if self._output_turn == 1:
@@ -2833,9 +2832,9 @@ class HelixAgentEngine:
                         for name in self.phase_tools_dict.keys()
                     )
                     if not has_rendering_tools:
-                        # No rendering tools available — skip Turn 1 and go straight to Final Summary
+                        # No rendering tools available - skip Turn 1 and go straight to Final Summary
                         self._output_turn = 2
-                        await self.emit_status("No rendering tools configured — skipping OUTPUT turn 1")
+                        await self.emit_status("No rendering tools configured - skipping OUTPUT turn 1")
                 if self._output_turn > 2 and not self._is_yolo_mode:
                     # Safety net: exceeded max output turns, return immediately
                     await self.emit_task_update(finalize_tasks=True)
@@ -2893,7 +2892,7 @@ class HelixAgentEngine:
 
             self.history = self._manage_context_window(self.history)
 
-            # ── Context Compression: check threshold and compress if needed ──
+            # -- Context Compression: check threshold and compress if needed --
             total_tokens = self._total_history_tokens()
             if total_tokens > self._get_history_compression_threshold():
                 if self.loop_count - getattr(self, "_last_compression_loop", 0) >= self.valves.COMPRESSION_INTERVAL:
@@ -2905,7 +2904,7 @@ class HelixAgentEngine:
             system_prompt = self._build_system_prompt()
             call_messages = [{"role": "system", "content": system_prompt}] + [m for m in self.history if m.get("role") != "system"]
 
-            # ── Token Tracking: estimate input tokens (messages + tools specs) ──
+            # -- Token Tracking: estimate input tokens (messages + tools specs) --
             input_tokens_this_call = sum(
                 self._estimate_tokens(str(m.get("content", ""))) for m in call_messages
             ) + sum(
@@ -2924,7 +2923,7 @@ class HelixAgentEngine:
             # In OUTPUT phase turn 2, remove tools to force pure text output
             if self.phase == self.PHASE_OUTPUT and self._output_turn >= 2:
                 completion_body["tools"] = None
-                # ── Structured Output: Enforce JSON schema for OUTPUT Turn 2 ──
+                # -- Structured Output: Enforce JSON schema for OUTPUT Turn 2 --
                 completion_body["response_format"] = OUTPUT_FINAL_JSON_SCHEMA
 
             # Inject model knowledge for native OpenWebUI vector search
@@ -2941,7 +2940,7 @@ class HelixAgentEngine:
             except Exception as e:
                 logger.warning("_apply_file_prep failed: %s", e)
 
-            # ── Stream LLM response ──
+            # -- Stream LLM response --
             tc_dict = {}
             content_chunks = []
 
@@ -2971,7 +2970,7 @@ class HelixAgentEngine:
 
             content = strip_thinking("".join(content_chunks).strip())
 
-            # ── Token Tracking: estimate output tokens (content + tool call arguments) ──
+            # -- Token Tracking: estimate output tokens (content + tool call arguments) --
             output_text = content + " ".join(
                 json.dumps(tc.get("function", {}).get("arguments", ""), ensure_ascii=False)
                 for tc in tc_dict.values()
@@ -2988,7 +2987,7 @@ class HelixAgentEngine:
                     })
                     self.history.append({
                         "role": "user",
-                        "content": "SYSTEM: You produced text but did not call any tools. You MUST call the confirm_plan tool with the plan to proceed. Do NOT output the plan as text—call the tool.",
+                        "content": "SYSTEM: You produced text but did not call any tools. You MUST call the confirm_plan tool with the plan to proceed. Do NOT output the plan as text-call the tool.",
                     })
                     await self.emit_output(f"\n[WARN] No tool call produced in {self.phase} phase. Re-prompting to enforce confirm_plan.\n")
                     continue
@@ -3020,7 +3019,7 @@ class HelixAgentEngine:
                     })
                     self.history.append({
                         "role": "user",
-                        "content": "SYSTEM: You produced text but did not call any tools. In REVIEW phase you MUST call exactly one of: proceed_to_output(), fix_plan(reason, updated_tasks), or replan(reason). Do NOT output text—call the appropriate tool.",
+                        "content": "SYSTEM: You produced text but did not call any tools. In REVIEW phase you MUST call exactly one of: proceed_to_output(), fix_plan(reason, updated_tasks), or replan(reason). Do NOT output text-call the appropriate tool.",
                     })
                     await self.emit_output(f"\n[WARN] No tool call produced in REVIEW phase. Re-prompting to enforce transition tool.\n")
                     continue
@@ -3032,7 +3031,7 @@ class HelixAgentEngine:
                     })
                     self.history.append({
                         "role": "user",
-                        "content": "SYSTEM: You produced text but did not call any tools. You have unfinished tasks. Continue working by calling the appropriate tool. Do NOT just describe what to do — call a tool.",
+                        "content": "SYSTEM: You produced text but did not call any tools. You have unfinished tasks. Continue working by calling the appropriate tool. Do NOT just describe what to do - call a tool.",
                     })
                     await self.emit_output(f"\n[WARN] No tool call produced. Re-prompting to continue.\n")
                     continue
@@ -3079,7 +3078,7 @@ class HelixAgentEngine:
                     })
                     continue
 
-                # ── Handle terminate ──
+                # -- Handle terminate --
                 if tool_name == "terminate":
                     result = args.get("result", "Task complete.")
                     success = args.get("success", True)
@@ -3092,7 +3091,7 @@ class HelixAgentEngine:
                     await self.emit_status("Finished", done=True)
                     return self._format_output()
 
-                # ── Handle replan ──
+                # -- Handle replan --
                 if tool_name == "replan":
                     reason = args.get("reason", "Plan needs adjustment")
 
@@ -3109,7 +3108,7 @@ class HelixAgentEngine:
                     await self.emit_status(f"[RPLN] Re-planning: {reason}")
                     continue
 
-                # ── Handle complete_task ──
+                # -- Handle complete_task --
                 if tool_name == "complete_task":
                     result_json = await self._tool_complete_task(**args)
                     result_data = json.loads(result_json)
@@ -3125,7 +3124,7 @@ class HelixAgentEngine:
                         _pending_phase_transition = self.PHASE_REVIEW
                     continue
 
-                # ── Handle fail_task ──
+                # -- Handle fail_task --
                 if tool_name == "fail_task":
                     result_json = await self._tool_fail_task(**args)
                     result_data = json.loads(result_json)
@@ -3142,7 +3141,7 @@ class HelixAgentEngine:
                         _pending_phase_transition = self.PHASE_REVIEW
                     continue
 
-                # ── Handle proceed_to_output ──
+                # -- Handle proceed_to_output --
                 if tool_name == "proceed_to_output":
                     result_json = await self._tool_proceed_to_output(**args)
                     result_data = json.loads(result_json)
@@ -3160,7 +3159,7 @@ class HelixAgentEngine:
                     })
                     continue
 
-                # ── Handle fix_plan ──
+                # -- Handle fix_plan --
                 if tool_name == "fix_plan":
                     result_json = await self._tool_fix_plan(**args)
                     result_data = json.loads(result_json)
@@ -3179,13 +3178,13 @@ class HelixAgentEngine:
                         _pending_phase_transition = self.PHASE_EXECUTE
                     continue
 
-                # ── Handle confirm_plan ──
+                # -- Handle confirm_plan --
                 if tool_name == "confirm_plan":
                     result_json = await self._tool_confirm_plan(**args)
                     result_data = json.loads(result_json)
                     action = result_data.get("action", "")
 
-                    # Error / timeout → stop immediately
+                    # Error / timeout -> stop immediately
                     if action in ("error", "timeout"):
                         error_msg = result_data.get("error", "Plan confirmation failed.")
                         await self.emit_output(f"\n[PLAN] **Plan confirmation error:** {error_msg}\n")
@@ -3193,14 +3192,14 @@ class HelixAgentEngine:
                         await self.emit_status("Plan confirmation error", done=True)
                         return self._format_output()
 
-                    # Cancel → stop immediately
+                    # Cancel -> stop immediately
                     if action == "cancel":
                         await self.emit_output("\nThe plan was cancelled by the user. The agent will not proceed.\n")
                         await self.emit_task_update(finalize_tasks=True)
                         await self.emit_status("Plan cancelled", done=True)
                         return self._format_output()
 
-                    # Feedback → stay in PLAN, revise
+                    # Feedback -> stay in PLAN, revise
                     if action == "feedback":
                         feedback = result_data.get("value", "")
                         self.history.append({
@@ -3213,11 +3212,11 @@ class HelixAgentEngine:
                             "role": "user",
                             "content": f"SYSTEM: User provided feedback on the proposed plan: {feedback}. Please revise the plan and call confirm_plan(tasks=[...]) again with the updated task list.",
                         })
-                        await self.emit_output(f"\n[PLAN] Plan rejected — user feedback: {feedback}\n")
+                        await self.emit_output(f"\n[PLAN] Plan rejected - user feedback: {feedback}\n")
                         await self.emit_status("[PLAN] Revising plan based on feedback...")
                         continue
 
-                    # Accept (or unknown safe fallback) → extract tasks, transition
+                    # Accept (or unknown safe fallback) -> extract tasks, transition
                     tasks = args.get("tasks", [])
                     if not isinstance(tasks, list):
                         tasks = []
@@ -3235,7 +3234,7 @@ class HelixAgentEngine:
                     await self.emit_output(f"\n[PLAN] Plan approved. Moving to execution.\n\n{task_summary}\n")
                     continue
 
-                # ── Handle run_tools_parallel ──
+                # -- Handle run_tools_parallel --
                 if tool_name == "run_tools_parallel":
                     result_json = await self._tool_run_tools_parallel(**args)
                     result_data = json.loads(result_json)
@@ -3252,7 +3251,7 @@ class HelixAgentEngine:
                     })
                     continue
 
-                # ── Handle ask_user ──
+                # -- Handle ask_user --
                 if tool_name == "ask_user":
                     result_json = await self._tool_ask_user(**args)
                     result_data = json.loads(result_json)
@@ -3270,7 +3269,7 @@ class HelixAgentEngine:
                     })
                     continue
 
-                # ── Duplicate detection ──
+                # -- Duplicate detection --
                 sig = f"{tool_name}:{json.dumps(args, sort_keys=True)}"
                 if recent_calls.count(sig) >= 2:
                     tool_result = f"Error: Identical call to `{tool_name}` repeated. Try a different approach."
@@ -3278,7 +3277,7 @@ class HelixAgentEngine:
                     recent_calls.append(sig)
                     await self.emit_status(f"Running: {tool_name}...")
 
-                    # ── Schema validation for single tool calls ──
+                    # -- Schema validation for single tool calls --
                     validation_failed = False
                     target_tool = self.phase_tools_dict.get(tool_name)
                     if target_tool:
@@ -3307,7 +3306,7 @@ class HelixAgentEngine:
                         tool_result = smart_truncate(result_str, truncation_limit)
                         self._total_tool_calls += 1
 
-                        # ── Consecutive tool-not-found tracking ──
+                        # -- Consecutive tool-not-found tracking --
                         if "not found in current phase" in tool_result:
                             self._consecutive_tool_misses[tool_name] = self._consecutive_tool_misses.get(tool_name, 0) + 1
                             miss_count = self._consecutive_tool_misses[tool_name]
@@ -3381,7 +3380,7 @@ class HelixAgentEngine:
                         self.chat_id, self.message_id, snapshot
                     )
                 )
-            # ── Token Tracking: emit final summary ──
+            # -- Token Tracking: emit final summary --
             total = self._total_input_tokens + self._total_output_tokens
             if total > 0 or self._total_tool_calls > 0:
                 summary = f"\n[Session Tokens] Total: {total} (in {self._total_input_tokens} / out {self._total_output_tokens}) | Tools: {self._total_tool_calls} | Loops: {self.loop_count}"
@@ -3392,7 +3391,7 @@ class HelixAgentEngine:
 
 class Pipe:
     class Valves(BaseModel):
-        # ── 1. Model ──
+        # -- 1. Model --
         AGENT_MODEL: str = Field(
             default="",
             description="Model ID for Helix Agent. The model MUST support native tool calling."
@@ -3402,7 +3401,7 @@ class Pipe:
             description="Model ID for context compression. If empty, falls back to AGENT_MODEL.",
         )
 
-        # ── 2. Iteration & Loop Safety ──
+        # -- 2. Iteration & Loop Safety --
         MAX_ITERATIONS: int = Field(
             default=100,
             description="Maximum Helix Agent iterations before stopping."
@@ -3430,7 +3429,7 @@ class Pipe:
             description="Timeout in seconds for individual tool execution. Set to 0 to disable."
         )
 
-        # ── 3. Context & Memory ──
+        # -- 3. Context & Memory --
         CONTEXT_LENGTH: int = Field(
             default=128000,
             ge=1000,
@@ -3457,7 +3456,7 @@ class Pipe:
             description="Maximum total conversation messages retained in context. Older messages are dropped while keeping tool-call pairs intact.",
         )
 
-        # ── 4. Phase Tools & Prompts ──
+        # -- 4. Phase Tools & Prompts --
         PLAN_TOOLS: str = Field(
             default=(
                 "calculate_timestamp, fetch_url, get_current_timestamp, get_process_status, "
@@ -3535,7 +3534,7 @@ class Pipe:
             description="System prompt for OUTPUT phase - Turn 1 (rendering / visualisation). Only rendering/visualisation tools are called here. Available placeholders: {goal}, {task_state}.",
         )
 
-        # ── 5. Safety & Limits ──
+        # -- 5. Safety & Limits --
         ENABLE_TOOL_TRUNCATION: bool = Field(
             default=True,
             description="If True, tool results are truncated to MAX_TOOL_RESULT_CHARS. If False, truncation is completely disabled and full tool results are passed to the LLM regardless of size.",
@@ -3559,14 +3558,14 @@ class Pipe:
             description="Timeout in seconds for the iteration limit Continue/Cancel modal. After this time the agent auto-stops.",
         )
 
-        # ── 6. Debug ──
+        # -- 6. Debug --
         DEBUG_MODE: bool = Field(
             default=False,
             description="Enable debug mode. When on, messages 'show tools' return the available items directly without any LLM call.",
         )
 
     class UserValves(BaseModel):
-        # ── 1. Behaviour ──
+        # -- 1. Behaviour --
         YOLO_MODE: bool = Field(
             default=False,
             description="Skip all user confirmations. Auto-approve plans and ignore iteration limits.",
@@ -3584,7 +3583,7 @@ class Pipe:
             description="If True, skip the OUTPUT phase turn 1 (rendering/visualization collection) and go straight to the final summary turn 2. Useful when no rendering/visualization tools are configured.",
         )
 
-        # ── 2. Limits ──
+        # -- 2. Limits --
         MAX_PLAN_QUESTIONS: int = Field(
             default=3,
             description="Maximum number of clarification questions (ask_user) the agent may ask per planning phase before it is forced to finalise the plan.",
