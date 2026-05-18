@@ -3,9 +3,9 @@ title: GitHub Access
 author: Piggidragon
 description: >
   Full read/write access to GitHub repositories, issues, pull requests,
-  branches, commits, and GitHub Actions workflows ? directly from OpenWebUI.
+  branches, commits, and GitHub Actions workflows - directly from OpenWebUI.
   Uses the GitHub REST API with your Personal Access Token.
-  Enforces a branch?file?PR workflow; no direct writes to main.
+  Enforces a branch->file->PR workflow; no direct writes to main.
 version: 2.2.0
 """
 
@@ -18,7 +18,7 @@ from typing import Optional, Callable, Awaitable, Any
 
 class Tools:
     class Valves(BaseModel):
-        """Global / admin settings ? left empty on purpose."""
+        """Global / admin settings - left empty on purpose."""
 
         pass
 
@@ -73,7 +73,7 @@ class Tools:
         t = uv.GITHUB_TOKEN
         if not t:
             raise ValueError(
-                "No GitHub token set. Go to Account ? Valves "
+                "No GitHub token set. Go to Account - Valves "
                 "and enter your PAT in GITHUB_TOKEN."
             )
         return {
@@ -110,11 +110,11 @@ class Tools:
             r.raise_for_status()
             repos = r.json()
             out = [
-                f"{'?' if r['private'] else '?'} **{r['full_name']}**  ?{r['stargazers_count']}"
+                f"{'[PRV]' if r['private'] else '[PUB]'} **{r['full_name']}**  *{r['stargazers_count']}"
                 for r in repos
             ]
             return "\n".join(out[:25]) + (
-                f"\n\n? and {len(repos) - 25} more" if len(repos) > 25 else ""
+                f"\n\n... and {len(repos) - 25} more" if len(repos) > 25 else ""
             )
 
     async def github_list_user_repos(
@@ -132,7 +132,7 @@ class Tools:
             r = await c.get(url, headers=self._auth(uv))
             r.raise_for_status()
             repos = r.json()
-            out = [f"? **{r['full_name']}**  ?{r['stargazers_count']}" for r in repos]
+            out = [f"[PUB] **{r['full_name']}**  *{r['stargazers_count']}" for r in repos]
             return (
                 "\n".join(out[:25])
                 if out
@@ -214,7 +214,7 @@ class Tools:
             data = r.json()
             if isinstance(data, list):
                 items = [
-                    f"{'?' if d['type'] == 'dir' else '?'} {d['name']}" for d in data
+                    f"{'[DIR]' if d['type'] == 'dir' else '[FILE]'} {d['name']}" for d in data
                 ]
                 return f"**{repo}/{path}**\n" + "\n".join(items)
             content = base64.b64decode(data["content"]).decode(
@@ -361,12 +361,12 @@ class Tools:
         """
         Create a NEW file on a branch. Fails if the file already exists.
         Use for initial file creation only. To overwrite an existing file, use github_write_file instead.
-        NEVER write directly to main ? always use a branch + PR workflow.
+        NEVER write directly to main - always use a branch + PR workflow.
 
         :param repo: Repository 'owner/name' (e.g. 'Piggidragon/OpenWebUI-plugins')
         :param path: File path inside the repo (e.g. 'src/main.py')
-        :param content: The COMPLETE file content as a plain text string. You MUST provide the entire file ? partial content will result in data loss.
-        :param branch: Branch to commit to (REQUIRED ? must be a new branch from github_create_branch)
+        :param content: The COMPLETE file content as a plain text string. You MUST provide the entire file - partial content will result in data loss.
+        :param branch: Branch to commit to (REQUIRED - must be a new branch from github_create_branch)
         :param message: Commit message (auto-generated if empty)
         """
         uv = self._get_valves(__user__)
@@ -395,7 +395,7 @@ class Tools:
             d = r.json()
             return (
                 f"**{d['content']['name']}** created on `{branch}`\n"
-                f"Commit: {d['commit']['sha'][:7]} ? {d['commit']['message']}\n"
+                f"Commit: {d['commit']['sha'][:7]} | {d['commit']['message']}\n"
                 f"URL: {d['content']['html_url']}"
             )
 
@@ -410,12 +410,12 @@ class Tools:
     ) -> str:
         """
         Overwrite an existing file on a branch with new content. Also works for creating new files.
-        NEVER write directly to main ? always use a branch + PR workflow.
+        NEVER write directly to main - always use a branch + PR workflow.
 
         :param repo: Repository 'owner/name' (e.g. 'Piggidragon/OpenWebUI-plugins')
         :param path: File path inside the repo (e.g. 'src/main.py')
-        :param content: The COMPLETE file content as a plain text string. You MUST provide the entire file ? do NOT send only the changed parts. Partial content will replace the entire file and cause data loss.
-        :param branch: Branch to write to (REQUIRED ? must be a branch, never main)
+        :param content: The COMPLETE file content as a plain text string. You MUST provide the entire file - do NOT send only the changed parts. Partial content will replace the entire file and cause data loss.
+        :param branch: Branch to write to (REQUIRED - must be a branch, never main)
         :param message: Commit message (auto-generated if empty)
         """
         uv = self._get_valves(__user__)
@@ -446,7 +446,7 @@ class Tools:
             d = r.json()
             return (
                 f"**{d['content']['name']}** written to `{branch}`\n"
-                f"Commit: {d['commit']['sha'][:7]} ? {d['commit']['message']}\n"
+                f"Commit: {d['commit']['sha'][:7]} | {d['commit']['message']}\n"
                 f"URL: {d['content']['html_url']}"
             )
 
@@ -459,7 +459,7 @@ class Tools:
         __user__: Optional[dict] = None,
     ) -> str:
         """
-        Delete a file on a branch (NOT on main ? use via PR workflow).
+        Delete a file on a branch (NOT on main - use via PR workflow).
 
         :param repo: Repository 'owner/name'
         :param path: File path to delete
@@ -601,7 +601,7 @@ class Tools:
         __user__: Optional[dict] = None,
     ) -> str:
         """
-        Rename or move a file on a branch (NOT on main ? use via PR workflow).
+        Rename or move a file on a branch (NOT on main - use via PR workflow).
         Creates the file at the new path and deletes the old one.
 
         :param repo: Repository 'owner/name'
@@ -627,7 +627,7 @@ class Tools:
         old_sha = old_data["sha"]
 
         if not message:
-            message = f"Rename {path} ? {new_path}"
+            message = f"Rename {path} -> {new_path}"
 
         new_url = f"https://api.github.com/repos/{repo}/contents/{new_path}"
         create_payload: dict = {
@@ -655,7 +655,7 @@ class Tools:
             )
             r_delete.raise_for_status()
 
-        return f"Renamed **{path}** ? **{new_path}** on `{branch}`."
+        return f"Renamed **{path}** -> **{new_path}** on `{branch}`."
 
     async def github_rename_directory(
         self,
@@ -667,7 +667,7 @@ class Tools:
         __user__: Optional[dict] = None,
     ) -> str:
         """
-        Rename or move a directory on a branch (NOT on main ? use via PR workflow).
+        Rename or move a directory on a branch (NOT on main - use via PR workflow).
         Moves all files from the old directory to the new one.
 
         :param repo: Repository 'owner/name'
@@ -680,7 +680,7 @@ class Tools:
         self._guard(uv.ENABLE_CONTENT_WRITE, "Content Write")
 
         if not message:
-            message = f"Rename directory {path} ? {new_path}"
+            message = f"Rename directory {path} -> {new_path}"
 
         files_to_move = []
 
@@ -714,13 +714,13 @@ class Tools:
                 path=old_file_path,
                 new_path=new_file_path,
                 branch=branch,
-                message=f"{message}: {old_file_path} ? {new_file_path}",
+                message=f"{message}: {old_file_path} -> {new_file_path}",
                 __user__=__user__,
             )
             results.append(result)
 
         return (
-            f"Renamed directory **{path}** ? **{new_path}** ({len(files_to_move)} files moved):\n"
+            f"Renamed directory **{path}** -> **{new_path}** ({len(files_to_move)} files moved):\n"
             + "\n".join(results)
         )
 
@@ -741,7 +741,7 @@ class Tools:
             branches = r.json()
             if not branches:
                 return f"No branches in {repo}."
-            out = [f"? **{b['name']}**  ({b['commit']['sha'][:7]})" for b in branches]
+            out = [f"[BR] **{b['name']}**  ({b['commit']['sha'][:7]})" for b in branches]
             return f"**{repo}** branches ({len(branches)}):\n" + "\n".join(out)
 
     async def github_rename_branch(
@@ -797,9 +797,9 @@ class Tools:
                 author = (
                     c["commit"]["author"]["name"]
                     if c.get("commit", {}).get("author")
-                    else c["author"]["login"] if c.get("author") else "?"
+                    else c["author"]["login"] if c.get("author") else "N/A"
                 )
-                out.append(f"`{sha}` **{msg}** ? {author}")
+                out.append(f"`{sha}` **{msg}** | {author}")
             return f"**{repo}** ({branch}) last {len(out)} commits:\n" + "\n".join(out)
 
     async def github_get_commit(
@@ -893,20 +893,20 @@ class Tools:
                 )
 
             return (
-                f"## {base} ? {head}\n"
+                f"## {base} -> {head}\n"
                 f"**Status:** {status}  |  Ahead: {ahead}  |  Behind: {behind}\n"
                 + (
                     f"\nCommits ({len(commits)}):\n" + "\n".join(commit_lines)
                     if commit_lines
                     else ""
                 )
-                + ("\n?and more" if len(commits) > 10 else "")
+                + ("\n... and more" if len(commits) > 10 else "")
                 + (
                     f"\n\nFiles ({len(files)}):\n" + "\n".join(file_lines)
                     if file_lines
                     else ""
                 )
-                + ("\n?and more" if len(files) > 15 else "")
+                + ("\n... and more" if len(files) > 15 else "")
             )
 
     async def github_list_issues(
@@ -1126,7 +1126,7 @@ class Tools:
     ) -> str:
         """
         Add a comment to an issue or pull request.
-        GitHub uses the same API for both ? pass the issue or PR number.
+        GitHub uses the same API for both - pass the issue or PR number.
 
         :param repo: Repository 'owner/name'
         :param number: Issue or PR number
@@ -1146,7 +1146,7 @@ class Tools:
     ) -> str:
         """
         List comments on an issue or pull request.
-        GitHub uses the same API for both ? pass the issue or PR number.
+        GitHub uses the same API for both - pass the issue or PR number.
 
         :param repo: Repository 'owner/name'
         :param number: Issue or PR number
@@ -1164,7 +1164,7 @@ class Tools:
                 return f"No comments on #{number}."
             out = [
                 f"**{c['user']['login']}** ({c['created_at']}):\n{c['body'][:200]}"
-                + ("?" if len(c["body"]) > 200 else "")
+                + ("..." if len(c["body"]) > 200 else "")
                 for c in comments
             ]
             return f"## Comments on #{number}\n\n" + "\n\n".join(out)
@@ -1231,7 +1231,7 @@ class Tools:
                 return f"No {state} PRs in {repo}."
             out = [
                 f"#{p['number']} **{p['title']}**  [{p['state']}]  "
-                f"{p['user']['login']}  ({p['head']['ref']} ? {p['base']['ref']})"
+                f"{p['user']['login']}  ({p['head']['ref']} -> {p['base']['ref']})"
                 for p in prs
             ]
             return "\n".join(out)
@@ -1273,9 +1273,9 @@ class Tools:
                 )
             return (
                 f"## #{p['number']} {p['title']}\n"
-                f"**State:** {p['state']}  |  **Mergeable:** {p.get('mergeable', '?')}"
+                f"**State:** {p['state']}  |  **Mergeable:** {p.get('mergeable', 'N/A')}"
                 f"  |  **Author:** {p['user']['login']}\n"
-                f"**Branch:** {p['head']['ref']} ? {p['base']['ref']}\n"
+                f"**Branch:** {p['head']['ref']} -> {p['base']['ref']}\n"
                 f"**Requested reviewers:** {requested}\n"
                 f"**URL:** {p['html_url']}\n\n"
                 f"{p['body'] or '_(no description)_'}"
@@ -1498,7 +1498,7 @@ class Tools:
             if not wfs:
                 return f"No workflows in {repo}."
             out = [
-                f"?? **{w['name']}**  `{w['path']}`  [{w['state']}]  (ID: {w['id']})"
+                f"[WF] **{w['name']}**  `{w['path']}`  [{w['state']}]  (ID: {w['id']})"
                 for w in wfs
             ]
             return "\n".join(out)
@@ -1573,11 +1573,11 @@ class Tools:
                 return "No workflow runs found."
             out = []
             for run in runs:
-                icon = {"completed": "?", "in_progress": "?", "queued": "?"}.get(
-                    run["status"], "?"
+                icon = {"completed": "[OK]", "in_progress": "[RUN]", "queued": "[Q]"}.get(
+                    run["status"], "-"
                 )
                 conclusion = (
-                    f" ? {run.get('conclusion', '')}" if run.get("conclusion") else ""
+                    f" -> {run.get('conclusion', '')}" if run.get("conclusion") else ""
                 )
                 out.append(
                     f"{icon} **#{run['id']}** {run['name']}  "
@@ -1603,7 +1603,7 @@ class Tools:
             r.raise_for_status()
             run = r.json()
             return (
-                f"## Run #{run['id']} ? {run['name']}\n"
+                f"## Run #{run['id']} -> {run['name']}\n"
                 f"**Workflow:** {run.get('workflow_id')}  |  "
                 f"**Status:** {run['status']}  |  "
                 f"**Conclusion:** {run.get('conclusion', 'N/A')}\n"
@@ -1632,7 +1632,7 @@ class Tools:
             location = r.headers.get("Location", "")
             if not location:
                 return "No logs available."
-            return f"Logs download URL: {location}\n_(Opens in browser ? a zip of all job logs)_"
+            return f"Logs download URL: {location}\n_(Opens in browser -> a zip of all job logs)_"
 
     async def github_trigger_workflow_dispatch(
         self,
