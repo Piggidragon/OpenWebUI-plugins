@@ -168,6 +168,17 @@ Use `run_tools_parallel` if you are calling multiple independent rendering/visua
 Only rendering/visualisation tools configured for the OUTPUT phase are available.
 """
 
+OUTPUT_FINAL_JSON_SCHEMA = """\
+You MUST respond as a single JSON object with this exact schema:
+{
+  "summary": "string: 3-5 sentence summary of what was accomplished, files created/modified, failed tasks (if any), and where to find results",
+  "files_created": ["string: relative path under agent/"],
+  "files_modified": ["string: relative path under agent/"],
+  "failed_tasks": ["string: brief description of any failed tasks and why"],
+  "status": "string: one of completed|partial|failed"
+}
+"""
+
 DEFAULT_OUTPUT_FINAL_PROMPT = """\
 You are in OUTPUT mode — FINAL SUMMARY PHASE.
 This is turn 2 of 2 in the output phase. You may NOT use any tools.
@@ -180,6 +191,8 @@ Write a concise 3-5 sentence summary for the user that covers:
 4. Where the user can find the results (project folder under `[USER_HOME]/agent/`).
 
 Do NOT reproduce file contents, code, or large text blocks here. All results are already persisted in files. Keep the reply short and focused.
+
+{output_schema}
 
 Goal: {goal}
 """
@@ -2248,10 +2261,14 @@ class HelixAgentEngine:
             )
         elif self.phase == self.PHASE_OUTPUT:
             if self._output_turn >= 2:
+                output_schema_block = ""
+                if getattr(self.valves, "ENABLE_STRUCTURED_OUTPUT", True):
+                    output_schema_block = OUTPUT_FINAL_JSON_SCHEMA
                 base = self._render_prompt(
                     DEFAULT_OUTPUT_FINAL_PROMPT,
                     goal=self.goal,
                     task_state=task_state,
+                    output_schema=output_schema_block,
                 )
             else:
                 base = self._render_prompt(
@@ -2927,7 +2944,23 @@ class HelixAgentEngine:
                     await self.emit_output(f"\n[WARN] No tool call produced. Re-prompting to continue.\n")
                     continue
                 if content:
-                    await self.emit_output(content)
+                    # ── Structured Output: Try to parse JSON for OUTPUT Turn 2 ──
+                    if self.phase == self.PHASE_OUTPUT and self._output_turn >= 2 and getattr(self.valves, "ENABLE_STRUCTURED_OUTPUT", True):
+                        try:
+                            parsed = json.loads(content)
+                            if isinstance(parsed, dict):
+                                summary = parsed.get("summary", "")
+                                if summary:
+                                    await self.emit_output(summary)
+                                else:
+                                    await self.emit_output(content)
+                            else:
+                                await self.emit_output(content)
+                        except json.JSONDecodeError:
+                            # If JSON parsing fails, fall back to raw content
+                            await self.emit_output(content)
+                    else:
+                        await self.emit_output(content)
                 await self.emit_status("Done", done=True)
                 return self._format_output()
 
@@ -3191,6 +3224,8 @@ class HelixAgentEngine:
                                 f"Truncated call {tool_name} because result was {len(result_str)}/{truncation_limit} chars"
                             )
                         tool_result = smart_truncate(result_str, truncation_limit)
+                        if self._token_tracking_enabled:
+                            self._total_tool_calls += 1
 
                         # ── Consecutive tool-not-found tracking ──
                         if "not found in current phase" in tool_result:
