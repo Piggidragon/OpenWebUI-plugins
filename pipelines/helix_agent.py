@@ -1,7 +1,7 @@
 """
 title: Helix Agent
 author: Piggidragon
-version: 0.23.2
+version: 0.24.0
 description: >
   Helix Agent — OpenWebUI-native agent loop with modular per-phase tool control.
 
@@ -83,7 +83,7 @@ What to do:
 3. Create a numbered task list that covers the entire goal.
 4. Each task must be a clear, actionable step. Break complex tasks into small, verifiable steps.
 5. If the goal involves writing code or creating files, include explicit verification tasks (e.g., syntax check, lint, run a quick test).
-6. Call confirm_plan with the plan as a JSON string: {"tasks": ["task 1", "task 2", ...]}.
+6. Call confirm_plan(tasks=["task 1", "task 2", ...]) with your task list.
 
 File paths: If the plan involves creating files, decide on a ONE project folder name (short slug based on the goal) under `[USER_HOME]/agent/`. ALL files for this task and any follow-up turns on the SAME topic must be written within that project folder. Do NOT write into the bare `[USER_HOME]/agent/` root.
 
@@ -121,7 +121,7 @@ Rules:
 - NEVER repeat identical failed tool calls (duplicate detection is active).
 - When all tasks are done, the system will move to review automatically.
 - If a tool returns an error, analyze it and retry with corrected parameters. You do NOT need to call fix_plan for trivial errors.
-- Only call fix_plan if the same task fails repeatedly (3+ attempts) or if the task design was wrong. Provide updated_tasks as a JSON string: {"tasks": ["task 1", "task 2"]}. List just the new/corrected tasks.
+- Only call fix_plan if the same task fails repeatedly (3+ attempts) or if the task design was wrong. Provide just the new/corrected tasks: fix_plan(reason="...", tasks=["task 1", "task 2"]).
 - Only call replan(reason) if the overall strategy is broken and a new plan is needed.
 - You MUST call complete_task(index) or fail_task(index, reason) after working on a task.
 """
@@ -141,7 +141,7 @@ What to do:
 3. Once you have inspected the work, call exactly ONE of these transition tools:
 
 - `proceed_to_output()` -- Everything is done and correct. Move to the OUTPUT phase to generate the polished final answer.
-- `fix_plan(reason, updated_tasks)` -- Only minor fixes are needed (a task failed or needs a small correction). Provide updated_tasks as a JSON string: {"tasks": ["task 1", "task 2"]}. List just the new/corrected tasks.
+- `fix_plan(reason, tasks)` -- Only minor fixes are needed (a task failed or needs a small correction). Provide just the new/corrected tasks: fix_plan(reason="...", tasks=["task 1", "task 2"]). List just the new/corrected tasks.
 - `replan(reason)` -- The overall strategy is broken and tasks need to be replaced entirely.
 
 Rules:
@@ -231,7 +231,7 @@ What to do:
 1. Review the previous goal and the current request.
 2. Create a minimal, focused task plan (1-3 tasks) that addresses the new request in the context of what was already done.
 3. If the goal involves writing code or creating files, include explicit verification tasks (e.g., syntax check, lint, run a quick test).
-4. Call confirm_plan with the updated plan as a JSON string: {"tasks": ["task 1", "task 2", ...]}.
+4. Call confirm_plan(tasks=["task 1", "task 2", ...]) with your updated task list.
 
 File paths: If the plan involves creating files, decide on a ONE project folder name (short slug based on the goal) under `[USER_HOME]/agent/`. ALL files for this task and any follow-up turns on the SAME topic must be written within that project folder. Do NOT write into the bare `[USER_HOME]/agent/` root.
 
@@ -883,13 +883,17 @@ class HelixAgentEngine:
         self.all_tools_dict["confirm_plan"] = {
             "spec": {
                 "name": "confirm_plan",
-                "description": "Present the task plan to the user for approval. Call this after creating the plan in PLAN phase. The plan MUST be provided as a JSON string with a 'tasks' array: {\"tasks\": [\"task 1\", \"task 2\", \"task 3\"]}.",
+                "description": "Present the task plan to the user for approval. Call this after creating the plan in PLAN phase. Provide the tasks as an array of clear, actionable steps.",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "plan": {"type": "string", "description": "A JSON string containing the tasks array: {\"tasks\": [\"task 1\", \"task 2\"]}. Each task must be a clear, actionable step."},
+                        "tasks": {
+                            "type": "array",
+                            "items": {"type": "string", "description": "A clear, actionable step"},
+                            "description": "Array of tasks to accomplish. Each task must be a clear, actionable step.",
+                        },
                     },
-                    "required": ["plan"],
+                    "required": ["tasks"],
                 },
             },
             "callable": self._tool_confirm_plan,
@@ -903,9 +907,13 @@ class HelixAgentEngine:
                     "type": "object",
                     "properties": {
                         "reason": {"type": "string", "description": "Why the fix is needed"},
-                        "updated_tasks": {"type": "string", "description": "A JSON string with the new/corrected tasks: {\"tasks\": [\"task 1\", \"task 2\"]}. These tasks will be appended or replace failed tasks."},
+                        "tasks": {
+                            "type": "array",
+                            "items": {"type": "string", "description": "A new or corrected task step"},
+                            "description": "Array of new/corrected tasks to add. These tasks will be appended or replace failed tasks.",
+                        },
                     },
-                    "required": ["reason", "updated_tasks"],
+                    "required": ["reason", "tasks"],
                 },
             },
             "callable": self._tool_fix_plan,
@@ -1120,13 +1128,14 @@ class HelixAgentEngine:
         return json.dumps({"failed": False, "error": f"Invalid task index {idx}"})
 
     # Lightweight correction tool. Use this instead of replan for minor issues.
-    async def _tool_fix_plan(self, reason: str, updated_tasks: str, **kwargs):
+    async def _tool_fix_plan(self, reason: str, tasks: list, **kwargs):
         if not self.task_list:
             return json.dumps({"fix_plan": False, "error": "No task list available"})
 
-        new_tasks = self._extract_task_list(updated_tasks)
-        if not new_tasks:
+        if not isinstance(tasks, list) or not tasks:
             return json.dumps({"fix_plan": False, "error": "No tasks provided"})
+
+        new_tasks = [str(t) for t in tasks]
 
         # Compute insertion index BEFORE removing failed tasks
         failed_names = {f["task"] for f in self.failed_tasks}
@@ -1158,24 +1167,24 @@ class HelixAgentEngine:
         return json.dumps({"proceed_to_output": False, "error": f"Cannot proceed to output from {self.phase} phase"})
 
     async def _tool_confirm_plan(self, **kwargs):
-        plan_text = kwargs.get("plan", "")
+        tasks = kwargs.get("tasks", [])
+        if not isinstance(tasks, list):
+            tasks = []
         uv = self.user_valves
 
         if uv and (getattr(uv, "YOLO_MODE", False) or not getattr(uv, "ENABLE_PLAN_APPROVAL", False)):
-            return json.dumps({"action": "accept"})
+            return json.dumps({"action": "accept", "tasks": tasks})
 
         # Auto-accept when in REPLAN phase to keep the skip flow fast
         if self.phase == self.PHASE_REPLAN:
-            return json.dumps({"action": "accept"})
+            return json.dumps({"action": "accept", "tasks": tasks})
 
         if not self.event_call:
-            return json.dumps({"action": "accept"})
+            return json.dumps({"action": "accept", "tasks": tasks})
 
-        # Task list extraction is deferred to the accept branch in _run_impl
-        tasks = self._extract_task_list(plan_text)
-        tasks_data = [{"task_id": f"T{i+1}", "description": t} for i, t in enumerate(tasks)]
+        tasks_data = [{"task_id": f"T{i+1}", "description": str(t)} for i, t in enumerate(tasks)]
         if not tasks_data:
-            tasks_data = [{"task_id": "T1", "description": plan_text}]
+            tasks_data = [{"task_id": "T1", "description": "Complete the user's request"}]
 
         timeout_s = getattr(self.valves, "PLAN_APPROVAL_TIMEOUT", 600)
         js = self._build_plan_approval_js(tasks_data, timeout_s=timeout_s)
@@ -1191,6 +1200,7 @@ class HelixAgentEngine:
         except (json.JSONDecodeError, AttributeError):
             res = {"action": "error", "error": "Malformed confirmation response."}
 
+        res["tasks"] = tasks
         return json.dumps(res)
 
     async def _tool_ask_user(self, question: str, options: list, allow_custom: bool = True, **kwargs):
@@ -3240,15 +3250,17 @@ class HelixAgentEngine:
                         })
                         self.history.append({
                             "role": "user",
-                            "content": f"SYSTEM: User provided feedback on the proposed plan: {feedback}. Please revise the plan and call confirm_plan again with the updated plan.",
+                            "content": f"SYSTEM: User provided feedback on the proposed plan: {feedback}. Please revise the plan and call confirm_plan(tasks=[...]) again with the updated task list.",
                         })
                         await self.emit_output(f"\n[PLAN] Plan rejected — user feedback: {feedback}\n")
                         await self.emit_status("[PLAN] Revising plan based on feedback...")
                         continue
 
                     # Accept (or unknown safe fallback) → extract tasks, transition
-                    plan_text = args.get("plan", content or "")
-                    self.task_list = self._extract_task_list(plan_text or content or "")
+                    tasks = args.get("tasks", [])
+                    if not isinstance(tasks, list):
+                        tasks = []
+                    self.task_list = [str(t) for t in tasks] if tasks else self._extract_task_list(content or "")
                     _pending_phase_transition = self.PHASE_EXECUTE
                     await self._save_state_to_file()
                     await self.emit_task_update()
