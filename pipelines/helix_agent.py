@@ -78,49 +78,29 @@ except Exception:
 DEFAULT_PLAN_PROMPT = """\
 You are in PLAN mode. Your job is to understand the user's request and create a clear, actionable task plan.
 
-PHASE: PLAN
-
-Available tools: {tool_names}
-
 What to do:
 1. Analyse the user's request thoroughly.
 2. Use your available tools to understand the scope (read files, search knowledge, etc.), but do NOT perform the actual task yet (e.g., do not write files, push code, or execute actions).
 3. Create a numbered task list that covers the entire goal.
-4. Each task should be a clear, actionable step.
+4. Each task must be a clear, actionable step. Break complex tasks into small, verifiable steps.
 5. If the goal involves writing code or creating files, include explicit verification tasks (e.g., syntax check, lint, run a quick test).
-6. After creating the plan, call confirm_plan with the plan text to present it for review.
+6. Call confirm_plan with the plan as a JSON string: {"tasks": ["task 1", "task 2", ...]}.
 
 File paths: If the plan involves creating files, decide on a ONE project folder name (short slug based on the goal) under `[USER_HOME]/agent/`. ALL files for this task and any follow-up turns on the SAME topic must be written within that project folder. Do NOT write into the bare `[USER_HOME]/agent/` root.
 
-Plan format for confirm_plan:
-When calling confirm_plan, provide the plan parameter as a numbered list with one task per line:
-1. First task description
-2. Second task description
-3. Third task description
-
-Alternatively, you may provide the plan as JSON: {{"tasks": ["task 1", "task 2", "task 3"]}}
-
 Rules:
-- Focus purely on planning — do NOT attempt to perform the task or execute actions.
+- Focus purely on planning -- do NOT attempt to perform the task or execute actions.
 - You may use available tools to gather context and inspect files or code relevant to the goal.
-- Break complex tasks into small, verifiable steps.
 - If the request is simple (1-2 tasks), still list them explicitly.
-- Call exactly ONE tool per step.
-- When done planning, call confirm_plan with the plan for confirmation.
+- Use `run_tools_parallel` for multiple independent tool calls to speed up information gathering.
 - If the request is inappropriate or impossible, call terminate with a brief explanation.
-- If a tool returns an error during planning (e.g., file not found), note the limitation in your plan. Do not call fix_plan for planning-stage errors.
-- If the user rejects your plan with feedback, revise the plan based on their feedback and call confirm_plan again with the updated plan. Do NOT repeat the same plan unchanged.
-- If the user cancels the plan, acknowledge it and stop.
-- Use the ask_user tool if you need clarification from the user (e.g., ambiguous request, missing details, unclear scope).
-- You may only use the tools listed above.
+- If a tool returns an error during planning, note the limitation in your plan.
+- Use the ask_user tool ONLY if you need clarification (e.g., ambiguous request, missing details).
+- If the user rejects your plan, revise it based on their feedback and call confirm_plan again. Do NOT repeat the same plan unchanged.
 """
 
 DEFAULT_EXECUTE_PROMPT = """\
 You are in EXECUTE mode. Work through tasks one at a time.
-
-PHASE: EXECUTE
-
-Available tools: {tool_names}
 
 {task_state}
 
@@ -138,58 +118,55 @@ File paths: All files MUST be written into the SAME project subfolder under `[US
 Code verification: If a task involves writing code, you MUST verify syntax before calling complete_task. Use appropriate validation tools (e.g. `python -m py_compile`, `bash -n`, `node --check`, a linter, or any available syntax-check tool). Only mark the task complete once the code passes validation or the validation failure has been documented.
 
 Rules:
-- Call exactly ONE tool per step OR use run_tools_parallel for multiple independent calls.
+- Use `run_tools_parallel` for multiple independent tool calls to speed up execution.
 - NEVER repeat identical failed tool calls (duplicate detection is active).
-- When all tasks are done, the system will move to review automatically. You may also call early_finish(reason) if you believe you're done early.
+- When all tasks are done, the system will move to review automatically.
 - If a tool returns an error, analyze it and retry with corrected parameters. You do NOT need to call fix_plan for trivial errors.
-- Only call fix_plan if the same task fails repeatedly (3+ attempts) or if the task design was wrong.
-- Only call replan(reason, updated_tasks) if the entire approach is wrong and a new plan is needed. It will enter Replan mode where you must then call confirm_plan with the new tasks.
-- If you need to think step-by-step before acting, do so — reasoning will be captured in a collapsible block.
+- Only call fix_plan if the same task fails repeatedly (3+ attempts) or if the task design was wrong. Provide updated_tasks as a JSON string: {"tasks": ["task 1", "task 2"]}. List just the new/corrected tasks.
+- Only call replan(reason) if the entire approach is wrong and a new plan is needed.
 - You MUST call complete_task(index) or fail_task(index, reason) after working on a task.
-- Use `run_tools_parallel` to call multiple independent tools at once for efficiency.
-- You may only use the tools listed above. Do NOT ask the user questions.
 """
 
 DEFAULT_REVIEW_PROMPT = """\
-You are in REVIEW mode. Inspect the completed work using the available tools BEFORE deciding on an action.
+You are in REVIEW mode. Inspect the completed work BEFORE deciding on an action.
 
-PHASE: REVIEW
 Original goal: {goal}
-Available tools: {tool_names}
 
 {task_state}
 
 Task status markers: [done] = completed, [FAIL: reason] = failed with reason, [    ] = not started.
 
 What to do:
-1. Use the available read-only tools (e.g. read_file, grep_search, list_files, view_knowledge_file) to verify the work. Check file contents, code correctness, and whether files exist in `[USER_HOME]/agent/<project>/`.
-2. Once you have inspected the work, call exactly ONE of these tools:
+1. Use read-only tools (e.g. read_file, grep_search, list_files, view_knowledge_file) to verify the work. Check file contents, code correctness, and whether files exist in `[USER_HOME]/agent/<project>/`.
+2. You may run verification commands (e.g. `python -m py_compile`, linters, tests) to validate syntax or behaviour, but do NOT modify or create files during review.
+3. Once you have inspected the work, call exactly ONE of these transition tools:
 
-- `proceed_to_output()` — Everything is done and correct. Move to the OUTPUT phase to generate the polished final answer.
-- `fix_plan(reason, updated_tasks)` — Only minor fixes are needed (a task failed or needs a small correction). List just the new/corrected tasks.
-- `replan(reason, updated_tasks)` — The overall strategy is broken and tasks need to be replaced entirely. The agent will enter Replan mode and you must then call confirm_plan with the updated plan.
+- `proceed_to_output()` -- Everything is done and correct. Move to the OUTPUT phase to generate the polished final answer.
+- `fix_plan(reason, updated_tasks)` -- Only minor fixes are needed (a task failed or needs a small correction). Provide updated_tasks as a JSON string: {"tasks": ["task 1", "task 2"]}. List just the new/corrected tasks.
+- `replan(reason)` -- The overall strategy is broken and tasks need to be replaced entirely.
 
 Rules:
-- ALWAYS verify before deciding. Don't guess — read files, run checks, inspect outputs.
+- ALWAYS verify before deciding. Don't guess -- read files, run checks, inspect outputs.
 - If there are only minor issues with individual tasks, ALWAYS prefer `fix_plan` over `replan`. Only use `replan` if the overall strategy is broken.
-- Be honest — don't call `proceed_to_output` if something is missing or wrong.
+- Be honest -- don't call `proceed_to_output` if something is missing or wrong.
 - If the result is good enough, call `proceed_to_output`. Don't gold-plate.
 - Provide a brief reasoning for your assessment before calling the final tool.
-- You may only use the tools listed above.
+- You may use `run_tools_parallel` for multiple independent verification calls.
 """
 
 DEFAULT_OUTPUT_PROMPT = """\
-You are in OUTPUT mode — RENDERING / VISUALISATION TURN.
+You are in OUTPUT mode -- RENDERING / VISUALISATION TURN.
 This is turn 1 of 2 in the output phase.
 
-Your ONLY job here is to call rendering or visualisation tools (e.g. render_visualization, show_map, display_file) if any are available and useful to illustrate the results for the user.
+Your ONLY job here is to call rendering or visualisation tools (e.g. display_file) if any are available and useful to illustrate the results for the user.
 Do NOT write summary text or answer the user yet. That happens in turn 2.
 
 Goal: {goal}
 
 {task_state}
 
-Available tools: {tool_names}
+Use `run_tools_parallel` if you are calling multiple independent rendering/visualisation tools.
+Only rendering/visualisation tools configured for the OUTPUT phase are available.
 """
 
 DEFAULT_OUTPUT_FINAL_PROMPT = """\
@@ -211,25 +188,23 @@ Goal: {goal}
 DEFAULT_REPLAN_PROMPT = """\
 You are in REPLAN mode. A previous session completed or the approach needs to change, and a new task plan is required.
 
-PHASE: REPLAN
-
-Available tools: {tool_names}
+Reason for replan: {reason}
 
 Recent context (previous goal):
 {goal}
+
+{task_state}
 
 What to do:
 1. Review the previous goal and the current request.
 2. Create a minimal, focused task plan (1-3 tasks) that addresses the new request in the context of what was already done.
 3. If the goal involves writing code or creating files, include explicit verification tasks (e.g., syntax check, lint, run a quick test).
-4. Call confirm_plan with the updated plan.
+4. Call confirm_plan with the updated plan as a JSON string: {"tasks": ["task 1", "task 2", ...]}.
 
 File paths: If the plan involves creating files, decide on a ONE project folder name (short slug based on the goal) under `[USER_HOME]/agent/`. ALL files for this task and any follow-up turns on the SAME topic must be written within that project folder. Do NOT write into the bare `[USER_HOME]/agent/` root.
 
-Plan format for confirm_plan:
-- Numbered list (1., 2., 3.) with short, specific action items.
-
 Rules:
+- Use `run_tools_parallel` for multiple independent tool calls to speed up information gathering.
 - You may call ask_user ONCE if the new request is ambiguous.
 - ABSOLUTELY CRITICAL: You MUST call confirm_plan to finish REPLAN mode. Do NOT answer the user directly. Do NOT generate story text, code, or any other output. Only call tools.
 """
@@ -417,14 +392,14 @@ class HelixAgentEngine:
     PHASE_REPLAN = "replan"  # Replan when previous session finished
 
     # Internal tools that are ALWAYS available regardless of phase filters
-    INTERNAL_TOOLS = {"terminate", "replan", "complete_task", "fail_task", "confirm_plan", "fix_plan", "proceed_to_output", "early_finish", "run_tools_parallel"}
+    INTERNAL_TOOLS = {"terminate", "replan", "complete_task", "fail_task", "confirm_plan", "fix_plan", "proceed_to_output", "run_tools_parallel", "ask_user"}
 
     PHASE_INTERNAL_TOOLS = {
-        PHASE_PLAN:       {"terminate", "complete_task", "fail_task", "confirm_plan", "fix_plan"},
-        PHASE_EXECUTE:    {"replan", "complete_task", "fail_task", "fix_plan", "early_finish", "run_tools_parallel"},
-        PHASE_REVIEW:     {"proceed_to_output", "replan", "fix_plan"},
+        PHASE_PLAN:       {"terminate", "confirm_plan", "ask_user", "run_tools_parallel"},
+        PHASE_EXECUTE:    {"replan", "complete_task", "fail_task", "fix_plan", "run_tools_parallel"},
+        PHASE_REVIEW:     {"proceed_to_output", "replan", "fix_plan", "run_tools_parallel"},
         PHASE_OUTPUT:     set(),
-        PHASE_REPLAN:    {"confirm_plan", "ask_user"},  # Replan phase has minimal internal tools
+        PHASE_REPLAN:     {"terminate", "confirm_plan", "ask_user", "run_tools_parallel"},
     }
 
     def __init__(self, request, user, body, event_emitter, event_call, metadata, valves, user_valves=None, incoming_tools=None):
@@ -461,6 +436,7 @@ class HelixAgentEngine:
         self.goal = ""
         self._skill_prompt = ""
         self.consecutive_json_errors = 0
+        self._replan_reason = ""
         self._plan_questions_asked = 0
 
         # Throttling / debounce state
@@ -787,12 +763,11 @@ class HelixAgentEngine:
         self.all_tools_dict["replan"] = {
             "spec": {
                 "name": "replan",
-                "description": "Restart planning. Use when the current approach is not working and you need to create a new plan. Preserves conversation history and context. After calling this tool, the agent will enter Replan mode where you must call confirm_plan with the updated task list.",
+                "description": "Restart planning. Use when the current approach is not working and you need to create a new plan. Preserves conversation history and context. After calling this tool, the agent will enter Replan mode where you must create a new plan.",
                 "parameters": {
                     "type": "object",
                     "properties": {
                         "reason": {"type": "string", "description": "What went wrong or why the plan needs to change"},
-                        "updated_tasks": {"type": "string", "description": "Updated task list as numbered steps (only what is still needed). If empty, existing non-completed tasks are kept."},
                     },
                     "required": ["reason"],
                 },
@@ -834,11 +809,11 @@ class HelixAgentEngine:
         self.all_tools_dict["confirm_plan"] = {
             "spec": {
                 "name": "confirm_plan",
-                "description": "Present the task plan to the user for approval. Call this after creating the plan in PLAN phase. Provide the plan as a numbered list (e.g. '1. Task one\\n2. Task two') or as JSON with a 'tasks' array. The user can accept, provide feedback, or cancel.",
+                "description": "Present the task plan to the user for approval. Call this after creating the plan in PLAN phase. The plan MUST be provided as a JSON string with a 'tasks' array: {\"tasks\": [\"task 1\", \"task 2\", \"task 3\"]}.",
                 "parameters": {
                     "type": "object",
                     "properties": {
-                        "plan": {"type": "string", "description": "The full plan text. Use numbered format '1. Task description' or JSON {\"tasks\": [\"task1\", \"task2\"]}. Each task should be a clear, actionable step."},
+                        "plan": {"type": "string", "description": "A JSON string containing the tasks array: {\"tasks\": [\"task 1\", \"task 2\"]}. Each task must be a clear, actionable step."},
                     },
                     "required": ["plan"],
                 },
@@ -854,7 +829,7 @@ class HelixAgentEngine:
                     "type": "object",
                     "properties": {
                         "reason": {"type": "string", "description": "Why the fix is needed"},
-                        "updated_tasks": {"type": "string", "description": "Newline-separated list of correction or replacement tasks to append"},
+                        "updated_tasks": {"type": "string", "description": "A JSON string with the new/corrected tasks: {\"tasks\": [\"task 1\", \"task 2\"]}. These tasks will be appended or replace failed tasks."},
                     },
                     "required": ["reason", "updated_tasks"],
                 },
@@ -874,21 +849,6 @@ class HelixAgentEngine:
                 },
             },
             "callable": self._tool_proceed_to_output,
-            "type": "function",
-        }
-        self.all_tools_dict["early_finish"] = {
-            "spec": {
-                "name": "early_finish",
-                "description": "Signal that the current work is complete enough to move to the next phase. Only available in EXECUTE phase.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "reason": {"type": "string", "description": "Brief reason why you're finishing early"},
-                    },
-                    "required": ["reason"],
-                },
-            },
-            "callable": self._tool_early_finish,
             "type": "function",
         }
         self.all_tools_dict["run_tools_parallel"] = {
@@ -1033,12 +993,6 @@ class HelixAgentEngine:
                     self.phase_tools_dict[name] = tool
                 continue
 
-            # ask_user is shown only in PLAN and REPLAN phases (planning / clarification only)
-            if name == "ask_user":
-                if phase in (self.PHASE_PLAN, self.PHASE_REPLAN):
-                    self.phase_tools_dict[name] = tool
-                continue
-
             # Allowlist filtering for non-internal tools
             if allowlist:
                 if name in allowlist:
@@ -1061,21 +1015,9 @@ class HelixAgentEngine:
         return json.dumps({"terminated": True, "result": kwargs.get("result", ""), "success": kwargs.get("success", True)})
 
     # Replan: transition to REPLAN phase to create a new plan while preserving context.
-    async def _tool_replan(self, reason: str, updated_tasks: str = "", **kwargs):
+    async def _tool_replan(self, reason: str, **kwargs):
         """Process a replan: transition to REPLAN phase for the LLM to create a new plan."""
-        new_tasks = self._extract_task_list(updated_tasks) if updated_tasks else []
-
-        # Update task list if new tasks were provided
-        if new_tasks:
-            self.task_list = new_tasks
-        else:
-            # Keep only tasks that are not completed or failed
-            failed_task_names = {f["task"] for f in self.failed_tasks}
-            self.task_list = [
-                t for t in self.task_list
-                if t not in self.completed_tasks and t not in failed_task_names
-            ]
-
+        self._replan_reason = reason
         self.completed_tasks = []
         self.failed_tasks = []
         self.consecutive_json_errors = 0
@@ -1086,7 +1028,7 @@ class HelixAgentEngine:
         self._plan_questions_asked = 0
         await self._save_state_to_file()
         await self.emit_task_update()
-        return json.dumps({"replan": True, "reason": reason, "tasks": self.task_list})
+        return json.dumps({"replan": True, "reason": reason})
 
     async def _tool_complete_task(self, **kwargs):
         idx = kwargs.get("index", -1)
@@ -1185,15 +1127,6 @@ class HelixAgentEngine:
             res = {"action": "error", "error": "Malformed confirmation response."}
 
         return json.dumps(res)
-
-    async def _tool_early_finish(self, reason: str, **kwargs):
-        """Signal early completion and move to REVIEW from EXECUTE."""
-        if self.phase == self.PHASE_EXECUTE:
-            self._transition_to(self.PHASE_REVIEW)
-            await self._save_state_to_file()
-            await self.emit_task_update()
-            return json.dumps({"early_finish": True, "phase": "review", "reason": reason})
-        return json.dumps({"early_finish": False, "error": f"Cannot early_finish from {self.phase}"})
 
     async def _tool_ask_user(self, question: str, options: list, allow_custom: bool = True, **kwargs):
         """Interactive user question tool. Only available during PLAN and REPLAN phases."""
@@ -2328,7 +2261,6 @@ class HelixAgentEngine:
 
     def _build_system_prompt(self):
         """Build system prompt based on current phase using Valves overrides."""
-        tool_names = ", ".join(sorted(self.phase_tools_dict.keys()))
         task_state = self._build_task_state()
 
         base = ""
@@ -2336,18 +2268,17 @@ class HelixAgentEngine:
             if self.phase == self.PHASE_PLAN:
                 base = self._render_prompt(
                     self.valves.PLAN_PROMPT or DEFAULT_PLAN_PROMPT,
-                    tool_names=tool_names,
                 )
             elif self.phase == self.PHASE_REPLAN:
                 base = self._render_prompt(
                     DEFAULT_REPLAN_PROMPT,
-                    tool_names=tool_names,
                     goal=self.goal,
+                    reason=self._replan_reason,
+                    task_state=task_state,
                 )
             elif self.phase == self.PHASE_EXECUTE:
                 base = self._render_prompt(
                     self.valves.EXECUTE_PROMPT or DEFAULT_EXECUTE_PROMPT,
-                    tool_names=tool_names,
                     task_state=task_state,
                 )
             elif self.phase == self.PHASE_REVIEW:
@@ -2355,7 +2286,6 @@ class HelixAgentEngine:
                     self.valves.REVIEW_PROMPT or DEFAULT_REVIEW_PROMPT,
                     goal=self.goal,
                     task_state=task_state,
-                    tool_names=tool_names,
                 )
             elif self.phase == self.PHASE_OUTPUT:
                 if self._output_turn >= 2:
@@ -2369,27 +2299,26 @@ class HelixAgentEngine:
                         self.valves.OUTPUT_PROMPT or DEFAULT_OUTPUT_PROMPT,
                         goal=self.goal,
                         task_state=task_state,
-                        tool_names=tool_names,
                     )
             else:
-                base = self._render_prompt(DEFAULT_PLAN_PROMPT, tool_names=tool_names)
+                base = self._render_prompt(DEFAULT_PLAN_PROMPT)
         except Exception:
             # Last-resort fallback if rendering itself somehow fails
             if self.phase == self.PHASE_PLAN:
-                base = self._render_prompt(DEFAULT_PLAN_PROMPT, tool_names=tool_names)
+                base = self._render_prompt(DEFAULT_PLAN_PROMPT)
             elif self.phase == self.PHASE_REPLAN:
-                base = self._render_prompt(DEFAULT_REPLAN_PROMPT, tool_names=tool_names, goal=self.goal)
+                base = self._render_prompt(DEFAULT_REPLAN_PROMPT, goal=self.goal, reason=self._replan_reason, task_state=task_state)
             elif self.phase == self.PHASE_EXECUTE:
-                base = self._render_prompt(DEFAULT_EXECUTE_PROMPT, tool_names=tool_names, task_state=task_state)
+                base = self._render_prompt(DEFAULT_EXECUTE_PROMPT, task_state=task_state)
             elif self.phase == self.PHASE_REVIEW:
-                base = self._render_prompt(DEFAULT_REVIEW_PROMPT, goal=self.goal, task_state=task_state, tool_names=tool_names)
+                base = self._render_prompt(DEFAULT_REVIEW_PROMPT, goal=self.goal, task_state=task_state)
             elif self.phase == self.PHASE_OUTPUT:
                 if self._output_turn >= 2:
                     base = self._render_prompt(DEFAULT_OUTPUT_FINAL_PROMPT, goal=self.goal, task_state=task_state)
                 else:
-                    base = self._render_prompt(DEFAULT_OUTPUT_PROMPT, goal=self.goal, task_state=task_state, tool_names=tool_names)
+                    base = self._render_prompt(DEFAULT_OUTPUT_PROMPT, goal=self.goal, task_state=task_state)
             else:
-                base = self._render_prompt(DEFAULT_PLAN_PROMPT, tool_names=tool_names)
+                base = self._render_prompt(DEFAULT_PLAN_PROMPT)
 
         base = base.replace("[USER_HOME]", os.path.expanduser("~"))
 
@@ -2621,7 +2550,7 @@ class HelixAgentEngine:
                 helix_tools = []
 
                 for name, info in self.all_tools_dict.items():
-                    if name in self.INTERNAL_TOOLS or name == "ask_user":
+                    if name in self.INTERNAL_TOOLS:
                         helix_tools.append(name)
                         continue
                     tool_type = info.get("type", "") if isinstance(info, dict) else ""
@@ -3039,32 +2968,6 @@ class HelixAgentEngine:
                     })
                     continue
 
-                # ── Handle early_finish ──
-                if tool_name == "early_finish":
-                    if self.phase != self.PHASE_EXECUTE:
-                        result_json = json.dumps({"early_finish": False, "error": f"early_finish is only available in EXECUTE phase, not {self.phase}"})
-                        self.history.append({
-                            "role": "tool",
-                            "content": result_json,
-                            "tool_call_id": call_id,
-                            "name": tool_name,
-                        })
-                        continue
-                    result_json = await self._tool_early_finish(**args)
-                    result_data = json.loads(result_json)
-                    if result_data.get("early_finish"):
-                        await self.emit_output(f"\n[FIN] Finishing early: {result_data.get('reason', '')}\n")
-                        await self.emit_status("Finishing early...")
-                    else:
-                        await self.emit_output(f"\n[FIN] Early finish failed: {result_data.get('error', 'Unknown error')}\n")
-                    self.history.append({
-                        "role": "tool",
-                        "content": result_json,
-                        "tool_call_id": call_id,
-                        "name": tool_name,
-                    })
-                    continue
-
                 # ── Handle terminate ──
                 if tool_name == "terminate":
                     result = args.get("result", "Task complete.")
@@ -3081,24 +2984,10 @@ class HelixAgentEngine:
                 # ── Handle replan ──
                 if tool_name == "replan":
                     reason = args.get("reason", "Plan needs adjustment")
-                    updated = args.get("updated_tasks", "")
-
-                    if not updated or not self._extract_task_list(updated):
-                        # No new tasks provided -- check if any remaining tasks exist
-                        failed_task_names = {f["task"] for f in self.failed_tasks}
-                        remaining = [
-                            t for t in self.task_list
-                            if t not in self.completed_tasks and t not in failed_task_names
-                        ]
-                        if not remaining:
-                            await self.emit_output(f"\n[WARN] Replan requested but no remaining tasks. Terminating.")
-                            await self.emit_task_update(finalize_tasks=True)
-                            await self.emit_status("No tasks remaining", done=True)
-                            return self._format_output()
 
                     recent_calls = []
                     self._consecutive_tool_misses.clear()
-                    result_json = await self._tool_replan(reason=reason, updated_tasks=updated)
+                    result_json = await self._tool_replan(reason=reason)
                     self.history.append({
                         "role": "tool",
                         "content": result_json,
@@ -3380,50 +3269,27 @@ class HelixAgentEngine:
         if not text:
             return ["Complete the user's request"]
 
-        # Try JSON parsing first: {"tasks": ["task1", "task2"]} or ["task1", "task2"]
+        # Plan must now be JSON only: {"tasks": ["task1", "task2"]}
         try:
             data = json.loads(text)
             if isinstance(data, dict) and "tasks" in data:
                 tasks = [t.get("description", t) if isinstance(t, dict) else str(t) for t in data["tasks"]]
                 return tasks if tasks else ["Complete the user's request"]
-            if isinstance(data, list):
-                tasks = [t.get("description", t) if isinstance(t, dict) else str(t) for t in data]
-                return tasks if tasks else ["Complete the user's request"]
-        except (json.JSONDecodeError, TypeError, AttributeError):
+        except (json.JSONDecodeError, TypeError):
             pass
 
         # Try to extract a JSON block from within the text
-        json_match = re.search(r'\{[^{}]*"tasks"\s*:\s*\[.*?\]\s*\}', text, re.DOTALL)
-        if not json_match:
-            json_match = re.search(r'\[\s*\{.*?\}\s*\]', text, re.DOTALL)
+        json_match = re.search(r'\{[^}]*"tasks"\s*:\s*\[.*?\]\s*\}', text, re.DOTALL)
         if json_match:
             try:
                 data = json.loads(json_match.group(0))
                 if isinstance(data, dict) and "tasks" in data:
                     tasks = [t.get("description", t) if isinstance(t, dict) else str(t) for t in data["tasks"]]
                     return tasks if tasks else ["Complete the user's request"]
-                if isinstance(data, list):
-                    tasks = [t.get("description", t) if isinstance(t, dict) else str(t) for t in data]
-                    return tasks if tasks else ["Complete the user's request"]
-            except (json.JSONDecodeError, TypeError, AttributeError):
+            except (json.JSONDecodeError, TypeError):
                 pass
 
-        # Fallback: regex extraction of numbered/bulleted items
-        tasks = []
-        for line in text.split("\n"):
-            line = line.strip()
-            m = re.match(r"^\d+[\.\)]\s+(.+)", line)
-            if m:
-                tasks.append(m.group(1).strip())
-            elif re.match(r"^[-*]\s+", line):
-                tasks.append(re.sub(r"^[-*]\s+", "", line).strip())
-        if not tasks:
-            summary = text.strip().split("\n")[0].strip()[:120]
-            if summary:
-                tasks = [summary]
-            else:
-                tasks = ["Complete the user's request"]
-        return tasks
+        return ["Complete the user's request"]
 
 
 class Pipe:
@@ -3525,7 +3391,8 @@ class Pipe:
             ),
             description=(
                 "Comma-separated tool names allowed in EXECUTE phase. "
-                "Leave EMPTY to allow ALL tools."
+                "Leave EMPTY to allow ALL tools. "
+                "Default excludes write-memory tools (add_memory, delete_memory, replace_memory_content)."
             )
         ),
         REVIEW_TOOLS: str = Field(
@@ -3555,19 +3422,19 @@ class Pipe:
 
         PLAN_PROMPT: str = Field(
             default=DEFAULT_PLAN_PROMPT,
-            description="System prompt for PLAN phase. Available placeholders: {tool_names}."
+            description="System prompt for PLAN phase. Available placeholders: none."
         )
         EXECUTE_PROMPT: str = Field(
             default=DEFAULT_EXECUTE_PROMPT,
-            description="System prompt for EXECUTE phase. Available placeholders: {tool_names}, {task_state}."
+            description="System prompt for EXECUTE phase. Available placeholders: {task_state}."
         )
         REVIEW_PROMPT: str = Field(
             default=DEFAULT_REVIEW_PROMPT,
-            description="System prompt for REVIEW phase. Available placeholders: {goal}, {task_state}, {tool_names}."
+            description="System prompt for REVIEW phase. Available placeholders: {goal}, {task_state}."
         )
         OUTPUT_PROMPT: str = Field(
             default=DEFAULT_OUTPUT_PROMPT,
-            description="System prompt for OUTPUT phase - Turn 1 (rendering / visualisation). Only rendering/visualisation tools are called here. Available placeholders: {goal}, {task_state}, {tool_names}.",
+            description="System prompt for OUTPUT phase - Turn 1 (rendering / visualisation). Only rendering/visualisation tools are called here. Available placeholders: {goal}, {task_state}.",
         )
 
         # ── 5. Safety & Limits ──
