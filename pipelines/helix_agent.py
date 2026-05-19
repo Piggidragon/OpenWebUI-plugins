@@ -1,7 +1,7 @@
 """
 title: Helix Agent
 author: Piggidragon
-    version: 0.25.0
+    version: 0.25.1
 description: >
   Helix Agent - OpenWebUI-native agent loop with modular per-phase tool control.
 
@@ -89,7 +89,7 @@ What to do:
 2. Create a numbered task list that covers the entire goal.
 3. Each task must be a clear, actionable step. Keep the total plan short (typically 3–7 tasks).
 4. If the goal involves writing code or creating files, include explicit verification tasks (e.g., syntax check, lint, run a quick test).
-5. Call confirm_plan(tasks=["task 1", "task 2", ...]) with your task list.
+5. Call confirm_plan(tasks=["task 1", "task 2", ...], task_dependencies=[[], [], ...]) with your task list. Provide task_dependencies as a list where index i contains a list of task indices that task i depends on. For example, task_dependencies=[[], [0], [0, 1]] means: task 0 has no dependencies, task 1 depends on task 0, task 2 depends on tasks 0 and 1. Keep dependencies minimal and only introduce them where truly necessary.
 
 File paths: If the plan involves creating files, decide on a ONE project folder name (short slug based on the goal) under `[USER_HOME]/agent/`. ALL files for this task and any follow-up turns on the SAME topic must be written within that project folder. Do NOT write into the bare `[USER_HOME]/agent/` root.
 
@@ -103,33 +103,39 @@ Rules:
 """
 
 DEFAULT_EXECUTE_PROMPT = """\
-You are in EXECUTE mode. Work through tasks one at a time.
+You are in EXECUTE mode. Work through tasks ONE AT A TIME.
 
 {loop_info}
 
 {task_state}
 
-Task status markers: [done] = completed, [FAIL: reason] = failed, [    ] = not started.
+The task list is split into THREE sections. You MUST focus exclusively on the ONE Current Task.
 
 What to do:
-1. Pick the next incomplete task (marked [    ]) from the list above.
-2. Execute it using the appropriate tool(s).
-3. After the task is truly done, call complete_task(index) where index is the task number shown in the list.
-4. If a task fails and cannot be recovered, call fail_task(index, reason) to mark it.
-5. Move on to the next task.
+1. Read the task list above. There is exactly ONE Current Task.
+2. Execute ONLY that Current Task using the appropriate tools.
+3. Only after you have finished working on the Current Task, call complete_task(index) for it, or fail_task(index, reason) if it cannot be completed.
+4. Do NOT proceed to any task in Future Tasks until the Current Task is completed or failed.
+5. Do NOT attempt tasks marked as [blocked].
 
 File paths: All files MUST be written into the SAME project subfolder under `[USER_HOME]/agent/` (e.g. `[USER_HOME]/agent/website-redesign/`). Use a short slug based on the current task/goal. EVERY file created in this or follow-up turns for the SAME topic must go into that SAME project folder. NEVER scatter files across unrelated directories and NEVER write into the bare `[USER_HOME]/agent/` root.
+
+File context discipline:
+- When files are returned by tools (e.g. read_file, search_results), do NOT copy the entire contents of those files into your response or thought process. Only extract the specific information needed for the CURRENT step.
+- Only read files that are STRICTLY NECESSARY for the current task. If you need to verify one line in a file, use grep/search rather than reading the whole file.
+- Do NOT read all files in a directory just to "get context". Read only what you need.
 
 Code verification: If a task involves writing code, you MUST verify syntax before calling complete_task. Use appropriate validation tools (e.g. `python -m py_compile`, `bash -n`, `node --check`, a linter, or any available syntax-check tool). Only mark the task complete once the code passes validation or the validation failure has been documented.
 
 Rules:
-- Use `run_tools_parallel` for multiple independent tool calls to speed up execution. NEVER use it for internal Helix tools (complete_task, fail_task, fix_plan, replan, proceed_to_output, terminate).
+- Use `run_tools_parallel` ONLY for multiple INDEPENDENT tool calls within the SAME Current Task. NEVER use it for internal Helix tools (complete_task, fail_task, fix_plan, replan, proceed_to_output, terminate).
 - NEVER repeat identical failed tool calls (duplicate detection is active).
-- When all tasks are done, the system will move to review automatically.
+- When all unblocked tasks are done, the system will move to review automatically.
 - If a tool returns an error, analyze it and retry with corrected parameters. You do NOT need to call fix_plan for trivial errors.
-- Only call fix_plan if the same task fails repeatedly (3+ attempts) or if the task design was wrong. Provide just the new/corrected tasks: fix_plan(reason="...", tasks=["task 1", "task 2"]).
+- Only call fix_plan if the same task fails repeatedly (3+ attempts) or if the task design was wrong.
 - Only call replan(reason) if the overall strategy is broken and a new plan is needed.
 - You MUST call complete_task(index) or fail_task(index, reason) after working on a task.
+- NEVER call complete_task for a task you have not actually completed, and NEVER skip calling complete_task before going to the next task.
 """
 
 DEFAULT_REVIEW_PROMPT = """\
@@ -141,7 +147,12 @@ Original goal: {goal}
 
 {task_state}
 
-Task status markers: [done] = completed, [FAIL: reason] = failed with reason, [    ] = not started.
+Task status markers: [done] = completed, [FAIL: reason] = failed with reason, [blocked] = has unmet dependencies, [    ] = not started.
+
+Review discipline:
+- Only read files that are STRICTLY NECESSARY to verify the completed tasks. If you need to verify one line, use grep/search rather than reading whole files.
+- Do NOT read all files in a directory just to "get context".
+- Do NOT copy entire file contents into your reasoning. Only extract the specific information needed for your verification.
 
 What to do:
 1. Use read-only tools (e.g. read_file, grep_search, list_files, view_knowledge_file) to verify the work. Check file contents, code correctness, and whether files exist in `[USER_HOME]/agent/<project>/`.
@@ -149,7 +160,7 @@ What to do:
 3. Once you have inspected the work, call exactly ONE of these transition tools:
 
 - `proceed_to_output()` -- Everything is done and correct. Move to the OUTPUT phase to generate the polished final answer.
-- `fix_plan(reason, tasks)` -- Only minor fixes are needed (a task failed or needs a small correction). Provide just the new/corrected tasks: fix_plan(reason="...", tasks=["task 1", "task 2"]). List just the new/corrected tasks.
+- `fix_plan(reason, tasks, task_dependencies)` -- Only minor fixes are needed. Provide just the new/corrected tasks and their dependencies.
 - `replan(reason)` -- The overall strategy is broken and tasks need to be replaced entirely.
 
 Rules:
@@ -234,7 +245,7 @@ You are in REPLAN mode. A previous session completed or the approach needs to ch
 
 {loop_info}
 
-A list of all available execution tools is shown above this prompt. Use it ONLY to understand what capabilities exist — you CANNOT call any tools in REPLAN mode.
+A list of all available execution tools is shown above this prompt. Use it ONLY to understand what capabilities exist -- you CANNOT call any tools in REPLAN mode.
 
 Reason for replan: {reason}
 
@@ -243,11 +254,13 @@ Recent context (previous goal):
 
 {task_state}
 
+Task status markers: [done] = completed, [FAIL: reason] = failed with reason, [blocked] = has unmet dependencies, [    ] = not started.
+
 What to do:
 1. Review the previous goal and the current request.
 2. Create a minimal, focused task plan (1-3 tasks) that addresses the new request in the context of what was already done.
 3. If the goal involves writing code or creating files, include explicit verification tasks (e.g., syntax check, lint, run a quick test).
-4. Call confirm_plan(tasks=["task 1", "task 2", ...]) with your updated task list.
+4. Call confirm_plan(tasks=["task 1", "task 2", ...], task_dependencies=[[], [], ...]) with your updated task list. task_dependencies is a list where index i contains task indices that task i depends on. Use empty lists if no dependencies needed.
 
 File paths: If the plan involves creating files, decide on a ONE project folder name (short slug based on the goal) under `[USER_HOME]/agent/`. ALL files for this task and any follow-up turns on the SAME topic must be written within that project folder. Do NOT write into the bare `[USER_HOME]/agent/` root.
 
@@ -372,6 +385,7 @@ class HelixAgentEngine:
         self.task_list = []
         self.completed_tasks = []
         self.failed_tasks = []
+        self.task_dependencies: Dict[int, List[int]] = {}
         self.produced_files = []
         self._files_lock = asyncio.Lock()
         self._consecutive_tool_misses: Dict[str, int] = {}
@@ -563,6 +577,7 @@ class HelixAgentEngine:
         Writes are throttled: at most one every 2 seconds, and skipped if the
         state payload is unchanged since the last successful save.
         Call with force=True to bypass throttling (e.g. on termination).
+        After a successful save, stale helix_state files in the chat are cleaned up.
         """
         if not HAS_DB_PERSISTENCE or not self.chat_id or not self.request or not self.user:
             return
@@ -573,6 +588,7 @@ class HelixAgentEngine:
                 "task_list": self.task_list,
                 "completed": self.completed_tasks,
                 "failed": self.failed_tasks,
+                "task_dependencies": {str(k): v for k, v in self.task_dependencies.items()},
                 "phase": self.phase,
                 "loop_count": self.loop_count,
                 "extra_grace": self._extra_grace,
@@ -588,7 +604,7 @@ class HelixAgentEngine:
                 if payload_hash == self._last_state_save_hash:
                     return
 
-            filename = f"helix_state_{self.chat_id}.json"
+            filename = f"helix_state_{self.chat_id}_{self.loop_count}.json"
 
             file_upload = UploadFile(
                 file=io.BytesIO(content),
@@ -615,16 +631,8 @@ class HelixAgentEngine:
             self._last_state_save_ts = now
             self._last_state_save_hash = payload_hash
 
-            # Update internal metadata (prune old state files first)
-            internal_files = self.metadata.get("__files__")
-            if isinstance(internal_files, list):
-                internal_files[:] = [
-                    f for f in internal_files
-                    if not (isinstance(f, dict) and f.get("name", "").startswith("helix_state_"))
-                ]
-                internal_files.append(file_info)
-            else:
-                self.metadata["__files__"] = [file_info]
+            # Update internal metadata
+            self._upsert_metadata_files(file_info)
 
             # Direct DB binding
             if self.chat_id and self.message_id:
@@ -639,14 +647,81 @@ class HelixAgentEngine:
                     )
                 except Exception as db_err:
                     logger.warning(f"DB file binding failed: {db_err}")
+                    return  # Abort cleanup if DB binding failed
 
             # Emit for immediate UI feedback
             if self.event_emitter:
                 await self.event_emitter(
                     {"type": "chat:message:files", "data": {"files": [file_info]}}
                 )
+
+            # Cleanup stale helix_state attachments across the entire chat
+            await self._cleanup_chat_state_files(exclude_file_id=str(file_id))
         except Exception as e:
             logger.error(f"Failed to save state file: {e}")
+
+    async def _cleanup_chat_state_files(self, exclude_file_id: str) -> None:
+        """Remove stale helix_state file attachments from all messages in the chat.
+
+        Deletes File DB records and removes the attachment references from
+        messages. Skips the file identified by exclude_file_id (the newest).
+        """
+        if not HAS_DB_PERSISTENCE or not self.chat_id:
+            return
+
+        try:
+            chat_obj = await Chats.get_chat_by_id(self.chat_id)
+            if not chat_obj or not hasattr(chat_obj, "chat"):
+                return
+            messages_map = chat_obj.chat.get("history", {}).get("messages", {})
+            current_id = chat_obj.chat.get("history", {}).get("currentId")
+
+            deleted_count = 0
+            visited = set()
+            msg_id = current_id
+            while msg_id and msg_id not in visited:
+                visited.add(msg_id)
+                msg = messages_map.get(msg_id)
+                if not msg:
+                    break
+                msg_files = msg.get("files")
+                if msg_files and isinstance(msg_files, list):
+                    # Identify stale helix_state attachments
+                    stale = []
+                    keep = []
+                    for f in msg_files:
+                        if self._is_helix_state_file(f):
+                            fid = f.get("id") or f.get("file_id")
+                            if fid and str(fid) != exclude_file_id:
+                                stale.append(f)
+                                continue
+                        keep.append(f)
+
+                    if stale:
+                        # Delete File DB records (best-effort)
+                        for f in stale:
+                            fid = f.get("id") or f.get("file_id")
+                            if fid:
+                                try:
+                                    await Files.delete_file_by_id(fid)
+                                    logger.info(f"[Helix GC] Deleted stale state file {fid}")
+                                except Exception as del_err:
+                                    logger.warning(f"[Helix GC] Failed to delete file {fid}: {del_err}")
+
+                        # Update message files array directly
+                        msg["files"] = keep
+                        await Chats.upsert_message_to_chat_by_id_and_message_id(
+                            self.chat_id,
+                            msg_id,
+                            {"files": keep},
+                        )
+                        deleted_count += len(stale)
+                msg_id = msg.get("parentId")
+
+            if deleted_count:
+                logger.info(f"[Helix GC] Pruned {deleted_count} stale helix_state attachments from chat {self.chat_id}")
+        except Exception as e:
+            logger.warning(f"[Helix GC] Cleanup failed: {e}")
 
     def _check_session_timeouts(self) -> tuple[bool, str]:
         """Return (should_stop, reason) if session or per-iteration timeout exceeded."""
@@ -674,27 +749,35 @@ class HelixAgentEngine:
         return False
 
     async def _recover_state_from_files(self, body: dict) -> None:
-        """Restore agent state from JSON file attachments in the chat."""
+        """Restore agent state from JSON file attachments in the chat.
+
+        Picks the newest helix_state file by the loop number embedded in the filename.
+        """
         if not HAS_DB_PERSISTENCE:
             return
 
-        state_file = None
+        def _extract_loop(name: str) -> int:
+            # helix_state_<chat_id>_<loop>.json
+            try:
+                parts = name.rsplit("_", 1)
+                return int(parts[-1].replace(".json", ""))
+            except (ValueError, IndexError):
+                return 0
+
+        state_candidates = []
         # 1. Look in current message attachments (body files)
         current_files = body.get("files") or body.get("__files__")
         # Also scan self.metadata files since they persist across turns
         metadata_files = self.metadata.get("__files__") or self.metadata.get("files")
         for file_list in (current_files, metadata_files):
             if file_list:
-                for f in reversed(file_list):
+                for f in file_list:
                     name = f.get("name", f.get("filename", ""))
-                    if "helix_state" in name and name.endswith(".json"):
-                        state_file = f
-                        break
-                if state_file:
-                    break
+                    if self._is_helix_state_file(f):
+                        state_candidates.append((f, _extract_loop(name)))
 
         # 2. Deep DB history scan
-        if not state_file and self.chat_id:
+        if not state_candidates and self.chat_id:
             logger.info(f"Deep history scan for chat {self.chat_id}...")
             try:
                 chat_obj = await Chats.get_chat_by_id(self.chat_id)
@@ -709,21 +792,20 @@ class HelixAgentEngine:
                             break
                         msg_files = msg.get("files")
                         if msg_files:
-                            for f in reversed(msg_files):
+                            for f in msg_files:
                                 name = f.get("name", f.get("filename", ""))
-                                if "helix_state" in name and name.endswith(".json"):
-                                    state_file = f
-                                    logger.info(f"Recovered state from DB history: {name}")
-                                    break
-                        if state_file:
-                            break
+                                if self._is_helix_state_file(f):
+                                    state_candidates.append((f, _extract_loop(name)))
                         current_id = msg.get("parentId")
             except Exception as e:
                 logger.warning(f"DB history scan failed: {e}")
 
-        if not state_file:
+        if not state_candidates:
             logger.info("No Helix state file found in attachments or DB history.")
             return
+
+        # Pick the state file with the highest loop number
+        state_file, _ = max(state_candidates, key=lambda item: item[1])
 
         try:
             file_id = state_file.get("file_id") or state_file.get("id")
@@ -742,6 +824,8 @@ class HelixAgentEngine:
             self.task_list = data.get("task_list", [])
             self.completed_tasks = data.get("completed", [])
             self.failed_tasks = data.get("failed", [])
+            raw_deps = data.get("task_dependencies", {})
+            self.task_dependencies = {int(k): v for k, v in raw_deps.items()}
             self.phase = data.get("phase", self.PHASE_PLAN)
             self.goal = data.get("goal") if "goal" in data else self.goal
             self.loop_count = data.get("loop_count", 0)
@@ -802,6 +886,32 @@ class HelixAgentEngine:
         """
         ctx = getattr(self.valves, "CONTEXT_LENGTH", 128000)
         return int(ctx * 0.05)
+
+    def _dedupe_files(self, file_list: list) -> list:
+        """Remove duplicate files by id/file_id/url, preserving order."""
+        seen = set()
+        unique = []
+        for f in file_list:
+            if not isinstance(f, dict):
+                continue
+            fid = f.get("id") or f.get("file_id") or f.get("url")
+            if fid and fid not in seen:
+                seen.add(fid)
+                unique.append(f)
+        return unique
+
+    @staticmethod
+    def _is_helix_state_file(f) -> bool:
+        return isinstance(f, dict) and f.get("name", "").startswith("helix_state_")
+
+    def _upsert_metadata_files(self, file_info: dict):
+        """Replace any existing helix_state files in metadata and append the new one."""
+        mfiles = self.metadata.get("__files__")
+        if isinstance(mfiles, list):
+            mfiles[:] = [f for f in mfiles if not self._is_helix_state_file(f)]
+            mfiles.append(file_info)
+        else:
+            self.metadata["__files__"] = [file_info]
 
     def get_current_files(self) -> list:
         """Return a deduplicated list of all known files (metadata + produced + DB canonical)."""
@@ -907,7 +1017,7 @@ class HelixAgentEngine:
         self.all_tools_dict["confirm_plan"] = {
             "spec": {
                 "name": "confirm_plan",
-                "description": "Present the task plan to the user for approval. Call this after creating the plan in PLAN phase. Provide the tasks as an array of clear, actionable steps.",
+                "description": "Present the task plan to the user for approval. Call this after creating the plan in PLAN or REPLAN phase. Provide the tasks as an array of clear, actionable steps. If some tasks depend on others, also provide task_dependencies.",
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -915,6 +1025,15 @@ class HelixAgentEngine:
                             "type": "array",
                             "items": {"type": "string", "description": "A clear, actionable step"},
                             "description": "Array of tasks to accomplish. Each task must be a clear, actionable step.",
+                        },
+                        "task_dependencies": {
+                            "type": "array",
+                            "items": {
+                                "type": "array",
+                                "items": {"type": "integer"},
+                                "description": "List of task indices that this task depends on"
+                            },
+                            "description": "Optional. A list aligned with tasks. Index i contains the indices of tasks that task i depends on. If task 2 depends on task 0 being completed first, pass task_dependencies[2]=[0]. Empty arrays mean no dependencies. Avoid cycles and self-referencing.",
                         },
                     },
                     "required": ["tasks"],
@@ -935,6 +1054,15 @@ class HelixAgentEngine:
                             "type": "array",
                             "items": {"type": "string", "description": "A new or corrected task step"},
                             "description": "Array of new/corrected tasks to add. These tasks will be appended or replace failed tasks.",
+                        },
+                        "task_dependencies": {
+                            "type": "array",
+                            "items": {
+                                "type": "array",
+                                "items": {"type": "integer"},
+                                "description": "List of task indices that this task depends on (relative to the new tasks array)"
+                            },
+                            "description": "Optional. Dependencies among the new tasks being added. Same format as confirm_plan.",
                         },
                     },
                     "required": ["reason", "tasks"],
@@ -1121,6 +1249,7 @@ class HelixAgentEngine:
         self.completed_tasks = []
         self.failed_tasks = []
         self.task_list = []
+        self.task_dependencies = {}
         self.consecutive_json_errors = 0
 
         # Reset counters for the new plan session
@@ -1160,7 +1289,7 @@ class HelixAgentEngine:
         return json.dumps({"failed": False, "error": f"Invalid task index {idx}"})
 
     # Lightweight correction tool. Use this instead of replan for minor issues.
-    async def _tool_fix_plan(self, reason: str, tasks: list, **kwargs):
+    async def _tool_fix_plan(self, reason: str, tasks: list, task_dependencies: list = None, **kwargs):
         if not self.task_list:
             return json.dumps({"fix_plan": False, "error": "No task list available"})
 
@@ -1185,6 +1314,23 @@ class HelixAgentEngine:
 
         self.task_list[insert_idx:insert_idx] = new_tasks
 
+        # Handle task_dependencies for new tasks
+        new_deps = self._validate_task_dependencies(task_dependencies, len(new_tasks))
+        if new_deps is None:
+            return json.dumps({"fix_plan": False, "error": "Invalid task_dependencies: out-of-range or cyclic dependencies detected."})
+        # Merge into existing deps: shift indices for inserted tasks
+        old_deps = dict(self.task_dependencies)
+        shifted_deps = {}
+        for old_idx, old_deps_list in old_deps.items():
+            if old_idx < insert_idx:
+                shifted_deps[old_idx] = old_deps_list
+            else:
+                shifted_deps[old_idx + len(new_tasks)] = [d + len(new_tasks) for d in old_deps_list]
+        # Add new deps offset by insert_idx
+        for local_idx, deps_list in new_deps.items():
+            shifted_deps[insert_idx + local_idx] = [d + insert_idx for d in deps_list]
+        self.task_dependencies = shifted_deps
+
         await self._save_state_to_file()
         await self.emit_task_update()
         return json.dumps({"fix_plan": True, "inserted_tasks": new_tasks, "reason": reason})
@@ -1198,11 +1344,80 @@ class HelixAgentEngine:
             return json.dumps({"proceed_to_output": True})
         return json.dumps({"proceed_to_output": False, "error": f"Cannot proceed to output from {self.phase} phase"})
 
+    def _validate_task_dependencies(self, raw_deps, num_tasks):
+        """Validate and normalize task_dependencies. Returns dict[int, List[int]] or None if invalid."""
+        if raw_deps is None:
+            return {}
+        if not isinstance(raw_deps, list):
+            return None
+        if len(raw_deps) != num_tasks:
+            # Allow shorter lists, fill with empty lists
+            raw_deps = list(raw_deps) + [[] for _ in range(num_tasks - len(raw_deps))]
+        parsed = {}
+        for i, dep_entry in enumerate(raw_deps):
+            if dep_entry is None:
+                dep_entry = []
+            if isinstance(dep_entry, int):
+                dep_entry = [dep_entry]
+            if not isinstance(dep_entry, list):
+                return None
+            deps = []
+            for d in dep_entry:
+                try:
+                    d_idx = int(d)
+                    if d_idx < 0 or d_idx >= num_tasks or d_idx == i:
+                        return None
+                    deps.append(d_idx)
+                except (ValueError, TypeError):
+                    return None
+            parsed[i] = deps
+        # Check for cycles via simple DFS
+        visited = {}
+        def has_cycle(node, stack):
+            visited[node] = True
+            stack.add(node)
+            for neighbor in parsed.get(node, []):
+                if neighbor in stack or (not visited.get(neighbor) and has_cycle(neighbor, stack)):
+                    return True
+            stack.remove(node)
+            return False
+        for node in range(num_tasks):
+            if not visited.get(node):
+                if has_cycle(node, set()):
+                    return None
+        return parsed
+
+    def _compute_blocked_tasks(self):
+        """Return set of task indices that are blocked due to unmet dependencies."""
+        blocked = set()
+        completed_set = {i for i, task in enumerate(self.task_list) if task in self.completed_tasks}
+        for idx, deps in self.task_dependencies.items():
+            if idx not in completed_set and not all(d in completed_set for d in deps):
+                blocked.add(idx)
+        return blocked
+
+    def _get_current_task_index(self):
+        """Return the index of the current task: first unblocked, incomplete, non-failed task."""
+        failed_set = {next((i for i, task in enumerate(self.task_list) if task == f["task"]), -1) for f in self.failed_tasks}
+        blocked = self._compute_blocked_tasks()
+        for i, task in enumerate(self.task_list):
+            if task in self.completed_tasks or i in failed_set or i in blocked:
+                continue
+            return i
+        return None
+
     async def _tool_confirm_plan(self, **kwargs):
         tasks = kwargs.get("tasks", [])
         if not isinstance(tasks, list):
             tasks = []
         uv = self.user_valves
+
+        # Validate and store task dependencies
+        raw_deps = kwargs.get("task_dependencies")
+        validated_deps = self._validate_task_dependencies(raw_deps, len(tasks))
+        if validated_deps is None:
+            return json.dumps({"action": "error", "error": "Invalid task_dependencies: out-of-range indices, self-references, or cyclic dependencies detected."})
+        self.task_dependencies = validated_deps
 
         if uv and (getattr(uv, "YOLO_MODE", False) or not getattr(uv, "ENABLE_PLAN_APPROVAL", False)):
             return json.dumps({"action": "accept", "tasks": tasks})
@@ -1977,12 +2192,8 @@ class HelixAgentEngine:
         if not self.task_list:
             tasks = []
         else:
-            first_outstanding = next(
-                (i for i, t in enumerate(self.task_list)
-                 if t not in self.completed_tasks
-                 and not any(f["task"] == t for f in self.failed_tasks)),
-                None,
-            )
+            blocked = self._compute_blocked_tasks()
+            first_outstanding = self._get_current_task_index()
             tasks = []
             for i, task in enumerate(self.task_list):
                 if task in self.completed_tasks:
@@ -2014,21 +2225,61 @@ class HelixAgentEngine:
 
     def _build_task_state(self):
         lines = []
-        lines.append("Current Tasks:")
+        blocked = self._compute_blocked_tasks()
+        failed_set = {i for i, task in enumerate(self.task_list) if any(f["task"] == task for f in self.failed_tasks)}
+        current_idx = self._get_current_task_index()
+
+        completed = []
+        current = None
+        future = []
+
         for i, task in enumerate(self.task_list):
             if task in self.completed_tasks:
-                status = "[done]"
-            elif any(f["task"] == task for f in self.failed_tasks):
+                completed.append((i, task))
+            elif i in failed_set:
                 reason = next((f["reason"] for f in self.failed_tasks if f["task"] == task), "")
-                status = f"[FAIL: {reason}]"
+                completed.append((i, task, reason))
+            elif i == current_idx:
+                current = (i, task)
             else:
-                status = "[    ]"
-            lines.append(f"  {i}. {status} {task}")
-        lines.append(f"\nCompleted: {len(self.completed_tasks)}/{len(self.task_list)}")
-        if self.failed_tasks:
-            lines.append("Failed:")
-            for f in self.failed_tasks:
-                lines.append(f"  - {f['task']}: {f['reason']}")
+                if i in blocked:
+                    deps = self.task_dependencies.get(i, [])
+                    dep_str = ", ".join(str(d) for d in deps)
+                    future.append((i, task, f"blocked: needs task(s) {dep_str}"))
+                else:
+                    future.append((i, task, None))
+
+        if completed:
+            lines.append("Completed Tasks:")
+            for item in completed:
+                if len(item) == 3:
+                    i, task, reason = item
+                    lines.append(f"  [FAIL: {reason}] {i}: {task}")
+                else:
+                    i, task = item
+                    lines.append(f"  [done] {i}: {task}")
+            lines.append("")
+
+        if current:
+            i, task = current
+            lines.append("Current Task (ACTIVE - work ONLY on this one):")
+            lines.append(f"  [ACTIVE] {i}: {task}")
+            lines.append("")
+
+        if future:
+            lines.append("Future Tasks (do NOT start these yet):")
+            for item in future:
+                i, task, extra = item
+                if extra:
+                    lines.append(f"  [{extra}] {i}: {task}")
+                else:
+                    lines.append(f"  [pending] {i}: {task}")
+            lines.append("")
+
+        if current_idx is None and not future:
+            lines.append("All unblocked tasks are complete.")
+
+        lines.append(f"Completed: {len(self.completed_tasks)}/{len(self.task_list)}")
         return "\n".join(lines)
 
 
@@ -2161,16 +2412,8 @@ class HelixAgentEngine:
             return True
 
         # Deduplicate by id/file_id/url
-        seen = set()
-        unique_files = []
         async with self._files_lock:
-            for f in self.produced_files:
-                if not isinstance(f, dict):
-                    continue
-                fid = f.get("id") or f.get("file_id") or f.get("url")
-                if fid and fid not in seen:
-                    seen.add(fid)
-                    unique_files.append(f)
+            unique_files = self._dedupe_files(self.produced_files)
             self.produced_files = unique_files.copy()
 
         if not unique_files:
