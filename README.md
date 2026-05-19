@@ -78,8 +78,6 @@ Searches the entire GitHub universe — public repositories, code, issues, pull 
 |-------|---------|-------------|
 | `GITHUB_TOKEN` | (empty) | Optional PAT for 30 req/min and private repos. Leave empty for anonymous public searches (10 req/min). |
 
-See the [GitHub Search PR](https://github.com/Piggidragon/OpenWebUI-plugins/pull/1) for details.
-
 ---
 
 ## Pipelines
@@ -132,17 +130,6 @@ A single-model Plan → Execute → Review → Replan loop with per-phase tool c
 |-------|---------|-------------|
 | `ENABLE_PLAN_APPROVAL` | true | Show plan confirmation popup before execution. When off, plans are auto-approved without asking the user. |
 | `YOLO_MODE` | false | Skip all user confirmations. Auto-approve plans and ignore iteration limits. |
-
----
-
-## System Prompt
-
-For the best experience, add this to your model's system prompt:
-
-```
-When interacting with GitHub, use the "github-workflow" skill.
-Never write directly to main. Always follow: github_create_branch → github_write_file → github_create_pull_request.
-```
 
 ---
 
