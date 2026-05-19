@@ -3349,6 +3349,7 @@ class HelixAgentEngine:
             if max_iter_seconds > 0:
                 iter_deadline = asyncio.get_event_loop().time() + max_iter_seconds
 
+            retryable_error_occurred = False
             try:
                 async for event in self._stream_completion(
                     completion_body, max_retries=max_llm_retries, iter_deadline=iter_deadline
@@ -3363,13 +3364,14 @@ class HelixAgentEngine:
                                 "role": "user",
                                 "content": f"SYSTEM: LLM call was interrupted by a transient error ({error_text}). The stream timed out or disconnected. Please retry your last action.",
                             })
+                            retryable_error_occurred = True
+                            break
                         else:
                             # Non-retryable (budget/session exhausted) – fatal
                             await self.emit_output(f"\n[ERROR] LLM Error: {error_text}")
                             await self.emit_task_update(finalize_tasks=True)
                             await self.emit_status("Error", done=True)
                             return self._format_output()
-                        break  # continue outer loop for retryable errors
                     elif etype == "content":
                         content_chunks.append(event.get("text", ""))
                     elif etype == "tool_calls":
@@ -3390,6 +3392,10 @@ class HelixAgentEngine:
                 await self.emit_task_update(finalize_tasks=True)
                 await self.emit_status("Cancelled", done=True)
                 raise
+
+            # Skip the rest of this iteration if a retryable error was handled above
+            if retryable_error_occurred:
+                continue
 
             content = strip_thinking("".join(content_chunks).strip())
 
