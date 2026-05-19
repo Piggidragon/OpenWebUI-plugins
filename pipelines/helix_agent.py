@@ -1,7 +1,7 @@
 """
 title: Helix Agent
 author: Piggidragon
-    version: 0.25.1
+    version: 0.26.0
 description: >
   Helix Agent - OpenWebUI-native agent loop with modular per-phase tool control.
 
@@ -92,6 +92,8 @@ What to do:
 5. Call confirm_plan(tasks=["task 1", "task 2", ...], task_dependencies=[[], [], ...]) with your task list. Provide task_dependencies as a list where index i contains a list of task indices that task i depends on. For example, task_dependencies=[[], [0], [0, 1]] means: task 0 has no dependencies, task 1 depends on task 0, task 2 depends on tasks 0 and 1. Keep dependencies minimal and only introduce them where truly necessary.
 
 File paths: If the plan involves creating files, decide on a ONE project folder name (short slug based on the goal) under `[USER_HOME]/agent/`. ALL files for this task and any follow-up turns on the SAME topic must be written within that project folder. Do NOT write into the bare `[USER_HOME]/agent/` root.
+
+CRITICAL: `[USER_HOME]` is the home directory of the currently logged-in user interacting with you (e.g. `/home/u...`). It is NEVER `/root/`. Do NOT write files into `/root/` or any `/root/` subdirectory under any circumstances. Always use the actual user's home directory.
 
 Rules:
 - Focus purely on planning -- do NOT attempt to perform the task or execute actions.
@@ -264,11 +266,15 @@ What to do:
 
 File paths: If the plan involves creating files, decide on a ONE project folder name (short slug based on the goal) under `[USER_HOME]/agent/`. ALL files for this task and any follow-up turns on the SAME topic must be written within that project folder. Do NOT write into the bare `[USER_HOME]/agent/` root.
 
+CRITICAL: `[USER_HOME]` is the home directory of the currently logged-in user interacting with you. The system has resolved it to `[USER_HOME]`. It is NEVER `/root/`. Do NOT write files into `/root/` or any `/root/` subdirectory under any circumstances. Always use `[USER_HOME]` exactly.
+
 Rules:
 - Focus purely on planning -- do NOT attempt to perform the task or execute actions.
-- No tools are available in REPLAN mode. Plan ONLY from the user's message, the existing context, and the tool catalog above.
+- No tools are available in PLAN mode. Plan ONLY from the user's message and the tool catalog above.
+- If the request is simple (1-2 tasks), still list them explicitly.
+- If the request is inappropriate or impossible, call terminate with a brief explanation.
 - Use the ask_user tool ONLY if you need clarification (e.g., ambiguous request, missing details). You may ask up to 3 questions; after that you must proceed with your best plan.
-- You MUST call confirm_plan to finish REPLAN mode. Do NOT answer the user directly. Do NOT generate story text, code, or any other output. Only call tools.
+- If the user rejects your plan, revise it based on their feedback and call confirm_plan again. Do NOT repeat the same plan unchanged.
 """
 
 
@@ -522,8 +528,9 @@ class HelixAgentEngine:
                     else:
                         chunk = await iterator.__anext__()
                 except asyncio.TimeoutError:
-                    logger.error(f"SSE chunk timeout: no data for {chunk_timeout}s")
-                    yield {"type": "error", "text": f"SSE chunk timeout: no data for {chunk_timeout}s"}
+                    # Chunk timeout – treat as retryable loop-level error
+                    logger.warning(f"SSE chunk timeout: no data for {chunk_timeout}s, treating as retryable")
+                    yield {"type": "error", "text": f"SSE chunk timeout: no data for {chunk_timeout}s (retryable)", "retryable": True}
                     return
                 except StopAsyncIteration:
                     break
@@ -531,7 +538,8 @@ class HelixAgentEngine:
                     raise
                 except Exception as e:
                     logger.error(f"SSE stream error: {e}")
-                    yield {"type": "error", "text": f"SSE stream error: {e}"}
+                    # SSE stream errors are treated as retryable errors so the agent can recover
+                    yield {"type": "error", "text": f"SSE stream error: {e}", "retryable": True}
                     return
 
                 decoded = chunk.decode("utf-8") if isinstance(chunk, bytes) else chunk
@@ -1540,15 +1548,28 @@ class HelixAgentEngine:
                 "data": {"files": new_files},
             })
         truncation_limit = self._get_truncation_limit()
+        was_truncated = False
+        truncated_result = result_str
         if truncation_limit and result_str and len(result_str) > truncation_limit:
+            was_truncated = True
             await self.emit_status(
-                f"Truncated parallel call {tool_name} because result was {len(result_str)}/{truncation_limit} chars"
+                f"Truncated result for {tool_name} ({len(result_str)} -> {truncation_limit} chars)"
             )
-        truncated_result = smart_truncate(result_str, truncation_limit)
+            # Prepend a truncation notice so the model knows result is incomplete.
+            truncated_result = (
+                f"[TRUNCATED] Tool '{tool_name}' result was cut from {len(result_str)} to {truncation_limit} chars. "
+                f"If you need the full output, refine your arguments or run a more targeted query.\n\n"
+                + smart_truncate(result_str, truncation_limit)
+            )
         parsed_result = truncated_result
         if isinstance(truncated_result, str):
             try:
                 parsed_result = json.loads(truncated_result)
+                if was_truncated and isinstance(parsed_result, dict):
+                    parsed_result["__truncated"] = True
+                    parsed_result["__truncated_reason"] = (
+                        f"Result truncated from {len(result_str)} to {truncation_limit} chars"
+                    )
             except json.JSONDecodeError:
                 pass
         return {
@@ -1557,7 +1578,11 @@ class HelixAgentEngine:
         }
 
     async def _tool_run_tools_parallel(self, tool_calls: list = None, **kwargs):
-        """Execute multiple independent tool calls in parallel."""
+        """Execute multiple independent tool calls in parallel.
+
+        Partial execution: valid calls run in parallel, invalid ones
+        return errors without blocking the rest.
+        """
         if not tool_calls:
             return json.dumps({"error": "No tool_calls provided"})
         try:
@@ -1571,54 +1596,61 @@ class HelixAgentEngine:
                 "error": f"run_tools_parallel may NOT contain internal Helix tools: {', '.join(internal_in_parallel)}. These MUST be called individually, not inside a parallel batch.",
             })
 
-        missing = []
-        validation_errors = []
-        for i, c in enumerate(calls):
+        # ── pre-flight validation, preserving original order ──
+        valid_calls = []          # list of (original_index, call)
+        invalid_results = {}      # original_index -> error dict
+        for original_idx, c in enumerate(calls):
             tool_name = c["name"]
             tool_entry = self.phase_tools_dict.get(tool_name)
             if not tool_entry:
-                missing.append(tool_name)
+                available = ", ".join(sorted(self.phase_tools_dict.keys())[:20])
+                invalid_results[original_idx] = {
+                    "tool_name": tool_name,
+                    "result": f"[ERR] Tool '{tool_name}' is NOT available in phase '{self.phase}'. Available: {available}.",
+                }
                 continue
             spec = tool_entry.get("spec", {})
             errs = self._validate_tool_args(spec, c.get("args", {}))
             if errs:
-                validation_errors.append(
-                    {"index": i, "tool": tool_name, "errors": errs}
-                )
-        if missing:
-            available = ", ".join(sorted(self.phase_tools_dict.keys())[:20])
-            phase_name = self.phase
-            return json.dumps({
-                "error": f"[{phase_name}] The following tools are NOT available in this phase: {', '.join(missing)}. Available tools in this phase: {available}. Please only use tools listed for the current phase.",
-            })
-        if validation_errors:
-            error_lines = []
-            for err in validation_errors:
-                error_lines.append(f"- {err['tool']}: {', '.join(err['errors'])}")
-            return json.dumps({
-                "error": "Validation failed for one or more parallel tool calls:\n" + "\n".join(error_lines),
-            })
+                invalid_results[original_idx] = {
+                    "tool_name": tool_name,
+                    "result": f"[ERR] Validation failed for '{tool_name}': {', '.join(errs)}",
+                }
+                continue
+            valid_calls.append((original_idx, c))
 
-        names = ", ".join(c["name"] for c in calls)
+        if not valid_calls:
+            # Every call was invalid – return them in original order
+            all_invalid = [invalid_results[i] for i in sorted(invalid_results.keys())]
+            return json.dumps({"results": all_invalid}, ensure_ascii=False)
+
+        names = ", ".join(c["name"] for _, c in valid_calls)
         await self.emit_status(f"Running parallel: {names}...")
 
         tasks = [
             self._execute_parallel_single(c, f"{self.message_id or 'parallel'}_{i}")
-            for i, c in enumerate(calls)
+            for i, c in valid_calls
         ]
-        results = await asyncio.gather(*tasks, return_exceptions=True)
+        exec_results = await asyncio.gather(*tasks, return_exceptions=True)
 
-        processed = []
-        for i, res in enumerate(results):
-            if isinstance(res, Exception):
-                processed.append({
-                    "tool_name": calls[i]["name"],
-                    "result": f"Error: {res}",
-                })
+        # Merge valid results back, preserving original order
+        final_results = []
+        valid_idx = 0
+        for original_idx in range(len(calls)):
+            if original_idx in invalid_results:
+                final_results.append(invalid_results[original_idx])
             else:
-                processed.append(res)
+                res = exec_results[valid_idx]
+                if isinstance(res, Exception):
+                    final_results.append({
+                        "tool_name": valid_calls[valid_idx][1]["name"],
+                        "result": f"[ERR] Execution failed: {res}",
+                    })
+                else:
+                    final_results.append(res)
+                valid_idx += 1
 
-        return json.dumps({"results": processed}, ensure_ascii=False)
+        return json.dumps({"results": final_results}, ensure_ascii=False)
 
     def _base_theme_js(self):
         return """
@@ -2689,13 +2721,12 @@ class HelixAgentEngine:
         OpenWebUI may run as root or in a container, so ``os.path.expanduser('~')``
         often returns ``/root``.  We look at the real user record from the
         OpenWebUI ``Users`` table first.  If that doesn't yield a usable home
-        we fall back to ``getent passwd`` followed by a simple ``/home/u*``
-        heuristic that matches the ``u<alnum>`` naming convention used in this
-        environment.
+        we fall back to ``getent passwd`` followed by any directory under
+        ``/home/`` (excluding ``/home/root``).
         """
         # 1. Try the OpenWebUI user object first.
+        user_name = None
         if self.user:
-            user_name = None
             if hasattr(self.user, "name"):
                 user_name = self.user.name
             elif isinstance(self.user, dict):
@@ -2718,10 +2749,11 @@ class HelixAgentEngine:
                 except Exception:
                     pass
 
-        # 2. Fallback: look for /home/u* directories (heuristic for this env).
+        # 2. Fallback: look for any directory under /home/ that isn't /home/root.
         try:
             home_dirs = sorted(
-                [d for d in os.listdir("/home") if d.startswith("u")],
+                [d for d in os.listdir("/home")
+                 if os.path.isdir(os.path.join("/home", d)) and d != "root"],
                 key=lambda x: os.stat(os.path.join("/home", x)).st_mtime,
                 reverse=True,
             )
@@ -3323,10 +3355,21 @@ class HelixAgentEngine:
                 ):
                     etype = event.get("type")
                     if etype == "error":
-                        await self.emit_output(f"\n[ERROR] LLM Error: {event.get('text', 'Unknown')}")
-                        await self.emit_task_update(finalize_tasks=True)
-                        await self.emit_status("Error", done=True)
-                        return self._format_output()
+                        error_text = event.get("text", "Unknown")
+                        if event.get("retryable"):
+                            # Retryable stream error: feed back to the model and try again
+                            await self.emit_status(f"LLM stream recovered: {error_text[:100]}...")
+                            self.history.append({
+                                "role": "user",
+                                "content": f"SYSTEM: LLM call was interrupted by a transient error ({error_text}). The stream timed out or disconnected. Please retry your last action.",
+                            })
+                        else:
+                            # Non-retryable (budget/session exhausted) – fatal
+                            await self.emit_output(f"\n[ERROR] LLM Error: {error_text}")
+                            await self.emit_task_update(finalize_tasks=True)
+                            await self.emit_status("Error", done=True)
+                            return self._format_output()
+                        break  # continue outer loop for retryable errors
                     elif etype == "content":
                         content_chunks.append(event.get("text", ""))
                     elif etype == "tool_calls":
@@ -3437,13 +3480,19 @@ class HelixAgentEngine:
                 except json.JSONDecodeError:
                     self.consecutive_json_errors += 1
                     max_errors = self.valves.MAX_CONSECUTIVE_ERRORS
-                    should_stop = getattr(self.valves, "ENABLE_HARD_STOP_ON_ERRORS", False) and self.consecutive_json_errors >= max_errors and not self._is_yolo_mode
-                    error_detail = f"Error: Invalid JSON in tool arguments for '{tool_name}'. The arguments provided were: {raw_args}. Please ensure they are a valid JSON object with exactly the keys expected by this tool."
-                    if should_stop:
-                        await self.emit_output(f"\n[ERROR] JSON parse failed {max_errors} times. Stopping.\n")
-                        await self.emit_task_update(finalize_tasks=True)
-                        await self.emit_status("JSON error", done=True)
-                        return self._format_output()
+                    error_detail = (
+                        f"Error: Invalid JSON in tool arguments for '{tool_name}'. "
+                        f"Attempt {self.consecutive_json_errors}/{max_errors}. "
+                        f"The arguments provided were: {raw_args}. "
+                        f"Please ensure they are a valid JSON object with exactly the keys expected by this tool. "
+                        f"You MUST fix this immediately."
+                    )
+                    if self.consecutive_json_errors >= max_errors:
+                        error_detail += (
+                            " CRITICAL: This is your final warning. The next failure will force termination. "
+                            "Please correct the JSON format NOW."
+                        )
+                    await self.emit_status(f"JSON parse error ({self.consecutive_json_errors}/{max_errors}): {tool_name}")
                     args = {}
                     self.history.append({
                         "role": "tool",
@@ -3451,6 +3500,7 @@ class HelixAgentEngine:
                         "tool_call_id": call_id,
                         "name": tool_name,
                     })
+                    await self._save_state_to_file()
                     continue
 
                 if tool_name == "terminate":
@@ -3519,7 +3569,7 @@ class HelixAgentEngine:
                         await self.emit_output(f"\n[OUT] **Proceeding to output generation...**\n")
                         await self.emit_status("[OUT] Moving to output phase...")
                     else:
-                        await self.emit_output(f"\n[OUT] **Output transition failed:** {result_data.get('error', 'Unknown error')}\n")
+                        await self.emit_status(f"[OUT] Output transition failed: {result_data.get('error', 'Unknown error')[:120]}")
                     self.history.append({
                         "role": "tool",
                         "content": result_json,
@@ -3535,7 +3585,7 @@ class HelixAgentEngine:
                         await self.emit_output(f"\n[FIX] **Plan fixed:** {result_data.get('reason', '')}\n")
                         await self.emit_output(f"[FIX] Inserted tasks: {', '.join(result_data.get('inserted_tasks', []))}\n")
                     else:
-                        await self.emit_output(f"\n[FIX] **Fix failed:** {result_data.get('error', 'Unknown error')}\n")
+                        await self.emit_status(f"[FIX] Fix failed: {result_data.get('error', 'Unknown error')[:120]}")
                     self.history.append({
                         "role": "tool",
                         "content": result_json,
@@ -3553,10 +3603,19 @@ class HelixAgentEngine:
 
                     if action in ("error", "timeout"):
                         error_msg = result_data.get("error", "Plan confirmation failed.")
-                        await self.emit_output(f"\n[PLAN] **Plan confirmation error:** {error_msg}\n")
-                        await self.emit_task_update(finalize_tasks=True)
-                        await self.emit_status("Plan confirmation error", done=True)
-                        return self._format_output()
+                        # Feed error back to the model so it can self-correct instead of aborting.
+                        self.history.append({
+                            "role": "tool",
+                            "content": result_json,
+                            "tool_call_id": call_id,
+                            "name": tool_name,
+                        })
+                        self.history.append({
+                            "role": "user",
+                            "content": f"SYSTEM: Plan confirmation encountered an error ({error_msg}). Please call confirm_plan(tasks=[...]) again with a proper task list.",
+                        })
+                        await self.emit_status(f"Plan confirmation error: {error_msg[:120]}")
+                        continue
 
                     if action == "cancel":
                         await self.emit_output("\nThe plan was cancelled by the user. The agent will not proceed.\n")
@@ -3601,7 +3660,7 @@ class HelixAgentEngine:
                     result_json = await self._tool_run_tools_parallel(**args)
                     result_data = json.loads(result_json)
                     if result_data.get("error"):
-                        await self.emit_output(f"\n[ERR] **Parallel execution failed:** {result_data['error']}\n")
+                        await self.emit_status(f"Parallel execution: {result_data['error'][:200]}")
                     self.history.append({
                         "role": "tool",
                         "content": result_json,
@@ -3644,7 +3703,19 @@ class HelixAgentEngine:
                             validation_failed = True
 
                     if not validation_failed:
-                        result_str, result_files = await self._execute_tool(tool_name, args, call_id)
+                        try:
+                            result_str, result_files = await self._execute_tool(tool_name, args, call_id)
+                        except Exception as exec_err:
+                            # Unhandled exception from tool – recoverable loop-level error
+                            await self.emit_status(f"Tool error: {tool_name} threw an exception. Recovering...")
+                            self.history.append({
+                                "role": "tool",
+                                "content": f"[ERR] Tool '{tool_name}' encountered an unexpected error: {exec_err}. Please adjust your arguments and try again.",
+                                "tool_call_id": call_id,
+                                "name": tool_name,
+                            })
+                            continue
+
                         new_files = await self._append_produced_files(result_files)
                         if new_files and self.event_emitter:
                             await self.event_emitter({
@@ -3652,11 +3723,23 @@ class HelixAgentEngine:
                                 "data": {"files": new_files},
                             })
                         truncation_limit = self._get_truncation_limit()
+                        was_truncated = False
+                        original_len = len(result_str) if result_str else 0
                         if truncation_limit and result_str and len(result_str) > truncation_limit:
+                            was_truncated = True
                             await self.emit_status(
-                                f"Truncated call {tool_name} because result was {len(result_str)}/{truncation_limit} chars"
+                                f"Truncated result for {tool_name} ({original_len} -> {truncation_limit} chars)"
                             )
-                        tool_result = smart_truncate(result_str, truncation_limit)
+                            tool_result = smart_truncate(result_str, truncation_limit)
+                        else:
+                            tool_result = result_str
+
+                        if was_truncated:
+                            tool_result = (
+                                f"[TRUNCATED] Tool '{tool_name}' result was cut from {original_len} to {truncation_limit} chars. "
+                                f"If you need the full output, refine your arguments or run a more targeted query.\n\n"
+                                f"{tool_result}"
+                            )
                         self._total_tool_calls += 1
 
                         if "not found in current phase" in tool_result:
@@ -3666,17 +3749,16 @@ class HelixAgentEngine:
                             available_tools = ", ".join(sorted(self.phase_tools_dict.keys())[:30])
                             warning_msg = (
                                 f"[WARN] Tool '{tool_name}' is not available in the current phase ({self.phase}). "
-                                f"Attempt {miss_count}. Available tools: {available_tools}. "
+                                f"Attempt {miss_count}/{max_errors}. Available tools: {available_tools}. "
                                 f"Please check the tool name and use only tools listed for this phase."
                             )
-                            should_stop = getattr(self.valves, "ENABLE_HARD_STOP_ON_ERRORS", False) and miss_count >= max_errors
-                            if should_stop:
-                                await self.emit_output(f"\n[ERROR] Tool '{tool_name}' unavailable {max_errors} times. Stopping.\n")
-                                await self.emit_task_update(finalize_tasks=True)
-                                await self.emit_status("Tool unavailable", done=True)
-                                return self._format_output()
-                            # Append a strong warning that the model will see in its next turn,
-                            # replacing the generic error with a more informative one.
+                            if miss_count >= max_errors:
+                                warning_msg += (
+                                    " CRITICAL: This is your final warning for unavailable tools. "
+                                    "The next failure will force termination. Please use the correct tool name NOW."
+                                )
+                            await self.emit_status(f"Tool unavailable ({miss_count}/{max_errors}): {tool_name}")
+                            # Replace the generic error with a more informative one that the model will see in its next turn.
                             tool_result = warning_msg
                         else:
                             self._consecutive_tool_misses.clear()
