@@ -6,7 +6,7 @@ description: >
   branches, commits, and GitHub Actions workflows - directly from OpenWebUI.
   Uses the GitHub REST API with your Personal Access Token.
   Enforces a branch->file->PR workflow; no direct writes to main.
-version: 2.3.0
+version: 2.4.0
 """
 
 import base64
@@ -188,7 +188,7 @@ class Tools:
                 ensure_ascii=False,
             )
 
-    async def github_get_file(
+    async def github_read_file(
         self,
         repo: str,
         path: str,
@@ -432,7 +432,7 @@ class Tools:
         """
         Replace the ENTIRE content of a file with the provided text. Also works for creating new files.
         You MUST provide the COMPLETE file body — partial content will overwrite everything and cause data loss.
-        For small changes inside an existing file, prefer github_edit_file instead.
+        For small changes inside an existing file, prefer github_replace_string instead.
         NEVER write directly to main - always use a branch + PR workflow.
 
         :param repo: Repository 'owner/name' (e.g. 'Piggidragon/OpenWebUI-plugins')
@@ -581,7 +581,7 @@ class Tools:
 
         return "\n".join(out_lines)
 
-    async def github_edit_file(
+    async def github_replace_string(
         self,
         repo: str,
         path: str,
@@ -656,9 +656,381 @@ class Tools:
         return (
             f"**{d['content']['name']}** edited on `{branch}`\n"
             f"Replaced {replacements} occurrence(s) of {old_string[:40]!r}.\n"
+                f"Commit: {d['commit']['sha'][:7]} | {d['commit']['message']}\n"
+                f"URL: {d['content']['html_url']}"
+            )
+
+    async def github_insert_at_line(
+        self,
+        repo: str,
+        path: str,
+        branch: str,
+        line_number: int,
+        text: str,
+        message: str = "",
+        __user__: Optional[dict] = None,
+    ) -> str:
+        """
+        Insert text at a specific line number (1-based). Existing content shifts down.
+        No need to know the exact surrounding text — just the line number.
+
+        :param repo: Repository 'owner/name'
+        :param path: File path inside the repo
+        :param branch: Branch to commit to
+        :param line_number: 1-based line number where text is inserted BEFORE this line.
+                            Use 1 to insert at the top, or a number larger than total lines to append at the end.
+        :param text: Text to insert (plain string, can contain newlines)
+        :param message: Commit message (auto-generated if empty)
+        """
+        uv = self._get_valves(__user__)
+        self._guard(uv.ENABLE_CONTENT_WRITE, "Content Write")
+
+        get_url = f"https://api.github.com/repos/{repo}/contents/{path}?ref={branch}"
+        async with httpx.AsyncClient() as c:
+            r = await c.get(get_url, headers=self._auth(uv))
+            if r.status_code == 404:
+                raise ValueError(f"File '{path}' not found on branch '{branch}' in {repo}.")
+            r.raise_for_status()
+            file_data = r.json()
+            if isinstance(file_data, list):
+                raise ValueError(f"'{path}' is a directory, not a file.")
+            current_content = base64.b64decode(file_data["content"]).decode("utf-8", errors="replace")
+            sha = file_data["sha"]
+
+        lines = current_content.splitlines()
+        insert_idx = max(0, min(line_number - 1, len(lines)))
+        insert_lines = text.splitlines()
+        lines[insert_idx:insert_idx] = insert_lines
+
+        updated_content = "\n".join(lines)
+        if current_content.endswith("\n"):
+            updated_content += "\n"
+
+        if not message:
+            message = f"Insert {len(insert_lines)} line(s) at row {line_number} in {path}"
+
+        put_url = f"https://api.github.com/repos/{repo}/contents/{path}"
+        payload: dict = {
+            "message": message,
+            "content": base64.b64encode(updated_content.encode("utf-8")).decode("ascii"),
+            "sha": sha,
+            "branch": branch,
+        }
+
+        async with httpx.AsyncClient() as c:
+            r_put = await c.put(put_url, headers=self._auth(uv), json=payload)
+            r_put.raise_for_status()
+            d = r_put.json()
+
+        return (
+            f"**Inserted {len(insert_lines)} line(s) at row {line_number}** in `{branch}`\n"
             f"Commit: {d['commit']['sha'][:7]} | {d['commit']['message']}\n"
             f"URL: {d['content']['html_url']}"
         )
+
+    async def github_delete_lines(
+        self,
+        repo: str,
+        path: str,
+        branch: str,
+        start_line: int,
+        end_line: int,
+        message: str = "",
+        __user__: Optional[dict] = None,
+    ) -> str:
+        """
+        Delete a contiguous range of lines (inclusive, 1-based). The remaining content shifts up.
+
+        :param repo: Repository 'owner/name'
+        :param path: File path inside the repo
+        :param branch: Branch to commit to
+        :param start_line: First line to delete (1-based)
+        :param end_line: Last line to delete (1-based, inclusive). Must not be less than start_line.
+        :param message: Commit message (auto-generated if empty)
+        """
+        uv = self._get_valves(__user__)
+        self._guard(uv.ENABLE_CONTENT_WRITE, "Content Write")
+
+        if start_line > end_line:
+            raise ValueError("start_line must not be greater than end_line.")
+
+        get_url = f"https://api.github.com/repos/{repo}/contents/{path}?ref={branch}"
+        async with httpx.AsyncClient() as c:
+            r = await c.get(get_url, headers=self._auth(uv))
+            if r.status_code == 404:
+                raise ValueError(f"File '{path}' not found on branch '{branch}' in {repo}.")
+            r.raise_for_status()
+            file_data = r.json()
+            if isinstance(file_data, list):
+                raise ValueError(f"'{path}' is a directory, not a file.")
+            current_content = base64.b64decode(file_data["content"]).decode("utf-8", errors="replace")
+            sha = file_data["sha"]
+
+        lines = current_content.splitlines()
+        total = len(lines)
+        if start_line < 1:
+            start_line = 1
+        if end_line > total:
+            end_line = total
+        if start_line > total:
+            raise ValueError(f"start_line {start_line} exceeds total lines ({total}).")
+
+        deleted = lines[start_line - 1:end_line]
+        del lines[start_line - 1:end_line]
+
+        updated_content = "\n".join(lines)
+        if current_content.endswith("\n"):
+            updated_content += "\n"
+
+        if not message:
+            message = f"Delete lines {start_line}-{end_line} in {path}"
+
+        put_url = f"https://api.github.com/repos/{repo}/contents/{path}"
+        payload: dict = {
+            "message": message,
+            "content": base64.b64encode(updated_content.encode("utf-8")).decode("ascii"),
+            "sha": sha,
+            "branch": branch,
+        }
+
+        async with httpx.AsyncClient() as c:
+            r_put = await c.put(put_url, headers=self._auth(uv), json=payload)
+            r_put.raise_for_status()
+            d = r_put.json()
+
+        return (
+            f"**Deleted {len(deleted)} line(s) ({start_line}-{end_line})** in `{branch}`\n"
+            f"Commit: {d['commit']['sha'][:7]} | {d['commit']['message']}\n"
+            f"URL: {d['content']['html_url']}"
+        )
+
+    async def github_grep_repo(
+        self,
+        repo: str,
+        pattern: str,
+        ref: str = "main",
+        max_files: int = 50,
+        case_sensitive: bool = False,
+        __user__: Optional[dict] = None,
+    ) -> str:
+        """
+        Search inside ALL text files of a repository for an exact string pattern.
+        Unlike github_search_code (which only gives filenames), this returns line numbers + snippets.
+
+        Uses the Git tree API to find files, then reads each file and searches line-by-line.
+ Skips binary files and files >1 MB.
+
+        :param repo: Repository 'owner/name'
+        :param pattern: Exact string to search for (plain text)
+        :param ref: Branch, tag or commit SHA (default: main)
+        :param max_files: Max number of text files to search (default: 50). Keep low to avoid rate limits.
+        :param case_sensitive: Match case exactly (default: False)
+        """
+        uv = self._get_valves(__user__)
+        self._guard(uv.ENABLE_CONTENT, "Content")
+        if not pattern:
+            return "No search pattern provided."
+
+        # 1. Get full tree
+        tree_url = f"https://api.github.com/repos/{repo}/git/trees/{ref}?recursive=1"
+        async with httpx.AsyncClient() as c:
+            r = await c.get(tree_url, headers=self._auth(uv))
+            if r.status_code == 404:
+                return f"Repository or ref not found: {repo}/{ref}"
+            r.raise_for_status()
+            tree = r.json()
+
+        # 2. Filter to text blobs
+        BINARY_EXTENSIONS = frozenset([
+            "png", "jpg", "jpeg", "gif", "bmp", "svg",
+            "zip", "tar", "gz", "bz2", "7z", "rar",
+            "pdf", "doc", "docx", "xls", "xlsx", "ppt", "pptx",
+            "exe", "dll", "so", "dylib", "o", "a",
+            "mp3", "mp4", "avi", "mkv", "mov", "wav", "flac",
+            "woff", "woff2", "ttf", "otf", "eot",
+        ])
+
+        files_to_search = []
+        for item in tree.get("tree", []):
+            if item.get("type") != "blob":
+                continue
+            path = item["path"]
+            ext = path.rsplit(".", 1)[-1].lower() if "." in path else ""
+            if ext in BINARY_EXTENSIONS:
+                continue
+            size = item.get("size", 0)
+            if size > 1_000_000:
+                continue
+            files_to_search.append(path)
+            if len(files_to_search) >= max_files:
+                break
+
+        if not files_to_search:
+            return f"No searchable text files found in {repo} (searched tree)."
+
+        # 3. Search files
+        search = pattern if case_sensitive else pattern.lower()
+        results: dict[str, list[tuple[int, str]]] = {}
+
+        for fpath in files_to_search:
+            get_url = f"https://api.github.com/repos/{repo}/contents/{fpath}?ref={ref}"
+            async with httpx.AsyncClient() as c:
+                r = await c.get(get_url, headers=self._auth(uv))
+                if r.status_code != 200:
+                    continue
+                try:
+                    data = r.json()
+                    if isinstance(data, list):
+                        continue
+                    content = base64.b64decode(data["content"]).decode("utf-8", errors="replace")
+                except Exception:
+                    continue
+
+            lines = content.splitlines()
+            matches = []
+            for i, line in enumerate(lines, start=1):
+                check = line if case_sensitive else line.lower()
+                if search in check:
+                    matches.append((i, line.strip()[:200]))
+
+            if matches:
+                results[fpath] = matches
+
+        if not results:
+            return f"No matches for '{pattern}' in {repo} (searched {len(files_to_search)} files)."
+
+        out_lines = [f"Matches for '{pattern}' in **{repo}** ({len(results)} file(s)):", ""]
+        for fpath, matches in results.items():
+            out_lines.append(f"`{fpath}` — {min(len(matches), 5)} match(es) shown ({len(matches)} total):")
+            for num, text in matches[:5]:
+                out_lines.append(f"  Line {num}: `{text}`")
+            if len(matches) > 5:
+                out_lines.append(f"  ... and {len(matches) - 5} more")
+
+        return "\n".join(out_lines)
+
+    async def github_get_file_commits(
+        self,
+        repo: str,
+        path: str,
+        branch: str = "main",
+        per_page: int = 20,
+        __user__: Optional[dict] = None,
+    ) -> str:
+        """
+        List commits that touched a specific file, most recent first.
+        A lightweight alternative to `git blame` — shows WHO changed WHAT and WHEN.
+
+        :param repo: Repository 'owner/name'
+        :param path: File path inside the repo
+        :param branch: Branch name (default: main)
+        :param per_page: Number of commits (default: 20, max: 100)
+        """
+        uv = self._get_valves(__user__)
+        self._guard(uv.ENABLE_CONTENT, "Content")
+        url = f"https://api.github.com/repos/{repo}/commits?sha={branch}&path={path}&per_page={min(per_page, 100)}"
+        async with httpx.AsyncClient() as c:
+            r = await c.get(url, headers=self._auth(uv))
+            r.raise_for_status()
+            commits = r.json()
+            if not commits:
+                return f"No commits for '{path}' on {branch} in {repo}."
+            out = []
+            for c in commits:
+                sha = c["sha"][:7]
+                msg = c["commit"]["message"].split("\n")[0]
+                author = c["commit"]["author"]["name"] if c.get("commit", {}).get("author") else "N/A"
+                date = c["commit"]["author"]["date"][:10] if c.get("commit", {}).get("author") else "?"
+                out.append(f"`{sha}` **{msg}** | {author} | {date}")
+            return f"**{repo}/{path}** ({branch}) — last {len(out)} commits touching this file:\n" + "\n".join(out)
+
+    async def github_get_commit_patch(
+        self,
+        repo: str,
+        sha: str,
+        max_files: int = 5,
+        __user__: Optional[dict] = None,
+    ) -> str:
+        """
+        Get the actual diff (patch) of a commit, showing changed lines. Unlike github_get_commit
+        which only shows stats, this returns the real code diff.
+
+        :param repo: Repository 'owner/name'
+        :param sha: Commit SHA (full or short)
+        :param max_files: Maximum files to show diff for (default: 5). Keep low for large commits.
+        """
+        uv = self._get_valves(__user__)
+        self._guard(uv.ENABLE_CONTENT, "Content")
+        url = f"https://api.github.com/repos/{repo}/commits/{sha}"
+        async with httpx.AsyncClient() as c:
+            r = await c.get(url, headers=self._auth(uv))
+            r.raise_for_status()
+            data = r.json()
+
+        msg = data["commit"]["message"].split("\n")[0]
+        author = data["commit"]["author"]["name"] if data.get("commit", {}).get("author") else "N/A"
+        date = data["commit"]["author"]["date"] if data.get("commit", {}).get("author") else "?"
+
+        out_lines = [
+            f"## {sha[:7]} — {msg}",
+            f"**Author:** {author} | **Date:** {date}",
+            "",
+        ]
+
+        files = data.get("files", [])
+        shown = 0
+        for f in files[:max_files]:
+            status = f.get("status", "modified")
+            fname = f.get("filename", "?")
+            patch = f.get("patch", "")
+            if not patch:
+                out_lines.append(f"`{fname}` ({status}) — no patch available (binary or too large)\n")
+                continue
+            out_lines.append(f"### `{fname}` ({status})  +{f.get('additions', 0)} -{f.get('deletions', 0)}")
+            for line in patch.split("\n"):
+                if line.startswith("+"):
+                    out_lines.append(f"+ {line[1:]}")
+                elif line.startswith("-"):
+                    out_lines.append(f"- {line[1:]}")
+                elif line.startswith("@@"):
+                    out_lines.append(line)
+                else:
+                    out_lines.append(f"  {line}")
+                out_lines.append("")
+            shown += 1
+
+        if len(files) > max_files:
+            out_lines.append(f"*... and {len(files) - max_files} more files*")
+
+        return "\n".join(out_lines)
+
+    async def github_list_tags(
+        self,
+        repo: str,
+        per_page: int = 30,
+        __user__: Optional[dict] = None,
+    ) -> str:
+        """
+        List tags (releases) in a repository, newest first.
+
+        :param repo: Repository 'owner/name'
+        :param per_page: Number of tags (default: 30, max: 100)
+        """
+        uv = self._get_valves(__user__)
+        self._guard(uv.ENABLE_CONTENT, "Content")
+        url = f"https://api.github.com/repos/{repo}/tags?per_page={min(per_page, 100)}"
+        async with httpx.AsyncClient() as c:
+            r = await c.get(url, headers=self._auth(uv))
+            r.raise_for_status()
+            tags = r.json()
+            if not tags:
+                return f"No tags in {repo}."
+            out = []
+            for t in tags:
+                name = t.get("name", "?")
+                sha = t["commit"]["sha"][:7] if t.get("commit") else "?"
+                out.append(f"`{sha}` **{name}**")
+            return f"**{repo}** tags ({len(out)}):\n" + "\n".join(out)
 
     async def github_create_directory(
         self,

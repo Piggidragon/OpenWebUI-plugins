@@ -31,11 +31,27 @@ Format: `<type>/<short-description>` (kebab-case, max 5 words)
 
 ## 2️⃣ Editing Existing Files
 
-To edit a file, always read it first, then write the full content back:
-1. `github_get_file(repo, path, branch)` — read current content
-2. `github_write_file(repo, path, COMPLETE_content, branch)` — write entire updated file
+To edit a file, always read it first. For large files, use `limit` and `offset` to read only a slice:
+```python
+github_read_file(repo, path, branch, limit=50, offset=1)  # lines 1-50
+github_read_file(repo, path, branch, limit=20, offset=51) # lines 51-70
+```
 
-Use `github_create_file` only for files that do not yet exist. It will refuse if the file already exists.
+Then choose the right edit tool based on the change size:
+
+| Tool | When to use |
+|------|-------------|
+| `github_replace_string` | Small, targeted edits (rename variable, fix typo, change a value). Replaces an exact substring — no need to rewrite the whole file. |
+| `github_insert_at_line` | Insert new lines at a specific line number (1-based). Existing content shifts down. |
+| `github_delete_lines` | Remove a contiguous range of lines (inclusive, 1-based). |
+| `github_write_file` | Large refactors or rewrites. **MUST provide the COMPLETE file content** — partial content will overwrite everything and cause data loss. |
+
+**Rule:** Prefer `replace_string`, `insert_at_line`, or `delete_lines` whenever possible. Only use `github_write_file` when you truly need to rewrite the entire file.
+
+**Rule:** Never write directly to `main`. Every change must follow:
+```
+github_create_branch → <edit_tool> → github_create_pull_request
+```
 
 ---
 
