@@ -6,7 +6,7 @@ description: >
   branches, commits, and GitHub Actions workflows - directly from OpenWebUI.
   Uses the GitHub REST API with your Personal Access Token.
   Enforces a branch->file->PR workflow; no direct writes to main.
-version: 2.2.1
+version: 2.3.0
 """
 
 import base64
@@ -193,15 +193,23 @@ class Tools:
         repo: str,
         path: str,
         ref: str = "main",
+        limit: int = 0,
+        offset: int = 1,
         __user__: Optional[dict] = None,
         __event_emitter__: Optional[Callable[[Any], Awaitable[None]]] = None,
     ) -> str:
         """
         Read a file or directory from a GitHub repository.
+        Optionally return only a slice of lines — useful for large files.
+
+        Use `limit` and `offset` to read a specific window of lines (e.g. offset=50, limit=20
+        returns lines 50-69). Both are 1-based.
 
         :param repo: Repository as 'owner/name' (e.g. 'Piggidragon/OpenWebUI-plugins')
         :param path: File path inside the repo (e.g. 'src/main.py')
         :param ref: Branch, tag or commit SHA (default: main)
+        :param limit: Maximum number of lines to return. 0 means "return all lines from offset to end".
+        :param offset: Line number to start from, 1-based (default: 1 = first line)
         """
         uv = self._get_valves(__user__)
         self._guard(uv.ENABLE_CONTENT, "Content")
@@ -220,20 +228,33 @@ class Tools:
             content = base64.b64decode(data["content"]).decode(
                 "utf-8", errors="replace"
             )
+            lines = content.splitlines()
+            total_lines = len(lines)
+            start = max(offset - 1, 0)
+            if start >= total_lines:
+                return f"**{repo}/{path}** — requested offset {offset} exceeds total {total_lines} lines."
+            if limit > 0:
+                end = start + limit
+                sliced = lines[start:end]
+                slice_info = f" (lines {start + 1}-{min(end, total_lines)} of {total_lines})"
+            else:
+                sliced = lines[start:]
+                slice_info = f" ({total_lines} lines)" if start == 0 else f" (lines {start + 1}-{total_lines} of {total_lines})"
+            sliced_content = "\n".join(sliced)
             lang = path.rsplit(".", 1)[-1] if "." in path else ""
             if __event_emitter__:
                 await __event_emitter__(
                     {
                         "type": "citation",
                         "data": {
-                            "document": [content[:500]],
+                            "document": [sliced_content[:500]],
                             "metadata": [{"source": data["html_url"]}],
                             "source": {"name": f"{repo}/{path}"},
                         },
                     }
                 )
             return (
-                f"**{repo}/{path}** ({data['size']} bytes)\n```{lang}\n{content}\n```"
+                f"**{repo}/{path}** ({data['size']} bytes){slice_info}\n```{lang}\n{sliced_content}\n```"
             )
 
     async def github_search_code(
@@ -409,12 +430,14 @@ class Tools:
         __user__: Optional[dict] = None,
     ) -> str:
         """
-        Overwrite an existing file on a branch with new content. Also works for creating new files.
+        Replace the ENTIRE content of a file with the provided text. Also works for creating new files.
+        You MUST provide the COMPLETE file body — partial content will overwrite everything and cause data loss.
+        For small changes inside an existing file, prefer github_edit_file instead.
         NEVER write directly to main - always use a branch + PR workflow.
 
         :param repo: Repository 'owner/name' (e.g. 'Piggidragon/OpenWebUI-plugins')
         :param path: File path inside the repo (e.g. 'src/main.py')
-        :param content: The COMPLETE file content as a plain text string. You MUST provide the entire file - do NOT send only the changed parts. Partial content will replace the entire file and cause data loss.
+        :param content: The COMPLETE new file content as a plain text string. This replaces the WHOLE file.
         :param branch: Branch to write to (REQUIRED - must be a branch, never main)
         :param message: Commit message (auto-generated if empty)
         """
@@ -501,6 +524,141 @@ class Tools:
             if r.status_code == 200:
                 return r.json()["sha"]
             return None
+
+    async def github_grep_file(
+        self,
+        repo: str,
+        path: str,
+        pattern: str,
+        ref: str = "main",
+        case_sensitive: bool = False,
+        __user__: Optional[dict] = None,
+    ) -> str:
+        """
+        Search inside a single file for an exact string pattern and return matching lines with line numbers.
+
+        Unlike github_search_code, this reads the file content and searches line-by-line,
+        giving you actual line numbers and the matching text.
+
+        :param repo: Repository as 'owner/name' (e.g. 'Piggidragon/OpenWebUI-plugins')
+        :param path: File path inside the repo (e.g. 'src/main.py')
+        :param pattern: Exact string to search for (plain text, no regex)
+        :param ref: Branch, tag or commit SHA (default: main)
+        :param case_sensitive: Match case exactly (default: False)
+        """
+        uv = self._get_valves(__user__)
+        self._guard(uv.ENABLE_CONTENT, "Content")
+        if not pattern:
+            return "No search pattern provided."
+
+        url = f"https://api.github.com/repos/{repo}/contents/{path}?ref={ref}"
+        async with httpx.AsyncClient() as c:
+            r = await c.get(url, headers=self._auth(uv))
+            if r.status_code == 404:
+                return f"Not found: {repo}/{path}"
+            r.raise_for_status()
+            data = r.json()
+            if isinstance(data, list):
+                return f"'{path}' is a directory, not a file. Use github_search_code to find files."
+            content = base64.b64decode(data["content"]).decode("utf-8", errors="replace")
+
+        search = pattern if case_sensitive else pattern.lower()
+        lines = content.splitlines()
+        matches = []
+        for i, line in enumerate(lines, start=1):
+            check = line if case_sensitive else line.lower()
+            if search in check:
+                matches.append((i, line.strip()))
+        if not matches:
+            return f"No matches for '{pattern}' in {repo}/{path}"
+
+        out_lines = [f"Matches for '{pattern}' in **{repo}/{path}** ({len(matches)} total):"]
+        max_shown = 20
+        for num, text in matches[:max_shown]:
+            out_lines.append(f"  Line {num}: `{text[:200]}`")
+        if len(matches) > max_shown:
+            out_lines.append(f"  ... and {len(matches) - max_shown} more matches")
+
+        return "\n".join(out_lines)
+
+    async def github_edit_file(
+        self,
+        repo: str,
+        path: str,
+        branch: str,
+        old_string: str,
+        new_string: str,
+        message: str = "",
+        replace_all: bool = False,
+        __user__: Optional[dict] = None,
+    ) -> str:
+        """
+        SURGICAL edit: replace a specific string inside an existing file. No need to rewrite the whole file.
+
+        Unlike github_write_file, which replaces the ENTIRE file content, this tool downloads the file,
+        finds the exact `old_string`, swaps it for `new_string`, and uploads only that change.
+        Perfect for small fixes: renaming a variable, changing a value, fixing a typo, etc.
+
+        :param repo: Repository 'owner/name' (e.g. 'Piggidragon/OpenWebUI-plugins')
+        :param path: File path inside the repo (e.g. 'src/main.py')
+        :param branch: Branch to commit to (REQUIRED - must be a branch, never main)
+        :param old_string: Exact substring to find in the current file. Must match character-for-character including whitespace.
+        :param new_string: Text to replace it with.
+        :param message: Commit message (auto-generated if empty)
+        :param replace_all: If True, replaces every occurrence. If False (default), replaces only the first match.
+        """
+        uv = self._get_valves(__user__)
+        self._guard(uv.ENABLE_CONTENT_WRITE, "Content Write")
+
+        # Load current file content
+        get_url = f"https://api.github.com/repos/{repo}/contents/{path}?ref={branch}"
+        async with httpx.AsyncClient() as c:
+            r = await c.get(get_url, headers=self._auth(uv))
+            if r.status_code == 404:
+                raise ValueError(f"File '{path}' not found on branch '{branch}' in {repo}.")
+            r.raise_for_status()
+            file_data = r.json()
+            if isinstance(file_data, list):
+                raise ValueError(f"'{path}' is a directory, not a file.")
+            current_content = base64.b64decode(file_data["content"]).decode("utf-8", errors="replace")
+            sha = file_data["sha"]
+
+        occurrences = current_content.count(old_string)
+        if occurrences == 0:
+            raise ValueError(
+                f"Old string not found in {repo}/{path}. "
+                f"The file was not modified.\n\nHint: double-check exact whitespace and newlines."
+            )
+
+        if replace_all:
+            updated_content = current_content.replace(old_string, new_string)
+            replacements = occurrences
+        else:
+            updated_content = current_content.replace(old_string, new_string, 1)
+            replacements = 1
+
+        if not message:
+            message = f"Edit {path}: replace {old_string[:40]!r} with {new_string[:40]!r}"
+
+        put_url = f"https://api.github.com/repos/{repo}/contents/{path}"
+        payload: dict = {
+            "message": message,
+            "content": base64.b64encode(updated_content.encode("utf-8")).decode("ascii"),
+            "sha": sha,
+            "branch": branch,
+        }
+
+        async with httpx.AsyncClient() as c:
+            r_put = await c.put(put_url, headers=self._auth(uv), json=payload)
+            r_put.raise_for_status()
+            d = r_put.json()
+
+        return (
+            f"**{d['content']['name']}** edited on `{branch}`\n"
+            f"Replaced {replacements} occurrence(s) of {old_string[:40]!r}.\n"
+            f"Commit: {d['commit']['sha'][:7]} | {d['commit']['message']}\n"
+            f"URL: {d['content']['html_url']}"
+        )
 
     async def github_create_directory(
         self,
