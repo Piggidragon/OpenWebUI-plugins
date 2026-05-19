@@ -1,7 +1,7 @@
 """
 title: Helix Agent
 author: Piggidragon
-    version: 0.24.6
+    version: 0.25.0
 description: >
   Helix Agent - OpenWebUI-native agent loop with modular per-phase tool control.
 
@@ -33,6 +33,13 @@ description: >
   - MCP support: MCP server tools provided via __tools__ parameter
   - Skills support: resolves user skills from model metadata and injects them into the system prompt
    - Context compression: single CONTEXT_LENGTH valve (tokens) drives adaptive history and goal compression via an estimated character-to-token ratio
+
+  Safety:
+  - Session timeout: MAX_SESSION_SECONDS hard-caps overall agent runtime (default 20 min).
+  - Per-iteration timeout: MAX_ITERATION_SECONDS hard-caps a single loop iteration (default 5 min).
+  - SSE chunk timeout: SSE_CHUNK_TIMEOUT_SECONDS aborts stalled streams if no chunk arrives (default 60 s).
+  - LLM call budget: MAX_LLM_CALLS stops the agent after N generate_chat_completion calls (default 50).
+  - All timeouts are zero-able via Valves; when any budget is exhausted the session is terminated cleanly.
 requirements: open-webui>=0.9.1
 """
 
@@ -276,70 +283,6 @@ async def _parse_sse_payload(payload: str):
         yield {"type": "tool_calls", "data": tc}
 
 
-async def stream_completion(request, body, user, max_retries: int = 1):
-    """Stream OWUI completion, yielding structured events. Retries on transient errors."""
-    body["stream"] = True
-    last_error = None
-
-    for attempt in range(max_retries + 1):
-        try:
-            response = await generate_chat_completion(request, body, user=user)
-            break
-        except (ConnectionError, TimeoutError, asyncio.TimeoutError) as e:
-            last_error = e
-            if attempt < max_retries:
-                logger.warning(f"Transient API error (attempt {attempt + 1}), retrying: {e}")
-                await asyncio.sleep(2 ** attempt)
-                continue
-            logger.error(f"LLM API error after {attempt + 1} attempt(s): {e}")
-            yield {"type": "error", "text": str(e)}
-            return
-        except Exception as e:
-            logger.error(f"generate_chat_completion failed: {e}")
-            yield {"type": "error", "text": str(e)}
-            return
-
-    if hasattr(response, "body_iterator"):
-        sse_buffer = ""
-        async for chunk in response.body_iterator:
-            decoded = chunk.decode("utf-8") if isinstance(chunk, bytes) else chunk
-            sse_buffer += decoded
-
-            while "\n\n" in sse_buffer:
-                raw_event, sse_buffer = sse_buffer.split("\n\n", 1)
-                data_lines = []
-                for line in raw_event.splitlines():
-                    stripped = line.strip()
-                    if stripped.startswith("data:"):
-                        data_lines.append(stripped[5:].lstrip())
-
-                payload = "\n".join(data_lines).strip()
-                if not payload or payload == "[DONE]":
-                    continue
-
-                async for event in _parse_sse_payload(payload):
-                    yield event
-
-        # Flush remaining buffer
-        if sse_buffer.strip():
-            for line in sse_buffer.strip().splitlines():
-                stripped = line.strip()
-                if stripped.startswith("data:"):
-                    payload = stripped[5:].lstrip()
-                    if payload and payload != "[DONE]":
-                        async for event in _parse_sse_payload(payload):
-                            yield event
-
-    elif isinstance(response, dict):
-        choices = response.get("choices", [])
-        if choices:
-            msg = choices[0].get("message", {})
-            if msg.get("tool_calls"):
-                yield {"type": "tool_calls", "data": msg["tool_calls"]}
-            if msg.get("content"):
-                yield {"type": "content", "text": msg["content"]}
-
-
 def smart_truncate(text, max_chars):
     if not text or max_chars <= 0 or len(text) <= max_chars:
         return text
@@ -455,6 +398,10 @@ class HelixAgentEngine:
 
         self._incoming_tools = dict(incoming_tools) if incoming_tools else {}
 
+        # Session lifetime & API budget guards
+        self._session_start_ts = asyncio.get_event_loop().time()
+        self._llm_call_count = 0
+
         # Cache model_knowledge from workspace model metadata for native vector search
         self._model_knowledge = self._resolve_model_knowledge()
 
@@ -498,6 +445,117 @@ class HelixAgentEngine:
             filtered.append(part)
         return "".join(filtered)
 
+
+    async def _stream_completion(self, body, max_retries: int = 1, iter_deadline: float = None):
+        """Stream OWUI completion, yielding structured events. Retries on transient errors."""
+        # --- API budget guard ---
+        max_llm = getattr(self.valves, "MAX_LLM_CALLS", 50)
+        if max_llm > 0 and self._llm_call_count >= max_llm:
+            await self.emit_output(f"\n[ERROR] LLM call budget exhausted ({self._llm_call_count}/{max_llm}). Stopping.\n")
+            yield {"type": "error", "text": f"LLM call budget exhausted ({self._llm_call_count}/{max_llm})"}
+            return
+
+        # --- Iteration deadline guard (fail fast before burning an API call) ---
+        if iter_deadline and asyncio.get_event_loop().time() >= iter_deadline:
+            yield {"type": "error", "text": "Iteration deadline reached before LLM call"}
+            return
+
+        body["stream"] = True
+        last_error = None
+        self._llm_call_count += 1
+
+        for attempt in range(max_retries + 1):
+            try:
+                remaining = None
+                if iter_deadline:
+                    remaining = max(0, iter_deadline - asyncio.get_event_loop().time())
+                    if remaining <= 0:
+                        yield {"type": "error", "text": "Iteration deadline reached before LLM call"}
+                        return
+
+                if remaining:
+                    response = await asyncio.wait_for(
+                        generate_chat_completion(self.request, body, user=self.user),
+                        timeout=remaining
+                    )
+                else:
+                    response = await generate_chat_completion(self.request, body, user=self.user)
+                break
+            except (ConnectionError, TimeoutError, asyncio.TimeoutError) as e:
+                last_error = e
+                if attempt < max_retries:
+                    logger.warning(f"Transient API error (attempt {attempt + 1}), retrying: {e}")
+                    await asyncio.sleep(2 ** attempt)
+                    continue
+                logger.error(f"LLM API error after {attempt + 1} attempt(s): {e}")
+                yield {"type": "error", "text": str(e)}
+                return
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.error(f"generate_chat_completion failed: {e}")
+                yield {"type": "error", "text": str(e)}
+                return
+
+        if hasattr(response, "body_iterator"):
+            sse_buffer = ""
+            chunk_timeout = getattr(self.valves, "SSE_CHUNK_TIMEOUT_SECONDS", 60)
+            iterator = response.body_iterator
+            while True:
+                try:
+                    if chunk_timeout > 0:
+                        chunk = await asyncio.wait_for(iterator.__anext__(), timeout=chunk_timeout)
+                    else:
+                        chunk = await iterator.__anext__()
+                except asyncio.TimeoutError:
+                    logger.error(f"SSE chunk timeout: no data for {chunk_timeout}s")
+                    yield {"type": "error", "text": f"SSE chunk timeout: no data for {chunk_timeout}s"}
+                    return
+                except StopAsyncIteration:
+                    break
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    logger.error(f"SSE stream error: {e}")
+                    yield {"type": "error", "text": f"SSE stream error: {e}"}
+                    return
+
+                decoded = chunk.decode("utf-8") if isinstance(chunk, bytes) else chunk
+                sse_buffer += decoded
+
+                while "\n\n" in sse_buffer:
+                    raw_event, sse_buffer = sse_buffer.split("\n\n", 1)
+                    data_lines = []
+                    for line in raw_event.splitlines():
+                        stripped = line.strip()
+                        if stripped.startswith("data:"):
+                            data_lines.append(stripped[5:].lstrip())
+
+                    payload = "\n".join(data_lines).strip()
+                    if not payload or payload == "[DONE]":
+                        continue
+
+                    async for event in _parse_sse_payload(payload):
+                        yield event
+
+            # Flush remaining buffer
+            if sse_buffer.strip():
+                for line in sse_buffer.strip().splitlines():
+                    stripped = line.strip()
+                    if stripped.startswith("data:"):
+                        payload = stripped[5:].lstrip()
+                        if payload and payload != "[DONE]":
+                            async for event in _parse_sse_payload(payload):
+                                yield event
+
+        elif isinstance(response, dict):
+            choices = response.get("choices", [])
+            if choices:
+                msg = choices[0].get("message", {})
+                if msg.get("tool_calls"):
+                    yield {"type": "tool_calls", "data": msg["tool_calls"]}
+                if msg.get("content"):
+                    yield {"type": "content", "text": msg["content"]}
 
     async def _save_state_to_file(self, force: bool = False) -> None:
         """Serialize agent state to a JSON file and bind it to the chat DB.
@@ -589,6 +647,31 @@ class HelixAgentEngine:
                 )
         except Exception as e:
             logger.error(f"Failed to save state file: {e}")
+
+    def _check_session_timeouts(self) -> tuple[bool, str]:
+        """Return (should_stop, reason) if session or per-iteration timeout exceeded."""
+        max_session = getattr(self.valves, "MAX_SESSION_SECONDS", 1200)
+        if max_session > 0:
+            elapsed = asyncio.get_event_loop().time() - self._session_start_ts
+            if elapsed >= max_session:
+                return True, f"Session timeout ({int(elapsed)}s / {max_session}s)"
+
+        max_llm = getattr(self.valves, "MAX_LLM_CALLS", 50)
+        if max_llm > 0 and self._llm_call_count >= max_llm:
+            return True, f"LLM call budget exhausted ({self._llm_call_count} / {max_llm})"
+
+        return False, ""
+
+    async def _check_timeouts_or_abort(self) -> bool:
+        """Return True if the agent should abort now."""
+        should_stop, reason = self._check_session_timeouts()
+        if should_stop:
+            await self.emit_output(f"\n[ERROR] {reason}. Stopping immediately.\n")
+            await self.emit_task_update(finalize_tasks=True)
+            await self.emit_status(f"Stopped: {reason}", done=True)
+            logger.warning(f"Helix aborting: {reason}")
+            return True
+        return False
 
     async def _recover_state_from_files(self, body: dict) -> None:
         """Restore agent state from JSON file attachments in the chat."""
@@ -2486,6 +2569,14 @@ class HelixAgentEngine:
             logger.warning("No compression model configured; skipping compression.")
             return ""
 
+        # --- API budget + session timeout guards ---
+        max_llm = getattr(self.valves, "MAX_LLM_CALLS", 50)
+        if max_llm > 0 and self._llm_call_count >= max_llm:
+            logger.warning("Skipping compression: LLM call budget exhausted.")
+            return ""
+        if await self._check_timeouts_or_abort():
+            return ""
+
         try:
             body = {
                 **self.body,
@@ -2493,6 +2584,7 @@ class HelixAgentEngine:
                 "messages": messages,
                 "stream": False,
             }
+            self._llm_call_count += 1
             response = await generate_chat_completion(self.request, body, self.user)
             if isinstance(response, dict) and response.get("choices"):
                 raw = response["choices"][0].get("message", {}).get("content", "")
@@ -2865,6 +2957,10 @@ class HelixAgentEngine:
         self._output_parts = []
 
         while True:
+            # --- Global session guards: time budget + LLM call budget ---
+            if await self._check_timeouts_or_abort():
+                return self._format_output()
+
             effective_max = self.valves.MAX_ITERATIONS + self._extra_grace
 
             if self.phase == self.PHASE_OUTPUT:
@@ -2973,28 +3069,41 @@ class HelixAgentEngine:
             content_chunks = []
 
             max_llm_retries = getattr(self.valves, "LLM_RETRY_COUNT", 1)
-            async for event in stream_completion(self.request, completion_body, self.user, max_retries=max_llm_retries):
-                etype = event.get("type")
-                if etype == "error":
-                    await self.emit_output(f"\n[ERROR] LLM Error: {event.get('text', 'Unknown')}")
-                    await self.emit_task_update(finalize_tasks=True)
-                    await self.emit_status("Error", done=True)
-                    return self._format_output()
-                elif etype == "content":
-                    content_chunks.append(event.get("text", ""))
-                elif etype == "tool_calls":
-                    for tc in event.get("data", []):
-                        idx = tc.get("index", 0)
-                        if idx not in tc_dict:
-                            tc_dict[idx] = {
-                                "id": tc.get("id") or f"call_{uuid.uuid4().hex[:12]}",
-                                "type": "function",
-                                "function": {"name": "", "arguments": ""},
-                            }
-                        if "name" in tc.get("function", {}):
-                            tc_dict[idx]["function"]["name"] = tc["function"]["name"]
-                        if "arguments" in tc.get("function", {}):
-                            tc_dict[idx]["function"]["arguments"] += tc["function"]["arguments"]
+            max_iter_seconds = getattr(self.valves, "MAX_ITERATION_SECONDS", 300)
+            iter_deadline = None
+            if max_iter_seconds > 0:
+                iter_deadline = asyncio.get_event_loop().time() + max_iter_seconds
+
+            try:
+                async for event in self._stream_completion(
+                    completion_body, max_retries=max_llm_retries, iter_deadline=iter_deadline
+                ):
+                    etype = event.get("type")
+                    if etype == "error":
+                        await self.emit_output(f"\n[ERROR] LLM Error: {event.get('text', 'Unknown')}")
+                        await self.emit_task_update(finalize_tasks=True)
+                        await self.emit_status("Error", done=True)
+                        return self._format_output()
+                    elif etype == "content":
+                        content_chunks.append(event.get("text", ""))
+                    elif etype == "tool_calls":
+                        for tc in event.get("data", []):
+                            idx = tc.get("index", 0)
+                            if idx not in tc_dict:
+                                tc_dict[idx] = {
+                                    "id": tc.get("id") or f"call_{uuid.uuid4().hex[:12]}",
+                                    "type": "function",
+                                    "function": {"name": "", "arguments": ""},
+                                }
+                            if "name" in tc.get("function", {}):
+                                tc_dict[idx]["function"]["name"] = tc["function"]["name"]
+                            if "arguments" in tc.get("function", {}):
+                                tc_dict[idx]["function"]["arguments"] += tc["function"]["arguments"]
+            except asyncio.CancelledError:
+                await self._save_state_to_file(force=True)
+                await self.emit_task_update(finalize_tasks=True)
+                await self.emit_status("Cancelled", done=True)
+                raise
 
             content = strip_thinking("".join(content_chunks).strip())
 
@@ -3419,6 +3528,27 @@ class Pipe:
         TOOL_TIMEOUT: int = Field(
             default=90,
             description="Timeout in seconds for individual tool execution. Set to 0 to disable."
+        )
+
+        MAX_SESSION_SECONDS: int = Field(
+            default=1200,
+            ge=0,
+            description="Hard session lifetime limit in seconds. If exceeded, the agent shuts down immediately regardless of state. Default 1200 (20 min). Set to 0 to disable."
+        )
+        SSE_CHUNK_TIMEOUT_SECONDS: int = Field(
+            default=60,
+            ge=0,
+            description="Max seconds to wait for the next SSE chunk from the LLM stream. If no chunk arrives in this time, the stream is aborted. Default 60. Set to 0 to disable."
+        )
+        MAX_ITERATION_SECONDS: int = Field(
+            default=300,
+            ge=0,
+            description="Hard per-iteration timeout in seconds (one trip through the main loop). If exceeded, the agent shuts down immediately. Default 300 (5 min). Set to 0 to disable."
+        )
+        MAX_LLM_CALLS: int = Field(
+            default=50,
+            ge=0,
+            description="Absolute maximum number of LLM API calls (generate_chat_completion) allowed per session. When reached, the agent aborts. Default 50. Set to 0 to disable."
         )
 
         CONTEXT_LENGTH: int = Field(
