@@ -92,6 +92,8 @@ Pipelines are custom processing flows that run server-side in Open WebUI. Each p
 
 A single-model Plan → Execute → Review → Replan loop with per-phase tool control.
 
+⚠️ Important: Still in development. Look at the helix-agent-update branch for newest version
+
 **How it works:**
 1. **Plan** — The model creates a task list and calls `confirm_plan`.
 2. **Execute** — The model works through tasks, calling tools and marking them complete/failed.
@@ -130,27 +132,6 @@ A single-model Plan → Execute → Review → Replan loop with per-phase tool c
 |-------|---------|-------------|
 | `ENABLE_PLAN_APPROVAL` | true | Show plan confirmation popup before execution. When off, plans are auto-approved without asking the user. |
 | `YOLO_MODE` | false | Skip all user confirmations. Auto-approve plans and ignore iteration limits. |
-
----
-
-### `planner_v3.py` — Planner v3 (v3.10.3, by Haervwe)
-
-Multi-agent orchestrator with subagents, MCP support, and plan approval UI. See the [planner_v3.py](pipelines/planner_v3.py) header for full documentation.
-
----
-
-### Option A — Workspace Import (recommended)
-
-1. Open your Open WebUI Workspace
-2. Go to **Tools** → **Import Tool**
-3. Paste the raw URL to the tool file (e.g. `https://raw.githubusercontent.com/Piggidragon/OpenWebUI-plugins/main/tools/github_access.py`)
-4. Click **Import**
-
-### Option B — Manual Upload
-
-1. Download the `.py` file from this repository
-2. In Open WebUI, go to **Workspace** → **Tools** → **Create Tool**
-3. Paste the content and save
 
 ---
 
