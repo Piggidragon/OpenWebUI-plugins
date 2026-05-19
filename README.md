@@ -90,7 +90,7 @@ Pipelines are custom processing flows that run server-side in Open WebUI. Each p
 
 ---
 
-### `helix_agent.py` — Helix Agent (v0.24.2)
+### `helix_agent.py` — Helix Agent (v0.24.5)
 
 A single-model **Plan → Execute → Review → Output** loop with a **Replan** phase for course correction. Per-phase tool filtering controls which tools the LLM sees at each step.
 
@@ -100,8 +100,8 @@ A single-model **Plan → Execute → Review → Output** loop with a **Replan**
 3. **Review** — After all tasks are done, the model calls one of: `proceed_to_output()` (move to Output), `fix_plan(reason, updated_tasks)` (minor fixes), or `replan(reason)` (major rework → enters Replan phase).
 4. **Replan** — If `replan` is called, the model enters Replan mode and must call `confirm_plan` with the revised task list before returning to Execute.
 5. **Output** — Two-turn output phase:
-   - **Turn 1 (Rendering)** — The model may call rendering/visualisation tools (e.g. `display_file`) to illustrate results. No summary text yet.
-   - **Turn 2 (Final Summary)** — The model produces a structured JSON summary of what was accomplished, files created/modified, failed tasks, and overall status.
+   - **RENDER** — The model may call rendering/visualisation tools (e.g. `display_file`) to illustrate results. No summary text yet.
+   - **SUMMARY** — The model produces a structured JSON summary of what was accomplished, files created/modified, failed tasks, and overall status.
 
 **Internal control tools** (always available, phase-relevant subset shown):
 
@@ -161,11 +161,11 @@ A single-model **Plan → Execute → Review → Output** loop with a **Replan**
 | `PLAN_TOOLS` | (read-only set) | Comma-separated tools allowed in PLAN phase. Empty = all tools. |
 | `EXECUTE_TOOLS` | (broad set) | Comma-separated tools allowed in EXECUTE phase. Empty = all tools. |
 | `REVIEW_TOOLS` | (read-only + exec set) | Comma-separated tools allowed in REVIEW phase. Empty = all tools. |
-| `OUTPUT_TOOLS` | `display_file` | Comma-separated rendering/visualization tools allowed in OUTPUT phase Turn 1. Empty = none. |
+| `OUTPUT_TOOLS` | `display_file` | Comma-separated rendering/visualization tools allowed in OUTPUT phase RENDER turn. Empty = none. |
 | `PLAN_PROMPT` | (built-in) | Custom PLAN system prompt. |
 | `EXECUTE_PROMPT` | (built-in) | Custom EXECUTE system prompt. Placeholder: `{task_state}`. |
 | `REVIEW_PROMPT` | (built-in) | Custom REVIEW system prompt. Placeholders: `{goal}`, `{task_state}`. |
-| `OUTPUT_PROMPT` | (built-in) | Custom OUTPUT system prompt — Turn 1 (rendering/visualization). Placeholders: `{goal}`, `{task_state}`. |
+| `OUTPUT_PROMPT` | (built-in) | Custom OUTPUT system prompt — RENDER turn (rendering/visualization). Placeholders: `{goal}`, `{task_state}`. |
 | `ENABLE_TOOL_TRUNCATION` | true | If True, tool results are truncated to `MAX_TOOL_RESULT_CHARS`. If False, truncation is completely disabled. |
 | `MAX_TOOL_RESULT_CHARS` | 12000 | Max characters for tool results before truncation. |
 | `MAX_ATTACHMENT_SIZE_MB` | 5 | Maximum allowed size of individual attached files in MB. 0 to disable the size check. |
@@ -179,7 +179,7 @@ A single-model **Plan → Execute → Review → Output** loop with a **Replan**
 | `YOLO_MODE` | false | Skip all user confirmations. Auto-approve plans and ignore iteration limits. |
 | `ENABLE_PLAN_APPROVAL` | true | Show plan confirmation popup before execution. When off, plans are auto-approved without asking the user. |
 | `SKIP_PLAN_ON_RESUME` | true | When the previous session is finished, skip the full PLAN phase for a new user request and jump straight to Replan. Set to False to always start fresh with a full PLAN phase. |
-| `SKIP_OUTPUT_RENDERING` | true | If True, skip the OUTPUT phase Turn 1 (rendering/visualization) and go straight to the final summary Turn 2. |
+| `SKIP_OUTPUT_RENDERING` | true | If True, skip the OUTPUT phase RENDER turn (rendering/visualization) and go straight to the SUMMARY turn. |
 | `MAX_PLAN_QUESTIONS` | 3 | Maximum number of clarification questions (`ask_user`) the agent may ask per planning phase before it is forced to finalise the plan. |
 | `MAX_TOOL_RESULT_CHARS` | 12000 | Max characters for individual tool results before truncation. Set to -1 to use admin default, 0 to disable truncation entirely. |
 

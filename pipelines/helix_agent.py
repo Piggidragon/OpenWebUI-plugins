@@ -1,7 +1,7 @@
 """
 title: Helix Agent
 author: Piggidragon
-    version: 0.24.3
+    version: 0.24.6
 description: >
   Helix Agent - OpenWebUI-native agent loop with modular per-phase tool control.
 
@@ -71,31 +71,34 @@ except Exception:
     HAS_DB_PERSISTENCE = False
 
 DEFAULT_PLAN_PROMPT = """\
-You are in PLAN mode. Your job is to understand the user's request and create a clear, actionable task plan.
+You are in PLAN mode. Your job is to create a concise, actionable task plan.
+
+{loop_info}
+
+A list of all available execution tools is shown above this prompt. Use it ONLY to understand what capabilities exist — you CANNOT call any tools in PLAN mode.
 
 What to do:
-1. Analyse the user's request thoroughly.
-2. Use your available tools to understand the scope (read files, search knowledge, etc.), but do NOT perform the actual task yet (e.g., do not write files, push code, or execute actions).
-3. Create a numbered task list that covers the entire goal.
-4. Each task must be a clear, actionable step. Break complex tasks into small, verifiable steps.
-5. If the goal involves writing code or creating files, include explicit verification tasks (e.g., syntax check, lint, run a quick test).
-6. Call confirm_plan(tasks=["task 1", "task 2", ...]) with your task list.
+1. Quickly grasp the user's request. Do NOT write a long analysis or explanation.
+2. Create a numbered task list that covers the entire goal.
+3. Each task must be a clear, actionable step. Keep the total plan short (typically 3–7 tasks).
+4. If the goal involves writing code or creating files, include explicit verification tasks (e.g., syntax check, lint, run a quick test).
+5. Call confirm_plan(tasks=["task 1", "task 2", ...]) with your task list.
 
 File paths: If the plan involves creating files, decide on a ONE project folder name (short slug based on the goal) under `[USER_HOME]/agent/`. ALL files for this task and any follow-up turns on the SAME topic must be written within that project folder. Do NOT write into the bare `[USER_HOME]/agent/` root.
 
 Rules:
 - Focus purely on planning -- do NOT attempt to perform the task or execute actions.
-- You may use available tools to gather context and inspect files or code relevant to the goal.
+- No tools are available in PLAN mode. Plan ONLY from the user's message and the tool catalog above.
 - If the request is simple (1-2 tasks), still list them explicitly.
-- Use `run_tools_parallel` for multiple independent tool calls to speed up information gathering. NEVER use it for internal Helix tools (confirm_plan, ask_user, terminate, replan, fix_plan, complete_task, fail_task, proceed_to_output).
 - If the request is inappropriate or impossible, call terminate with a brief explanation.
-- If a tool returns an error during planning, note the limitation in your plan.
 - Use the ask_user tool ONLY if you need clarification (e.g., ambiguous request, missing details). You may ask up to 3 questions; after that you must proceed with your best plan.
 - If the user rejects your plan, revise it based on their feedback and call confirm_plan again. Do NOT repeat the same plan unchanged.
 """
 
 DEFAULT_EXECUTE_PROMPT = """\
 You are in EXECUTE mode. Work through tasks one at a time.
+
+{loop_info}
 
 {task_state}
 
@@ -125,6 +128,8 @@ Rules:
 DEFAULT_REVIEW_PROMPT = """\
 You are in REVIEW mode. Inspect the completed work BEFORE deciding on an action.
 
+{loop_info}
+
 Original goal: {goal}
 
 {task_state}
@@ -150,11 +155,13 @@ Rules:
 """
 
 DEFAULT_OUTPUT_PROMPT = """\
-You are in OUTPUT mode - RENDERING / VISUALISATION TURN.
-This is turn 1 of 2 in the output phase.
+You are in OUTPUT mode - RENDER TURN.
+This is the RENDER turn (1 of 2) in the output phase.
+
+{loop_info}
 
 Your ONLY job here is to call rendering or visualisation tools (e.g. display_file) if any are available and useful to illustrate the results for the user.
-Do NOT write summary text or answer the user yet. That happens in turn 2.
+Do NOT write summary text or answer the user yet. That happens in the SUMMARY turn.
 
 Goal: {goal}
 
@@ -204,8 +211,10 @@ OUTPUT_FINAL_JSON_SCHEMA = {
 }
 
 DEFAULT_OUTPUT_FINAL_PROMPT = """\
-You are in OUTPUT mode - FINAL SUMMARY PHASE.
-This is turn 2 of 2 in the output phase. You may NOT use any tools.
+You are in OUTPUT mode - SUMMARY TURN.
+This is the SUMMARY turn (2 of 2) in the output phase. You may NOT use any tools.
+
+{loop_info}
 
 Your response MUST conform to the provided JSON schema.
 Do NOT reproduce file contents, code, or large text blocks here. All results are already persisted in files. Keep the summary concise and focused.
@@ -215,6 +224,10 @@ Goal: {goal}
 
 DEFAULT_REPLAN_PROMPT = """\
 You are in REPLAN mode. A previous session completed or the approach needs to change, and a new task plan is required.
+
+{loop_info}
+
+A list of all available execution tools is shown above this prompt. Use it ONLY to understand what capabilities exist — you CANNOT call any tools in REPLAN mode.
 
 Reason for replan: {reason}
 
@@ -233,7 +246,7 @@ File paths: If the plan involves creating files, decide on a ONE project folder 
 
 Rules:
 - Focus purely on planning -- do NOT attempt to perform the task or execute actions.
-- Use `run_tools_parallel` for multiple independent tool calls to speed up information gathering. NEVER use it for internal Helix tools (confirm_plan, ask_user, terminate, replan, fix_plan, complete_task, fail_task, proceed_to_output).
+- No tools are available in REPLAN mode. Plan ONLY from the user's message, the existing context, and the tool catalog above.
 - Use the ask_user tool ONLY if you need clarification (e.g., ambiguous request, missing details). You may ask up to 3 questions; after that you must proceed with your best plan.
 - You MUST call confirm_plan to finish REPLAN mode. Do NOT answer the user directly. Do NOT generate story text, code, or any other output. Only call tools.
 """
@@ -385,11 +398,11 @@ class HelixAgentEngine:
     INTERNAL_TOOLS = {"terminate", "replan", "complete_task", "fail_task", "confirm_plan", "fix_plan", "proceed_to_output", "run_tools_parallel", "ask_user"}
 
     PHASE_INTERNAL_TOOLS = {
-        PHASE_PLAN:       {"terminate", "confirm_plan", "ask_user", "run_tools_parallel"},
+        PHASE_PLAN:       {"terminate", "confirm_plan", "ask_user"},
         PHASE_EXECUTE:    {"replan", "complete_task", "fail_task", "fix_plan", "run_tools_parallel"},
         PHASE_REVIEW:     {"proceed_to_output", "replan", "fix_plan", "run_tools_parallel"},
         PHASE_OUTPUT:     set(),
-        PHASE_REPLAN:     {"terminate", "confirm_plan", "ask_user", "run_tools_parallel"},
+        PHASE_REPLAN:     {"terminate", "confirm_plan", "ask_user"},
     }
 
     def __init__(self, request, user, body, event_emitter, event_call, metadata, valves, user_valves=None, incoming_tools=None):
@@ -433,8 +446,6 @@ class HelixAgentEngine:
         self._last_compression_loop = 0
 
         # Token tracking state
-        self._total_input_tokens = 0
-        self._total_output_tokens = 0
         self._total_tool_calls = 0
 
         # Throttling / debounce state
@@ -689,11 +700,6 @@ class HelixAgentEngine:
         """Return estimated token count of all messages in self.history."""
         return sum(self._estimate_tokens(str(m.get("content", ""))) for m in self.history)
 
-
-    def _track_tokens(self, input_tokens: int, output_tokens: int):
-        """Accumulate session-wide token usage."""
-        self._total_input_tokens += input_tokens
-        self._total_output_tokens += output_tokens
 
     def _format_token_status(self) -> str:
         """Return a concise token status string showing current context size."""
@@ -972,11 +978,7 @@ class HelixAgentEngine:
         # Determine which tool names are allowed for this phase
         allowlist: Set[str] = set()
 
-        if phase == self.PHASE_PLAN:
-            allowlist = set(_comma_list(self.valves.PLAN_TOOLS))
-        elif phase == self.PHASE_REPLAN:
-            allowlist = set(_comma_list(self.valves.PLAN_TOOLS))  # Same tools as PLAN for replan
-        elif phase == self.PHASE_EXECUTE:
+        if phase == self.PHASE_EXECUTE:
             allowlist = set(_comma_list(self.valves.EXECUTE_TOOLS))
         elif phase == self.PHASE_REVIEW:
             allowlist = set(_comma_list(self.valves.REVIEW_TOOLS))
@@ -985,6 +987,19 @@ class HelixAgentEngine:
 
         # Phase-specific internal tools (only show relevant ones per phase)
         phase_internal_tools = self.PHASE_INTERNAL_TOOLS.get(phase, self.INTERNAL_TOOLS)
+
+        # PLAN and REPLAN phases: only internal tools (no external tools)
+        if phase in (self.PHASE_PLAN, self.PHASE_REPLAN):
+            self.phase_tools_dict = {
+                name: tool for name, tool in self.all_tools_dict.items()
+                if name in phase_internal_tools
+            }
+            self.phase_tools_specs = [
+                {"type": "function", "function": t["spec"]}
+                for t in self.phase_tools_dict.values()
+                if isinstance(t, dict) and "spec" in t
+            ]
+            return
 
         # If allowlist is empty -> allow ALL tools
         # If allowlist has entries -> only those tools (plus phase-internal ones)
@@ -1025,9 +1040,7 @@ class HelixAgentEngine:
         self.task_list = []
         self.consecutive_json_errors = 0
 
-        # Reset token counters for the new plan session
-        self._total_input_tokens = 0
-        self._total_output_tokens = 0
+        # Reset counters for the new plan session
         self._total_tool_calls = 0
 
         # Transition to REPLAN phase
@@ -1316,12 +1329,8 @@ class HelixAgentEngine:
                 text: '#cdd6f4', sub: '#a6adc8', input: '#313244', inputBorder: '#45475a',
                 btn: '#313244', btnText: '#cdd6f4', btnBorder: '#45475a',
                 btnPrimary: '#E8713A', btnPrimaryText: '#ffffff',
+                muted: '#6c7086',
             };
-            try { const s = getComputedStyle(document.documentElement);
-              col.panel = s.getPropertyValue('--color-gray-900').trim() || col.panel;
-              col.text = s.getPropertyValue('--color-gray-50').trim() || col.text;
-              col.btnPrimary = s.getPropertyValue('--color-blue-500').trim() || col.btnPrimary;
-            } catch(e) {}
         """
 
     def _build_ask_user_js(self, question: str, options: list, allow_custom: bool = True) -> str:
@@ -1428,14 +1437,7 @@ class HelixAgentEngine:
           optLabel.textContent = opt;
           textBlock.appendChild(optLabel);
 
-          const check = document.createElement('span');
-          Object.assign(check.style, {{
-            flexShrink:'0',fontSize:'15px',color:col.btnPrimary,
-            opacity:'0',transition:'opacity 0.12s',display:'none',
-          }});
-          check.textContent = 'x';
-
-          btn.appendChild(keyBadge); btn.appendChild(textBlock); btn.appendChild(check);
+            btn.appendChild(keyBadge); btn.appendChild(textBlock);
 
           function applySelected(){{
             btn.style.background    = col.btnPrimary+'1c';
@@ -1451,11 +1453,13 @@ class HelixAgentEngine:
           }}
 
           btn.addEventListener('mouseenter', function(){{
-            if (btn.dataset.selected !== '1'){{
-              btn.style.background  = '#3c3c52';
-              btn.style.borderColor = col.btnPrimary+'77';
-              btn.style.transform   = 'translateY(-1px)';
-            }}
+            btn.style.background  = '#3c3c52';
+            btn.style.borderColor = col.btnPrimary+'77';
+            btn.style.transform   = 'translateY(-1px)';
+          }});
+          btn.addEventListener('mouseleave', function(){{
+            applyDeselected();
+            btn.style.transform = '';
           }});
           btn.addEventListener('mouseleave', function(){{
             if (btn.dataset.selected !== '1') applyDeselected();
@@ -1475,7 +1479,7 @@ class HelixAgentEngine:
 
           const customInput = document.createElement('input');
           customInput.type = 'text';
-          customInput.placeholder = 'Or type a custom answer...';
+          customInput.placeholder = 'Or type a custom answer\u2026';
           Object.assign(customInput.style, {{
             flex:'1',background:col.input,border:'1.5px solid '+col.inputBorder,
             borderRadius:'8px',padding:'10px 12px',color:col.text,
@@ -1501,7 +1505,7 @@ class HelixAgentEngine:
             flexShrink:'0',transition:'opacity 0.12s, transform 0.1s',
             fontFamily:'inherit',
           }});
-          sendBtn.textContent = '->';
+          sendBtn.textContent = '\u21b5';
           sendBtn.addEventListener('mouseenter', ()=>{{ sendBtn.style.transform='scale(1.08)'; }});
           sendBtn.addEventListener('mouseleave', ()=>{{ sendBtn.style.transform=''; }});
           sendBtn.addEventListener('click', ()=>{{
@@ -1555,10 +1559,21 @@ class HelixAgentEngine:
     return (function(){{
       return new Promise((resolve)=>{{
     {self._base_theme_js()}
-        let _timer;
         const OVERLAY_ID = '__owui_helix_plan__';
         const existing = document.getElementById(OVERLAY_ID);
         if (existing) existing.remove();
+
+        let _timer;
+
+        function cleanup(){{
+          panel.style.transform='scale(0.95)';
+          panel.style.opacity='0';
+          overlay.style.opacity='0';
+          setTimeout(()=>{{
+            overlay.remove();
+            document.removeEventListener('keydown',onKey);
+          }},180);
+        }}
 
         const overlay = document.createElement('div');
         overlay.id = OVERLAY_ID;
@@ -1585,13 +1600,10 @@ class HelixAgentEngine:
 
         const header = document.createElement('div');
         Object.assign(header.style, {{ display:'flex',alignItems:'flex-start',gap:'12px' }});
-        const iconBlock = document.createElement('div');
-        iconBlock.textContent = '[]';
-        Object.assign(iconBlock.style, {{ fontSize:'22px',flexShrink:'0',marginTop:'2px' }});
         const titleText = document.createElement('p');
         Object.assign(titleText.style, {{
-          margin:'0',color:col.text,fontSize:'16px',
-          fontWeight:'700',lineHeight:'1.4',flex:'1',wordBreak:'break-word',
+          margin:'0',color:col.text,fontSize:'15px',
+          fontWeight:'600',lineHeight:'1.55',flex:'1',wordBreak:'break-word',
         }});
         titleText.textContent = 'Review Proposed Plan';
         const badge = document.createElement('span');
@@ -1602,13 +1614,10 @@ class HelixAgentEngine:
           marginTop:'2px',whiteSpace:'nowrap',
         }});
         badge.textContent = 'PLAN REVIEW';
-        header.appendChild(iconBlock); header.appendChild(titleText); header.appendChild(badge);
+        header.appendChild(titleText); header.appendChild(badge);
 
-        const scrollContainer = document.createElement('div');
-        Object.assign(scrollContainer.style, {{
-          overflowY:'auto',flex:'1',display:'flex',flexDirection:'column',gap:'7px',
-          paddingRight:'4px',
-        }});
+        const optContainer = document.createElement('div');
+        Object.assign(optContainer.style, {{ display:'flex',flexDirection:'column',gap:'7px' }});
 
         const tasksData = {ts};
         tasksData.forEach((t,i)=>{{
@@ -1618,6 +1627,7 @@ class HelixAgentEngine:
               background:col.input,border:'1.5px solid '+col.inputBorder,
               borderRadius:'10px',padding:'11px 13px',
               minHeight:'48px',transition:'background 0.12s, border-color 0.12s',
+              boxSizing:'border-box',
             }});
             const num = document.createElement('span');
             Object.assign(num.style, {{
@@ -1625,11 +1635,11 @@ class HelixAgentEngine:
               borderRadius:'6px',background:col.btnPrimary,
               display:'flex',alignItems:'center',justifyContent:'center',
               fontSize:'11px',fontWeight:'700',color:col.btnPrimaryText,
-              marginTop:'2px',
+              marginTop:'2px',userSelect:'none',
             }});
             num.textContent = String(i+1);
             const content = document.createElement('div');
-            Object.assign(content.style, {{ display:'flex',flexDirection:'column',gap:'4px',flex:'1',minWidth:'0' }});
+            Object.assign(content.style, {{ display:'flex',flexDirection:'column',gap:'2px',flex:'1',minWidth:'0' }});
             const tid = document.createElement('span');
             Object.assign(tid.style, {{
               fontSize:'11px',fontWeight:'700',color:col.sub,
@@ -1643,7 +1653,7 @@ class HelixAgentEngine:
             desc.textContent = t.description;
             content.appendChild(tid); content.appendChild(desc);
             card.appendChild(num); card.appendChild(content);
-            scrollContainer.appendChild(card);
+            optContainer.appendChild(card);
         }});
 
         const inputContainer = document.createElement('div');
@@ -1660,12 +1670,12 @@ class HelixAgentEngine:
           background:col.input,border:'1.5px solid '+col.inputBorder,
           color:col.text,padding:'12px 14px',
           borderRadius:'10px',fontSize:'14px',outline:'none',
-          minHeight:'64px',resize:'none',
+          minHeight:'64px',resize:'vertical',
           fontFamily:'inherit',boxSizing:'border-box',
           transition:'border-color 0.15s',
         }});
         feedbackInput.addEventListener('focus', ()=>{{ feedbackInput.style.borderColor=col.btnPrimary; }});
-        feedbackInput.addEventListener('blur', ()=>{{ feedbackInput.style.borderColor=col.inputBorder; }});
+        feedbackInput.addEventListener('blur', ()=>{{ feedbackInput.style.borderColor=feedbackInput.value?col.btnPrimary:col.inputBorder; }});
         inputContainer.appendChild(inputLabel); inputContainer.appendChild(feedbackInput);
 
         const footer = document.createElement('div');
@@ -1677,7 +1687,7 @@ class HelixAgentEngine:
           Object.assign(b.style, {{
             padding:'10px 18px',borderRadius:'8px',
             fontSize:'13px',fontWeight:'700',
-            cursor:'pointer',fontFamily:'inherit',
+            cursor:'pointer',fontFamily:'inherit',boxSizing:'border-box',
             border:'1.5px solid '+(primary?'transparent':col.btnBorder),
             background:primary?col.btnPrimary:col.btn,
             color:primary?col.btnPrimaryText:col.btnText,
@@ -1692,20 +1702,10 @@ class HelixAgentEngine:
         const feedbackBtn = makeBtn('Send Feedback',false);
         const cancelBtn = makeBtn('Cancel',false);
         Object.assign(cancelBtn.style, {{
-          background:'#313244',color:'#f38ba8',borderColor:'#f38ba8',
+          background:col.btn,color:'#f38ba8',borderColor:'#f38ba8',
         }});
         cancelBtn.addEventListener('mouseenter', ()=>{{ cancelBtn.style.opacity='0.85'; cancelBtn.style.transform='translateY(-1px)'; }});
         cancelBtn.addEventListener('mouseleave', ()=>{{ cancelBtn.style.opacity='1'; cancelBtn.style.transform=''; }});
-
-        const cleanup = ()=>{{
-          panel.style.transform='scale(0.95)';
-          panel.style.opacity='0';
-          overlay.style.opacity='0';
-          setTimeout(()=>{{
-            overlay.remove();
-            document.removeEventListener('keydown',onKey);
-          }},180);
-        }};
 
         acceptBtn.addEventListener('click', ()=>{{ clearTimeout(_timer); cleanup(); resolve(JSON.stringify({{action:'accept'}})); }});
         feedbackBtn.addEventListener('click', ()=>{{
@@ -1729,7 +1729,7 @@ class HelixAgentEngine:
         }}
         document.addEventListener('keydown',onKey);
 
-        panel.appendChild(header); panel.appendChild(scrollContainer); panel.appendChild(inputContainer); panel.appendChild(footer); panel.appendChild(countdown);
+        panel.appendChild(header); panel.appendChild(optContainer); panel.appendChild(inputContainer); panel.appendChild(footer); panel.appendChild(countdown);
         overlay.appendChild(panel); document.body.appendChild(overlay);
         feedbackInput.focus();
 
@@ -1762,6 +1762,16 @@ class HelixAgentEngine:
         const existing = document.getElementById(OVERLAY_ID);
         if (existing) existing.remove();
 
+        function cleanup(){{
+          panel.style.transform='scale(0.95)';
+          panel.style.opacity='0';
+          overlay.style.opacity='0';
+          setTimeout(()=>{{
+            overlay.remove();
+            document.removeEventListener('keydown',onKey);
+          }},180);
+        }}
+
         const overlay = document.createElement('div');
         overlay.id = OVERLAY_ID;
         Object.assign(overlay.style, {{
@@ -1777,7 +1787,8 @@ class HelixAgentEngine:
         Object.assign(panel.style, {{
           background:col.panel,border:'1px solid '+col.border,
           borderRadius:'16px',padding:'26px 26px 20px',
-          maxWidth:'440px',width:'calc(100vw - 32px)',
+          maxWidth:'520px',width:'calc(100vw - 32px)',
+          maxHeight:'85vh',overflowY:'auto',
           boxShadow:'0 28px 80px rgba(0,0,0,0.65)',
           display:'flex',flexDirection:'column',gap:'14px',
           transform:'scale(0.92)',opacity:'0',
@@ -1786,13 +1797,10 @@ class HelixAgentEngine:
 
         const header = document.createElement('div');
         Object.assign(header.style, {{ display:'flex',alignItems:'flex-start',gap:'12px' }});
-        const iconBlock = document.createElement('div');
-        iconBlock.textContent = '!';
-        Object.assign(iconBlock.style, {{ fontSize:'22px',flexShrink:'0',marginTop:'2px' }});
         const titleText = document.createElement('p');
         Object.assign(titleText.style, {{
-          margin:'0',color:col.text,fontSize:'16px',
-          fontWeight:'700',lineHeight:'1.4',flex:'1',wordBreak:'break-word',
+          margin:'0',color:col.text,fontSize:'15px',
+          fontWeight:'600',lineHeight:'1.55',flex:'1',wordBreak:'break-word',
         }});
         titleText.textContent = 'Iteration Limit Reached';
         const badge = document.createElement('span');
@@ -1803,7 +1811,7 @@ class HelixAgentEngine:
           marginTop:'2px',whiteSpace:'nowrap',
         }});
         badge.textContent = 'LIMIT';
-        header.appendChild(iconBlock); header.appendChild(titleText); header.appendChild(badge);
+        header.appendChild(titleText); header.appendChild(badge);
 
         const msg = document.createElement('p');
         Object.assign(msg.style, {{
@@ -1820,7 +1828,7 @@ class HelixAgentEngine:
           Object.assign(b.style, {{
             padding:'10px 18px',borderRadius:'8px',
             fontSize:'13px',fontWeight:'700',
-            cursor:'pointer',fontFamily:'inherit',
+            cursor:'pointer',fontFamily:'inherit',boxSizing:'border-box',
             border:'1.5px solid '+(primary?'transparent':col.btnBorder),
             background:primary?col.btnPrimary:col.btn,
             color:primary?col.btnPrimaryText:col.btnText,
@@ -1833,19 +1841,9 @@ class HelixAgentEngine:
 
         const continueBtn = makeBtn('Continue',true);
         const stopBtn = makeBtn('Stop',false);
-        Object.assign(stopBtn.style, {{ background:'#313244',color:'#f38ba8',borderColor:'#f38ba8' }});
+        Object.assign(stopBtn.style, {{ background:col.btn,color:'#f38ba8',borderColor:'#f38ba8' }});
         stopBtn.addEventListener('mouseenter', ()=>{{ stopBtn.style.opacity='0.85'; stopBtn.style.transform='translateY(-1px)'; }});
         stopBtn.addEventListener('mouseleave', ()=>{{ stopBtn.style.opacity='1'; stopBtn.style.transform=''; }});
-
-        const cleanup = ()=>{{
-          panel.style.transform='scale(0.95)';
-          panel.style.opacity='0';
-          overlay.style.opacity='0';
-          setTimeout(()=>{{
-            overlay.remove();
-            document.removeEventListener('keydown',onKey);
-          }},180);
-        }};
 
         let _timer;
         continueBtn.addEventListener('click', ()=>{{ clearTimeout(_timer); cleanup(); resolve(JSON.stringify({{action:'continue'}})); }});
@@ -2249,32 +2247,90 @@ class HelixAgentEngine:
                 result = result.replace(placeholder, str(value))
         return result
 
+    def _build_tool_catalog(self) -> str:
+        """Generate a human-readable summary of all non-internal (external) tools.
+        
+        Used in PLAN and REPLAN phases so the model knows what capabilities
+        will be available during EXECUTE without being able to call them now.
+        """
+        lines = []
+        external_tools = {
+            name: tool for name, tool in self.all_tools_dict.items()
+            if name not in self.INTERNAL_TOOLS
+        }
+        if not external_tools:
+            return ""
+        
+        lines.append("=" * 60)
+        lines.append("Available tools during execution (for planning purposes only)")
+        lines.append("=" * 60)
+        lines.append("The following tools will be available in the EXECUTE and REVIEW phases.")
+        lines.append("You CANNOT call them now — use this list ONLY to inform your task planning.")
+        lines.append("")
+        
+        for name in sorted(external_tools.keys()):
+            tool = external_tools[name]
+            spec = tool.get("spec", {})
+            desc = spec.get("description", "No description")
+            # Clean up description: single line, max 200 chars
+            desc = desc.replace("\n", " ").replace("\r", " ")
+            desc = " ".join(desc.split())  # Collapse whitespace
+            if len(desc) > 200:
+                desc = desc[:197] + "..."
+            lines.append(f"  • {name}: {desc}")
+        
+        lines.append("")
+        lines.append("=" * 60)
+        return "\n".join(lines)
+
     def _build_system_prompt(self):
         """Build system prompt based on current phase using Valves overrides."""
         task_state = self._build_task_state()
 
+        # Build loop counter info for all phases
+        phase_name = {
+            self.PHASE_PLAN: "PLAN",
+            self.PHASE_REPLAN: "REPLAN",
+            self.PHASE_EXECUTE: "EXECUTE",
+            self.PHASE_REVIEW: "REVIEW",
+            self.PHASE_OUTPUT: "OUTPUT",
+        }.get(self.phase, "LOOP")
+
+        max_loops = getattr(self.valves, "MAX_PLAN_LOOPS", 5)
+        loop_info = f"[Agent State] Phase: {phase_name} | Loop: {self.loop_count}/{max_loops}"
+
         base = ""
         if self.phase == self.PHASE_PLAN:
+            tool_catalog = self._build_tool_catalog()
             base = self._render_prompt(
                 self.valves.PLAN_PROMPT or DEFAULT_PLAN_PROMPT,
+                loop_info=loop_info,
             )
+            if tool_catalog:
+                base = f"{tool_catalog}\n\n{base}"
         elif self.phase == self.PHASE_REPLAN:
+            tool_catalog = self._build_tool_catalog()
             base = self._render_prompt(
                 DEFAULT_REPLAN_PROMPT,
                 goal=self.goal,
                 reason=self._replan_reason,
                 task_state=task_state,
+                loop_info=loop_info,
             )
+            if tool_catalog:
+                base = f"{tool_catalog}\n\n{base}"
         elif self.phase == self.PHASE_EXECUTE:
             base = self._render_prompt(
                 self.valves.EXECUTE_PROMPT or DEFAULT_EXECUTE_PROMPT,
                 task_state=task_state,
+                loop_info=loop_info,
             )
         elif self.phase == self.PHASE_REVIEW:
             base = self._render_prompt(
                 self.valves.REVIEW_PROMPT or DEFAULT_REVIEW_PROMPT,
                 goal=self.goal,
                 task_state=task_state,
+                loop_info=loop_info,
             )
         elif self.phase == self.PHASE_OUTPUT:
             if self._output_turn >= 2:
@@ -2282,22 +2338,76 @@ class HelixAgentEngine:
                     DEFAULT_OUTPUT_FINAL_PROMPT,
                     goal=self.goal,
                     task_state=task_state,
+                    loop_info=loop_info,
                 )
             else:
                 base = self._render_prompt(
                     self.valves.OUTPUT_PROMPT or DEFAULT_OUTPUT_PROMPT,
                     goal=self.goal,
                     task_state=task_state,
+                    loop_info=loop_info,
                 )
         else:
-            base = self._render_prompt(DEFAULT_PLAN_PROMPT)
+            base = self._render_prompt(DEFAULT_PLAN_PROMPT, loop_info=loop_info)
 
-        base = base.replace("[USER_HOME]", os.path.expanduser("~"))
+        base = base.replace("[USER_HOME]", self._get_user_home())
 
         if self._skill_prompt:
             base = f"{self._skill_prompt}\n\n{base}"
         return base
 
+
+    def _get_user_home(self):
+        """Resolve the actual Linux user home directory for the OpenWebUI user.
+
+        OpenWebUI may run as root or in a container, so ``os.path.expanduser('~')``
+        often returns ``/root``.  We look at the real user record from the
+        OpenWebUI ``Users`` table first.  If that doesn't yield a usable home
+        we fall back to ``getent passwd`` followed by a simple ``/home/u*``
+        heuristic that matches the ``u<alnum>`` naming convention used in this
+        environment.
+        """
+        # 1. Try the OpenWebUI user object first.
+        if self.user:
+            user_name = None
+            if hasattr(self.user, "name"):
+                user_name = self.user.name
+            elif isinstance(self.user, dict):
+                user_name = self.user.get("name")
+
+            if user_name:
+                # getent passwd is the safest way to resolve a real home dir.
+                try:
+                    import subprocess
+                    result = subprocess.run(
+                        ["getent", "passwd", user_name],
+                        capture_output=True, text=True, timeout=5
+                    )
+                    if result.returncode == 0:
+                        parts = result.stdout.strip().split(":")
+                        if len(parts) >= 6:
+                            home = parts[5]
+                            if home and os.path.isdir(home):
+                                return home
+                except Exception:
+                    pass
+
+        # 2. Fallback: look for /home/u* directories (heuristic for this env).
+        try:
+            home_dirs = sorted(
+                [d for d in os.listdir("/home") if d.startswith("u")],
+                key=lambda x: os.stat(os.path.join("/home", x)).st_mtime,
+                reverse=True,
+            )
+            for d in home_dirs:
+                candidate = os.path.join("/home", d)
+                if os.path.isdir(candidate):
+                    return candidate
+        except Exception:
+            pass
+
+        # 3. Last resort – whatever expanduser gives us.
+        return os.path.expanduser("~")
 
     def _transition_to(self, phase):
         """Transition to a new phase: update tools, system prompt, state."""
@@ -2309,8 +2419,8 @@ class HelixAgentEngine:
             skip_rendering = getattr(self.user_valves, "SKIP_OUTPUT_RENDERING", True)
             if skip_rendering and "display_file" not in self._incoming_tools:
                 self._output_rendering_skipped = True
-                self._output_turn = 1  # Start at 1 so the first loop iteration is treated as turn 2 (final)
-                asyncio.create_task(self.emit_status("Skipping OUTPUT rendering (display_file not available)"))
+                self._output_turn = 1  # Bypass RENDER so first loop is treated as SUMMARY
+                asyncio.create_task(self.emit_status("Skipping RENDER (display_file not available)"))
         # Rebuild filtered tools for new phase
         self._filter_tools_for_phase(phase)
 
@@ -2747,8 +2857,6 @@ class HelixAgentEngine:
             self.failed_tasks = []
             self.loop_count = 0
             self._plan_questions_asked = 0
-            self._total_input_tokens = 0
-            self._total_output_tokens = 0
             self._total_tool_calls = 0
             self._filter_tools_for_phase(self.PHASE_PLAN)
             self.history = [last_user_msg_raw if last_user_msg_raw else {"role": "user", "content": user_msg}]
@@ -2768,10 +2876,10 @@ class HelixAgentEngine:
                     )
                     if not has_rendering_tools:
                         self._output_turn = 2
-                        await self.emit_status("No rendering tools configured - skipping OUTPUT turn 1")
+                        await self.emit_status("No rendering tools configured - skipping RENDER")
                 if self._output_turn > 2 and not self._is_yolo_mode:
                     await self.emit_task_update(finalize_tasks=True)
-                    await self.emit_status("Output phase exceeded max turns", done=True)
+                    await self.emit_status("Output exceeded max turns", done=True)
                     return self._format_output()
 
             if self.loop_count >= effective_max and not self._is_yolo_mode:
@@ -2816,9 +2924,12 @@ class HelixAgentEngine:
                 self.PHASE_OUTPUT: "Output",
             }
             name = phase_name.get(self.phase, "Loop")
+            if self.phase == self.PHASE_OUTPUT:
+                sub = "RENDER" if self._output_turn == 1 else ("SUMMARY" if self._output_turn == 2 else "Output")
+                name = f"{phase_name[self.PHASE_OUTPUT]} ({sub})"
 
             effective_max = self.valves.MAX_ITERATIONS + self._extra_grace
-            token_status = f", {self._format_token_status()}" if self._total_input_tokens > 0 or self._total_output_tokens > 0 else ""
+            token_status = f", {self._format_token_status()}"
             await self.emit_status(f"Mode: {name}, Loop: {self.loop_count}/{effective_max}{token_status}")
 
 
@@ -2833,13 +2944,6 @@ class HelixAgentEngine:
 
             system_prompt = self._build_system_prompt()
             call_messages = [{"role": "system", "content": system_prompt}] + [m for m in self.history if m.get("role") != "system"]
-
-            input_tokens_this_call = sum(
-                self._estimate_tokens(str(m.get("content", ""))) for m in call_messages
-            ) + sum(
-                self._estimate_tokens(json.dumps(t.get("function", {}), ensure_ascii=False)) for t in (self.phase_tools_specs or [])
-            )
-            self._track_tokens(input_tokens=input_tokens_this_call, output_tokens=0)
 
             completion_body = {
                 **self.body,
@@ -2894,35 +2998,36 @@ class HelixAgentEngine:
 
             content = strip_thinking("".join(content_chunks).strip())
 
-            output_text = content + " ".join(
-                json.dumps(tc.get("function", {}).get("arguments", ""), ensure_ascii=False)
-                for tc in tc_dict.values()
-            )
-            self._track_tokens(input_tokens=0, output_tokens=self._estimate_tokens(output_text))
-
             if not tc_dict:
                 if self.phase in (self.PHASE_PLAN, self.PHASE_REPLAN):
                     self.history.append({
                         "role": "assistant",
                         "content": content or "",
                     })
+                    urgency = ""
+                    max_plan_loops = getattr(self.valves, "MAX_PLAN_LOOPS", 5)
+                    if self.loop_count >= max_plan_loops - 1:
+                        urgency = f" URGENT: You are at loop {self.loop_count} of {max_plan_loops}. You MUST call confirm_plan NOW with your best plan. Do NOT ask more questions or produce more text."
                     self.history.append({
                         "role": "user",
-                        "content": "SYSTEM: You produced text but did not call any tools. You MUST call the confirm_plan tool with the plan to proceed. Do NOT output the plan as text-call the tool.",
+                        "content": f"SYSTEM: You produced text but did not call any tools. You MUST call the confirm_plan tool with the plan to proceed. Do NOT output the plan as text — call the tool.{urgency}",
                     })
                     await self.emit_output(f"\n[WARN] No tool call produced in {self.phase} phase. Re-prompting to enforce confirm_plan.\n")
                     continue
                 if self.phase == self.PHASE_OUTPUT:
                     if self._output_turn == 1:
-                        # Turn 1 with no tools: skip text and proceed to Turn 2
+                        # RENDER with no tools: skip text and proceed to SUMMARY
                         self.history.append({
                             "role": "assistant",
                             "content": content or "",
                         })
                         continue
                     if content:
-                        parsed = json.loads(content)
-                        summary = parsed.get("summary", "")
+                        try:
+                            parsed = json.loads(content)
+                            summary = parsed.get("summary", "")
+                        except json.JSONDecodeError:
+                            summary = ""
                         if summary:
                             await self.emit_output(summary)
                         else:
@@ -3145,9 +3250,6 @@ class HelixAgentEngine:
                     result_data = json.loads(result_json)
                     if result_data.get("error"):
                         await self.emit_output(f"\n[ERR] **Parallel execution failed:** {result_data['error']}\n")
-                    else:
-                        executed_names = [r.get("tool_name", "?") for r in result_data.get("results", [])]
-                        await self.emit_output(f"\n[PAR] **Parallel done:** {', '.join(executed_names)}\n")
                     self.history.append({
                         "role": "tool",
                         "content": result_json,
@@ -3163,8 +3265,6 @@ class HelixAgentEngine:
                     skipped = result_data.get("skipped", False)
                     if skipped:
                         await self.emit_output(f"\n[ASK] **User question skipped:** {user_response}\n")
-                    else:
-                        await self.emit_output(f"\n[ASK] **User answered:** {user_response}\n")
                     self.history.append({
                         "role": "tool",
                         "content": result_json,
@@ -3276,9 +3376,8 @@ class HelixAgentEngine:
                         self.chat_id, self.message_id, snapshot
                     )
                 )
-            total = self._total_input_tokens + self._total_output_tokens
-            if total > 0 or self._total_tool_calls > 0:
-                summary = f"\n[Session Tokens] Total: {total} | Tools: {self._total_tool_calls} | Loops: {self.loop_count}"
+            if self._total_tool_calls > 0:
+                summary = f"\n[Session Stats] Tools: {self._total_tool_calls} | Loops: {self.loop_count}"
                 await self.emit_output(summary)
                 await self.emit_status(f"Session: {self._format_token_status()}", done=True)
             self._seen_file_ids.clear()
@@ -3348,20 +3447,12 @@ class Pipe:
             description="Maximum total conversation messages retained in context. Older messages are dropped while keeping tool-call pairs intact.",
         )
 
-        PLAN_TOOLS: str = Field(
-            default=(
-                "calculate_timestamp, get_current_timestamp, get_process_status, "
-                "glob_search, grep_search, list_files, list_knowledge_bases, list_memories, "
-                "list_processes, view_skill"
-                "search_calendar_events, search_channel_messages, search_channels, search_chats, "
-                "search_knowledge_bases, search_knowledge_files, search_memories, search_notes"
-            ),
-            description=(
-                "Comma-separated tool names allowed in PLAN phase. "
-                "Leave EMPTY to allow ALL tools. "
-                "Default is a read-only / research-safe set."
-            )
+        MAX_PLAN_LOOPS: int = Field(
+            default=5,
+            ge=1,
+            description="Soft loop limit for PLAN and REPLAN phases. Displayed in system prompts so the model self-regulates. Not a hard engine limit.",
         )
+
         EXECUTE_TOOLS: str = Field(
             default=(
                 "calculate_timestamp, create_calendar_event, delete_calendar_event, "
@@ -3401,26 +3492,26 @@ class Pipe:
         OUTPUT_TOOLS: str = Field(
             default="display_file",
             description=(
-                "Comma-separated rendering/visualization tool names allowed in OUTPUT phase turn 1. "
+                "Comma-separated rendering/visualization tool names allowed in OUTPUT phase RENDER turn. "
                 "Default is display_file for rendering produced files."
             )
         )
 
         PLAN_PROMPT: str = Field(
             default=DEFAULT_PLAN_PROMPT,
-            description="System prompt for PLAN phase. Available placeholders: none."
+            description="System prompt for PLAN phase. Available placeholders: {loop_info}."
         )
         EXECUTE_PROMPT: str = Field(
             default=DEFAULT_EXECUTE_PROMPT,
-            description="System prompt for EXECUTE phase. Available placeholders: {task_state}."
+            description="System prompt for EXECUTE phase. Available placeholders: {task_state}, {loop_info}."
         )
         REVIEW_PROMPT: str = Field(
             default=DEFAULT_REVIEW_PROMPT,
-            description="System prompt for REVIEW phase. Available placeholders: {goal}, {task_state}."
+            description="System prompt for REVIEW phase. Available placeholders: {goal}, {task_state}, {loop_info}."
         )
         OUTPUT_PROMPT: str = Field(
             default=DEFAULT_OUTPUT_PROMPT,
-            description="System prompt for OUTPUT phase - Turn 1 (rendering / visualisation). Only rendering/visualisation tools are called here. Available placeholders: {goal}, {task_state}.",
+            description="System prompt for OUTPUT phase - RENDER turn. Only rendering/visualisation tools are called here. Available placeholders: {goal}, {task_state}, {loop_info}.",
         )
 
         ENABLE_TOOL_TRUNCATION: bool = Field(
@@ -3466,7 +3557,7 @@ class Pipe:
         )
         SKIP_OUTPUT_RENDERING: bool = Field(
             default=True,
-            description="If True, skip the OUTPUT phase turn 1 (rendering/visualization collection) and go straight to the final summary turn 2. Useful when no rendering/visualization tools are configured.",
+            description="If True, skip the OUTPUT phase RENDER turn (rendering/visualization collection) and go straight to the SUMMARY turn. Useful when no rendering/visualization tools are configured.",
         )
 
         MAX_PLAN_QUESTIONS: int = Field(
