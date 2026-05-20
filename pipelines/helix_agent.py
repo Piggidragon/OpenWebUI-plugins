@@ -1,7 +1,7 @@
 """
 title: Helix Agent
 author: Piggidragon
-    version: 0.27.1
+    version: 0.27.2
 description: >
   Helix Agent - OpenWebUI-native agent loop with modular per-phase tool control.
 
@@ -117,7 +117,7 @@ Actions:
 3. Include verification tasks if writing code or files.
 4. Call confirm_plan(tasks=[...], task_dependencies=[[], [0], ...]). Minimize dependencies.
 
-File paths: `/home/[USER_HOME]agent/<slug>/`. NEVER use `/root/`.
+File paths: `/home/[USER_HOME]/helix/<slug>/`. NEVER use `/root/`.
 
 These tools are available during EXECUTE only:
 {tool_info}
@@ -139,7 +139,7 @@ Actions:
 2. Create a minimal, focused plan (1–3 tasks). Keep dependencies minimal.
 3. Call confirm_plan(tasks=[...], task_dependencies=[[], [0], ...]).
 
-File paths: `/home/[USER_HOME]/agent/<slug>/`. NEVER use `/root/`.
+File paths: `/home/[USER_HOME]/helix/<slug>/`. NEVER use `/root/`.
 
 Task status markers: [done] = completed, [FAIL: reason] = failed, [blocked] = unmet dependencies, [    ] = not started.
 
@@ -168,7 +168,7 @@ Core rules:
 6. Verify code with lint/compile/test before marking complete.
 7. If minor issues, prefer fix_plan over replan. Replan only if everything is completely wrong.
 
-File paths: `/home/[USER_HOME]/agent/<slug>/`. NEVER use `/root/`.
+File paths: `/home/[USER_HOME]/helix/<slug>/`. NEVER use `/root/`.
 
 Past tasks:
 {past_tasks}
@@ -502,6 +502,7 @@ class HelixAgentEngine:
             return None
 
     def _format_output(self):
+        """Assemble final visible output for the user."""
         filtered = []
         for part in self._output_parts:
             s = part.strip()
@@ -510,20 +511,6 @@ class HelixAgentEngine:
             if "<details type=\"reasoning\">" in s:
                 continue
             if "<details type=\"tool_calls\">" in s:
-                continue
-            if s.startswith("[EXEC]"):
-                continue
-            if s.startswith("[RPLN]"):
-                continue
-            if s.startswith("[FIX]"):
-                continue
-            if s.startswith("[OK]") and "marked complete" in s:
-                continue
-            if s.startswith("[FAIL]") and "marked failed" in s:
-                continue
-            if s.startswith("[OUT]"):
-                continue
-            if s.startswith("[PLAN]"):
                 continue
             filtered.append(part)
         return "".join(filtered)
@@ -3516,11 +3503,10 @@ class HelixAgentEngine:
         await self._recover_state_from_files(self.body if isinstance(self.body, dict) else {})
 
         # --- Memory injection (once, before first plan LLM call) ---
-        if getattr(self.valves, "ENABLE_MEMORY_INJECTION", True) and not self._memory_injected:
-            self._memory_context = await self._inject_memory_context(user_msg)
-            if self._memory_context:
-                self._memory_injected = True
-                logger.info("Injected user memory context into system prompt.")
+        self._memory_context = await self._inject_memory_context(user_msg)
+        if self._memory_context:
+            self._memory_injected = True
+            logger.info("Injected user memory context into system prompt.")
 
         max_size_mb = getattr(self.valves, "MAX_ATTACHMENT_SIZE_MB", 5)
         if max_size_mb > 0 and self.request:
@@ -3645,7 +3631,7 @@ class HelixAgentEngine:
                     return self._format_output()
 
             if self.loop_count >= effective_max and not self._is_yolo_mode:
-                await self.emit_output(f"\n[WARN] Max iterations ({effective_max}) reached.")
+                await self.emit_status(f"Max iterations ({effective_max}) reached")
                 should_continue = False
                 if self.event_call and not (self.user_valves and getattr(self.user_valves, "YOLO_MODE", False)):
                     try:
@@ -3671,7 +3657,7 @@ class HelixAgentEngine:
             # --- LLM call budget guard with continue dialog ---
             max_llm = getattr(self.valves, "MAX_LLM_CALLS", 100)
             if max_llm > 0 and self._llm_call_count >= max_llm + self._extra_llm_grace and not self._is_yolo_mode:
-                await self.emit_output(f"\n[WARN] Max LLM calls ({max_llm + self._extra_llm_grace}) reached.")
+                await self.emit_status(f"Max LLM calls ({max_llm + self._extra_llm_grace}) reached")
                 should_continue = False
                 if self.event_call and not (self.user_valves and getattr(self.user_valves, "YOLO_MODE", False)):
                     try:
@@ -3735,8 +3721,7 @@ class HelixAgentEngine:
             call_messages = [{"role": "system", "content": system_prompt}] + [m for m in self.history if m.get("role") != "system"]
 
             # ── Filter pipeline (inlet) before LLM call ──
-            if getattr(self.valves, "ENABLE_FILTER_PIPELINE", True):
-                call_messages = await self._apply_filter_pipeline(call_messages, user_msg)
+            call_messages = await self._apply_filter_pipeline(call_messages, user_msg)
 
             completion_body = {
                 **self.body,
@@ -3840,7 +3825,7 @@ class HelixAgentEngine:
                         "role": "system",
                         "content": f"CRITICAL REMINDER: You are in {self.phase.upper()} mode. You MUST call one of these tools ONLY: ask_user, terminate, or confirm_plan. Any other output is rejected.{urgency}",
                     })
-                    await self.emit_output(f"\n[WARN] No tool call produced in {self.phase} phase. Re-prompting to enforce confirm_plan.\n")
+                    await self.emit_status(f"No tool call in {self.phase} phase, re-prompting")
                     continue
                 if self.phase == self.PHASE_OUTPUT:
                     if self._output_turn == 1:
@@ -3876,7 +3861,7 @@ class HelixAgentEngine:
                         "role": "user",
                         "content": "SYSTEM: You produced text but did not call any tools. In REVIEW phase you MUST call exactly one of: proceed_to_output(), fix_plan(reason, updated_tasks), or replan(reason). Do NOT output text-call the appropriate tool.",
                     })
-                    await self.emit_output(f"\n[WARN] No tool call produced in REVIEW phase. Re-prompting to enforce transition tool.\n")
+                    await self.emit_status(f"No tool call in REVIEW phase, re-prompting")
                     continue
                 if content and self.task_list and len(self.completed_tasks) < len(self.task_list):
                     # Tasks remain: inject continuation prompt instead of terminating
@@ -3888,7 +3873,7 @@ class HelixAgentEngine:
                         "role": "user",
                         "content": "SYSTEM: You produced text but did not call any tools. You have unfinished tasks. Continue working by calling the appropriate tool. Do NOT just describe what to do - call a tool.",
                     })
-                    await self.emit_output(f"\n[WARN] No tool call produced. Re-prompting to continue.\n")
+                    await self.emit_status(f"No tool call, re-prompting")
                     continue
                 if content:
                     await self.emit_output(content)
@@ -3931,7 +3916,7 @@ class HelixAgentEngine:
                     )
                     self.history.append({"role": "system", "content": reminder})
                     tool_calls_list = [chosen_tc]
-                    await self.emit_output(f"\n[WARN] EXECUTE: Only one tool per turn. Executed '{names[chosen_idx]}', dropped: {rejected_names}.\n")
+                    logger.warning(f"EXECUTE: Only one tool per turn. Executed {names[chosen_idx]}, dropped: {rejected_names}")
 
             _pending_phase_transition = None
             for tc in tool_calls_list:
@@ -3964,12 +3949,11 @@ class HelixAgentEngine:
                 if tool_name == "terminate":
                     result = args.get("result", "Task complete.")
                     success = args.get("success", True)
-                    icon = "[OK]" if success else "[FAIL]"
                     await self._save_state_to_file(force=True)
                     await self.emit_task_update(finalize_tasks=True)
                     if content:
                         await self.emit_output(content + "\n\n")
-                    await self.emit_output(f"{icon} **Finished:** {result}")
+                    await self.emit_output(f"**Finished:** {result}")
                     await self.emit_status("Finished", done=True)
                     return self._format_output()
 
@@ -3984,15 +3968,13 @@ class HelixAgentEngine:
                         "tool_call_id": call_id,
                         "name": tool_name,
                     })
-                    await self.emit_output(f"\n[RPLN] **Re-planning:** {reason}\n")
-                    await self.emit_status(f"[RPLN] Re-planning: {reason}")
+                    await self.emit_status(f"Re-planning: {reason}")
                     continue
 
                 if tool_name == "complete_task":
                     result_json = await self._tool_complete_task(**args)
                     result_data = json.loads(result_json)
-                    status_icon = "[OK]" if result_data.get("completed") else "[WARN]"
-                    await self.emit_output(f"\n{status_icon} Task {args.get('index', '?')} marked complete.\n")
+                    await self.emit_status(f"Task {args.get('index', '?')} marked complete")
                     self.history.append({
                         "role": "tool",
                         "content": result_json,
@@ -4007,8 +3989,7 @@ class HelixAgentEngine:
                 if tool_name == "fail_task":
                     result_json = await self._tool_fail_task(**args)
                     result_data = json.loads(result_json)
-                    status_icon = "[FAIL]" if result_data.get("failed") else "[WARN]"
-                    await self.emit_output(f"\n{status_icon} Task {args.get('index', '?')} marked failed: {args.get('reason', '')}\n")
+                    await self.emit_status(f"Task {args.get('index', '?')} marked failed: {args.get('reason', '')[:80]}")
                     self.history.append({
                         "role": "tool",
                         "content": result_json,
@@ -4040,10 +4021,10 @@ class HelixAgentEngine:
                     result_json = await self._tool_fix_plan(**args)
                     result_data = json.loads(result_json)
                     if result_data.get("fix_plan"):
-                        await self.emit_output(f"\n[FIX] **Plan fixed:** {result_data.get('reason', '')}\n")
-                        await self.emit_output(f"[FIX] Inserted tasks: {', '.join(result_data.get('inserted_tasks', []))}\n")
+                        await self.emit_status(f"Plan fixed: {result_data.get('reason', '')[:120]}")
+                        await self.emit_status(f"Inserted tasks: {', '.join(result_data.get('inserted_tasks', []))}")
                     else:
-                        await self.emit_status(f"[FIX] Fix failed: {result_data.get('error', 'Unknown error')[:120]}")
+                        await self.emit_status(f"Fix failed: {result_data.get('error', 'Unknown error')[:120]}")
                     self.history.append({
                         "role": "tool",
                         "content": result_json,
@@ -4093,8 +4074,7 @@ class HelixAgentEngine:
                             "role": "user",
                             "content": f"SYSTEM: User provided feedback on the proposed plan: {feedback}. Please revise the plan and call confirm_plan(tasks=[...]) again with the updated task list.",
                         })
-                        await self.emit_output(f"\n[PLAN] Plan rejected - user feedback: {feedback}\n")
-                        await self.emit_status("[PLAN] Revising plan based on feedback...")
+                        await self.emit_status(f"Plan rejected - revising based on feedback")
                         continue
 
                     tasks = args.get("tasks", [])
@@ -4118,8 +4098,7 @@ class HelixAgentEngine:
                         "tool_call_id": call_id,
                         "name": tool_name,
                     })
-                    task_summary = "\n".join(f"  {i+1}. {t}" for i, t in enumerate(self.task_list))
-                    await self.emit_output(f"\n[PLAN] Plan approved. Moving to execution.\n\n{task_summary}\n")
+                    await self.emit_status("Plan approved. Moving to execution.")
                     continue
 
                 if tool_name == "run_tools_parallel":
@@ -4141,7 +4120,7 @@ class HelixAgentEngine:
                     user_response = result_data.get("response", "")
                     skipped = result_data.get("skipped", False)
                     if skipped:
-                        await self.emit_output(f"\n[ASK] **User question skipped:** {user_response}\n")
+                        await self.emit_status(f"User question skipped: {user_response[:80]}")
                     self.history.append({
                         "role": "tool",
                         "content": result_json,
@@ -4209,13 +4188,13 @@ class HelixAgentEngine:
                         self._total_tool_calls += 1
 
                         # ── Terminal sync for file/command tools ──
-                        if getattr(self.valves, "ENABLE_TERMINAL_SYNC", True) and tool_name in (
+                        if tool_name in (
                             "display_file", "write_file", "replace_file_content", "run_command", "replace_note_content", "write_note"
                         ) and result_str:
                             await self._emit_terminal_event(tool_name, args, result_str)
 
                         # ── Citation / source events for search/fetch/kb tools ──
-                        if getattr(self.valves, "ENABLE_CITATIONS", True) and tool_name in (
+                        if tool_name in (
                             "search_web", "fetch_url", "query_knowledge_files", "view_knowledge_file", "query_knowledge_bases", "view_knowledge_bases"
                         ) and result_str:
                             await self._emit_citation_source(tool_name, args, result_str)
@@ -4467,21 +4446,9 @@ class Pipe:
             ),
         )
 
-        ENABLE_CITATIONS: bool = Field(
-            default=True,
-            description="If True, emits source/citation events after web_search, fetch_url, query_knowledge_files, and view_knowledge_file tool calls so users see clickable sources."
-        )
-        ENABLE_TERMINAL_SYNC: bool = Field(
-            default=True,
-            description="If True, emits terminal events after write_file, replace_file_content, display_file, and run_command so the OpenWebUI Terminal tab refreshes automatically."
-        )
-        ENABLE_MEMORY_INJECTION: bool = Field(
-            default=True,
-            description="If True and the OpenWebUI memory module is available, injects relevant user memories into the system prompt before the first plan."
-        )
-        ENABLE_FILTER_PIPELINE: bool = Field(
-            default=True,
-            description="If True and the OpenWebUI inlet filter is available, runs process_pipeline_inlet_filter on the chat payload before each LLM call so admin-configured security/compliance filters are honoured."
+        ENABLE_RAG_TEMPLATE: bool = Field(
+            default=False,
+            description="If True and the OpenWebUI RAG middleware is available, formats source context from tool results via apply_source_context_to_messages instead of plain-text injection."
         )
         ENABLE_RAG_TEMPLATE: bool = Field(
             default=False,
@@ -4489,7 +4456,7 @@ class Pipe:
         )
         MEMORY_QUERY_K: int = Field(
             default=3,
-            description="Number of top user memories to retrieve when ENABLE_MEMORY_INJECTION is active."
+            description="Number of top user memories to retrieve when memory injection is active."
         )
 
     class UserValves(BaseModel):
