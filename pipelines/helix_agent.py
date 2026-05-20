@@ -1,7 +1,7 @@
 """
 title: Helix Agent
 author: Piggidragon
-    version: 0.26.0
+    version: 0.26.3
 description: >
   Helix Agent - OpenWebUI-native agent loop with modular per-phase tool control.
 
@@ -78,117 +78,137 @@ except Exception:
     HAS_DB_PERSISTENCE = False
 
 DEFAULT_PLAN_PROMPT = """\
-You are in PLAN mode. Your job is to create a concise, actionable task plan.
+You are in PLAN mode. Create a concise, actionable task plan.
 
 {loop_info}
 
-A list of all available execution tools is shown above this prompt. Use it ONLY to understand what capabilities exist — you CANNOT call any tools in PLAN mode.
+Core rules:
+1. Only call ask_user (clarification), terminate (impossible/inappropriate), or confirm_plan (submit plan).
+2. No plain text, analysis, or chit-chat — call a tool or the request WILL fail.
+3. confirm_plan MUST receive a concrete list of 3–7 actionable tasks. Each task is a discrete, measurable step.
+4. "Complete the user's request" or "Do the work" are NOT valid tasks.
 
-What to do:
-1. Quickly grasp the user's request. Do NOT write a long analysis or explanation.
-2. Create a numbered task list that covers the entire goal.
-3. Each task must be a clear, actionable step. Keep the total plan short (typically 3–7 tasks).
-4. If the goal involves writing code or creating files, include explicit verification tasks (e.g., syntax check, lint, run a quick test).
-5. Call confirm_plan(tasks=["task 1", "task 2", ...], task_dependencies=[[], [], ...]) with your task list. Provide task_dependencies as a list where index i contains a list of task indices that task i depends on. For example, task_dependencies=[[], [0], [0, 1]] means: task 0 has no dependencies, task 1 depends on task 0, task 2 depends on tasks 0 and 1. Keep dependencies minimal and only introduce them where truly necessary.
+Actions:
+1. Grasp the request. Do NOT write long analysis.
+2. Create a numbered task list covering the full goal.
+3. Include verification tasks if writing code or files.
+4. Call confirm_plan(tasks=[...], task_dependencies=[[], [0], ...]). Minimize dependencies.
 
-File paths: If the plan involves creating files, decide on a ONE project folder name (short slug based on the goal) under `[USER_HOME]/agent/`. ALL files for this task and any follow-up turns on the SAME topic must be written within that project folder. Do NOT write into the bare `[USER_HOME]/agent/` root.
+File paths: `/home/[USER_HOME]agent/<slug>/`. NEVER use `/root/`.
 
-CRITICAL: `[USER_HOME]` is the home directory of the currently logged-in user interacting with you (e.g. `/home/u...`). It is NEVER `/root/`. Do NOT write files into `/root/` or any `/root/` subdirectory under any circumstances. Always use the actual user's home directory.
-
-Rules:
-- Focus purely on planning -- do NOT attempt to perform the task or execute actions.
-- No tools are available in PLAN mode. Plan ONLY from the user's message and the tool catalog above.
-- If the request is simple (1-2 tasks), still list them explicitly.
-- If the request is inappropriate or impossible, call terminate with a brief explanation.
-- Use the ask_user tool ONLY if you need clarification (e.g., ambiguous request, missing details). You may ask up to 3 questions; after that you must proceed with your best plan.
-- If the user rejects your plan, revise it based on their feedback and call confirm_plan again. Do NOT repeat the same plan unchanged.
+These tools are available during EXECUTE only:
+{tool_info}
 """
 
-DEFAULT_EXECUTE_PROMPT = """\
-You are in EXECUTE mode. Work through tasks ONE AT A TIME.
+DEFAULT_REPLAN_PROMPT = """\
+You are in REPLAN mode. A new task plan is needed.
 
 {loop_info}
 
-{task_state}
+Core rules:
+1. Only call ask_user (clarification), terminate (impossible), or confirm_plan (submit plan).
+2. No plain text, analysis, or chit-chat — call a tool or be discarded.
+3. confirm_plan MUST receive a concrete list of minimal, actionable tasks (1–3). Each task is a discrete, measurable step.
+4. "Complete the user's request" or "Do the work" are NOT valid tasks.
 
-The task list is split into THREE sections. You MUST focus exclusively on the ONE Current Task.
+Actions:
+1. Review the previous goal and current request.
+2. Create a minimal, focused plan (1–3 tasks). Keep dependencies minimal.
+3. Call confirm_plan(tasks=[...], task_dependencies=[[], [0], ...]).
 
-What to do:
-1. Read the task list above. There is exactly ONE Current Task.
-2. Execute ONLY that Current Task using the appropriate tools.
-3. Only after you have finished working on the Current Task, call complete_task(index) for it, or fail_task(index, reason) if it cannot be completed.
-4. Do NOT proceed to any task in Future Tasks until the Current Task is completed or failed.
-5. Do NOT attempt tasks marked as [blocked].
+File paths: `/home/[USER_HOME]/agent/<slug>/`. NEVER use `/root/`.
 
-File paths: All files MUST be written into the SAME project subfolder under `[USER_HOME]/agent/` (e.g. `[USER_HOME]/agent/website-redesign/`). Use a short slug based on the current task/goal. EVERY file created in this or follow-up turns for the SAME topic must go into that SAME project folder. NEVER scatter files across unrelated directories and NEVER write into the bare `[USER_HOME]/agent/` root.
+Task status markers: [done] = completed, [FAIL: reason] = failed, [blocked] = unmet dependencies, [    ] = not started.
 
-File context discipline:
-- When files are returned by tools (e.g. read_file, search_results), do NOT copy the entire contents of those files into your response or thought process. Only extract the specific information needed for the CURRENT step.
-- Only read files that are STRICTLY NECESSARY for the current task. If you need to verify one line in a file, use grep/search rather than reading the whole file.
-- Do NOT read all files in a directory just to "get context". Read only what you need.
-
-Code verification: If a task involves writing code, you MUST verify syntax before calling complete_task. Use appropriate validation tools (e.g. `python -m py_compile`, `bash -n`, `node --check`, a linter, or any available syntax-check tool). Only mark the task complete once the code passes validation or the validation failure has been documented.
-
-Rules:
-- Use `run_tools_parallel` ONLY for multiple INDEPENDENT tool calls within the SAME Current Task. NEVER use it for internal Helix tools (complete_task, fail_task, fix_plan, replan, proceed_to_output, terminate).
-- NEVER repeat identical failed tool calls (duplicate detection is active).
-- When all unblocked tasks are done, the system will move to review automatically.
-- If a tool returns an error, analyze it and retry with corrected parameters. You do NOT need to call fix_plan for trivial errors.
-- Only call fix_plan if the same task fails repeatedly (3+ attempts) or if the task design was wrong.
-- Only call replan(reason) if the overall strategy is broken and a new plan is needed.
-- You MUST call complete_task(index) or fail_task(index, reason) after working on a task.
-- NEVER call complete_task for a task you have not actually completed, and NEVER skip calling complete_task before going to the next task.
-"""
-
-DEFAULT_REVIEW_PROMPT = """\
-You are in REVIEW mode. Inspect the completed work BEFORE deciding on an action.
-
-{loop_info}
+Reason for replan: {reason}
 
 Original goal: {goal}
 
+Past tasks:
 {task_state}
 
-Task status markers: [done] = completed, [FAIL: reason] = failed with reason, [blocked] = has unmet dependencies, [    ] = not started.
-
-Review discipline:
-- Only read files that are STRICTLY NECESSARY to verify the completed tasks. If you need to verify one line, use grep/search rather than reading whole files.
-- Do NOT read all files in a directory just to "get context".
-- Do NOT copy entire file contents into your reasoning. Only extract the specific information needed for your verification.
-
-What to do:
-1. Use read-only tools (e.g. read_file, grep_search, list_files, view_knowledge_file) to verify the work. Check file contents, code correctness, and whether files exist in `[USER_HOME]/agent/<project>/`.
-2. You may run verification commands (e.g. `python -m py_compile`, linters, tests) to validate syntax or behaviour, but do NOT modify or create files during review.
-3. Once you have inspected the work, call exactly ONE of these transition tools:
-
-- `proceed_to_output()` -- Everything is done and correct. Move to the OUTPUT phase to generate the polished final answer.
-- `fix_plan(reason, tasks, task_dependencies)` -- Only minor fixes are needed. Provide just the new/corrected tasks and their dependencies.
-- `replan(reason)` -- The overall strategy is broken and tasks need to be replaced entirely.
-
-Rules:
-- ALWAYS verify before deciding. Don't guess -- read files, run checks, inspect outputs.
-- If there are only minor issues with the individual tasks, ALWAYS prefer `fix_plan` over `replan`. Only use `replan` if the overall strategy is broken.
-- Be honest -- don't call `proceed_to_output` if something is missing or wrong.
-- If the result is good enough, call `proceed_to_output`. Don't gold-plate.
-- Provide a brief reasoning for your assessment before calling the final tool.
-- You may use `run_tools_parallel` for multiple independent verification calls. NEVER use it for internal Helix tools (fix_plan, replan, proceed_to_output).
+These tools are available during EXECUTE only:
+{tool_info}
 """
+
+DEFAULT_EXECUTE_PROMPT = """\
+You are in EXECUTE mode. Complete exactly ONE task, then mark it done.
+
+{loop_info}
+
+Core rules:
+1. Execute ONLY the Current Task. Do NOT call tools for any other task.
+2. Use run_tools_parallel for multiple INDEPENDENT calls within the SAME Current Task.
+3. When the Current Task is done, call complete_task(index) or fail_task(index, reason).
+4. Do NOT read or work ahead. Do NOT call multiple separate tools sequentially.
+5. Verify code with lint/compile/test before marking complete.
+6. If minor issues, prefer fix_plan over replan. Replan only if everything is completely wrong.
+
+File paths: `/home/[USER_HOME]/agent/<slug>/`. NEVER use `/root/`.
+
+Past tasks:
+{past_tasks}
+
+Current task:
+{current_task}
+"""
+
+DEFAULT_REVIEW_PROMPT = """\
+You are in REVIEW mode. Inspect completed work BEFORE deciding.
+
+{loop_info}
+
+Task status markers: [done] = completed, [FAIL: reason] = failed, [    ] = not started.
+
+Core rules:
+1. Only read what is STRICTLY NECESSARY for verification. Use grep/search, not full file reads. Use run_command for syntax or code run checks.
+2. Do NOT copy entire file contents into reasoning.
+3. Be honest — don't call proceed_to_output if something is missing.
+4. If minor issues, prefer fix_plan over replan. Replan only if everything is completely wrong.
+
+Actions:
+1. Verify work using read-only tools (read_file, grep_search, list_files, etc.).
+2. Optionally run verification commands (linters, tests).
+3. Call exactly ONE of: proceed_to_output(), fix_plan(reason, tasks), or replan(reason).
+
+Original goal: {goal}
+
+Tasks:
+{task_state}
+"""
+
 
 DEFAULT_OUTPUT_PROMPT = """\
 You are in OUTPUT mode - RENDER TURN.
-This is the RENDER turn (1 of 2) in the output phase.
 
 {loop_info}
 
 Your ONLY job here is to call rendering or visualisation tools (e.g. display_file) if any are available and useful to illustrate the results for the user.
-Do NOT write summary text or answer the user yet. That happens in the SUMMARY turn.
+Do NOT write any plain text. Only call the appropriate tools.
 
-Goal: {goal}
+Original goal: {goal}
 
+Tasks:
 {task_state}
 
 Use `run_tools_parallel` if you are calling multiple independent rendering/visualisation tools.
 Only rendering/visualisation tools configured for the OUTPUT phase are available.
+"""
+
+DEFAULT_OUTPUT_FINAL_PROMPT = """\
+You are in OUTPUT mode - SUMMARY TURN.
+
+{loop_info}
+
+Core rules:
+1. Return ONLY a JSON object.
+2. Concise summary of the entire loop. Only write what has happened and not how. Don't go in detail.
+3. Use the provided JSON schema.
+
+Goal: {goal}
+
+Tasks:
+{task_state}
 """
 
 OUTPUT_FINAL_JSON_SCHEMA = {
@@ -229,54 +249,6 @@ OUTPUT_FINAL_JSON_SCHEMA = {
         }
     }
 }
-
-DEFAULT_OUTPUT_FINAL_PROMPT = """\
-You are in OUTPUT mode - SUMMARY TURN.
-This is the SUMMARY turn (2 of 2) in the output phase. You may NOT use any tools.
-
-{loop_info}
-
-Your response MUST conform to the provided JSON schema.
-Do NOT reproduce file contents, code, or large text blocks here. All results are already persisted in files. Keep the summary concise and focused.
-
-Goal: {goal}
-"""
-
-DEFAULT_REPLAN_PROMPT = """\
-You are in REPLAN mode. A previous session completed or the approach needs to change, and a new task plan is required.
-
-{loop_info}
-
-A list of all available execution tools is shown above this prompt. Use it ONLY to understand what capabilities exist -- you CANNOT call any tools in REPLAN mode.
-
-Reason for replan: {reason}
-
-Recent context (previous goal):
-{goal}
-
-{task_state}
-
-Task status markers: [done] = completed, [FAIL: reason] = failed with reason, [blocked] = has unmet dependencies, [    ] = not started.
-
-What to do:
-1. Review the previous goal and the current request.
-2. Create a minimal, focused task plan (1-3 tasks) that addresses the new request in the context of what was already done.
-3. If the goal involves writing code or creating files, include explicit verification tasks (e.g., syntax check, lint, run a quick test).
-4. Call confirm_plan(tasks=["task 1", "task 2", ...], task_dependencies=[[], [], ...]) with your updated task list. task_dependencies is a list where index i contains task indices that task i depends on. Use empty lists if no dependencies needed.
-
-File paths: If the plan involves creating files, decide on a ONE project folder name (short slug based on the goal) under `[USER_HOME]/agent/`. ALL files for this task and any follow-up turns on the SAME topic must be written within that project folder. Do NOT write into the bare `[USER_HOME]/agent/` root.
-
-CRITICAL: `[USER_HOME]` is the home directory of the currently logged-in user interacting with you. The system has resolved it to `[USER_HOME]`. It is NEVER `/root/`. Do NOT write files into `/root/` or any `/root/` subdirectory under any circumstances. Always use `[USER_HOME]` exactly.
-
-Rules:
-- Focus purely on planning -- do NOT attempt to perform the task or execute actions.
-- No tools are available in PLAN mode. Plan ONLY from the user's message and the tool catalog above.
-- If the request is simple (1-2 tasks), still list them explicitly.
-- If the request is inappropriate or impossible, call terminate with a brief explanation.
-- Use the ask_user tool ONLY if you need clarification (e.g., ambiguous request, missing details). You may ask up to 3 questions; after that you must proceed with your best plan.
-- If the user rejects your plan, revise it based on their feedback and call confirm_plan again. Do NOT repeat the same plan unchanged.
-"""
-
 
 async def _parse_sse_payload(payload: str):
     """Parse a single SSE data payload and yield structured events."""
@@ -394,7 +366,6 @@ class HelixAgentEngine:
         self.task_dependencies: Dict[int, List[int]] = {}
         self.produced_files = []
         self._files_lock = asyncio.Lock()
-        self._consecutive_tool_misses: Dict[str, int] = {}
         self._output_turn = 0
         self._output_rendering_skipped = False
         self._seen_file_ids: Set[str] = set()
@@ -402,9 +373,9 @@ class HelixAgentEngine:
         self.loop_count = 0
         self.goal = ""
         self._skill_prompt = ""
-        self.consecutive_json_errors = 0
         self._replan_reason = ""
         self._plan_questions_asked = 0
+        self._plan_reprompt_count = 0
         self._extra_grace = 0
         self._last_compression_loop = 0
 
@@ -460,11 +431,83 @@ class HelixAgentEngine:
                 continue
             if s.startswith("[FAIL]") and "marked failed" in s:
                 continue
+            if s.startswith("[OUT]"):
+                continue
             if s.startswith("[PLAN]"):
                 continue
             filtered.append(part)
         return "".join(filtered)
 
+    def _parse_output_json(self, text: str) -> dict | None:
+        """Robustly parse JSON from model output, handling markdown blocks and whitespace."""
+        if not text:
+            return None
+        cleaned = text.strip()
+        if cleaned.startswith("```"):
+            lines = cleaned.splitlines()
+            if lines[0].startswith("```"):
+                lines = lines[1:]
+            if lines and lines[-1].strip() == "```":
+                lines = lines[:-1]
+            cleaned = "\n".join(lines).strip()
+        try:
+            parsed = json.loads(cleaned)
+            if isinstance(parsed, dict):
+                return parsed
+        except json.JSONDecodeError:
+            pass
+        match = re.search(r'\{[\s\S]*\}', cleaned)
+        if match:
+            try:
+                parsed = json.loads(match.group(0))
+                if isinstance(parsed, dict):
+                    return parsed
+            except json.JSONDecodeError:
+                pass
+        return None
+
+    @staticmethod
+    def _render_output_markdown(data: dict) -> str:
+        """Render structured output data as a clean markdown summary."""
+        lines = []
+
+        summary = data.get("summary", "")
+        if summary:
+            lines.append(summary)
+            lines.append("")
+
+        status = data.get("status", "")
+        if status == "completed":
+            lines.append("**Status:** Completed")
+        elif status == "partial":
+            lines.append("**Status:** Partial")
+        elif status == "failed":
+            lines.append("**Status:** Failed")
+        elif status:
+            lines.append(f"**Status:** {status}")
+
+        files_created = data.get("files_created", [])
+        if files_created:
+            lines.append("")
+            lines.append("**Files created:**")
+            for f in files_created:
+                lines.append(f"- `{f}`")
+
+        files_modified = data.get("files_modified", [])
+        if files_modified:
+            lines.append("")
+            lines.append("**Files modified:**")
+            for f in files_modified:
+                lines.append(f"- `{f}`")
+
+        failed_tasks = data.get("failed_tasks", [])
+        if failed_tasks:
+            lines.append("")
+            lines.append("**Failed tasks:**")
+            for t in failed_tasks:
+                lines.append(f"- {t}")
+
+        return "\n".join(lines)
 
     async def _stream_completion(self, body, max_retries: int = 1, iter_deadline: float = None):
         """Stream OWUI completion, yielding structured events. Retries on transient errors."""
@@ -1258,7 +1301,6 @@ class HelixAgentEngine:
         self.failed_tasks = []
         self.task_list = []
         self.task_dependencies = {}
-        self.consecutive_json_errors = 0
 
         # Reset counters for the new plan session
         self._total_tool_calls = 0
@@ -1267,6 +1309,7 @@ class HelixAgentEngine:
         self._transition_to(self.PHASE_REPLAN)
         self.loop_count = 0
         self._plan_questions_asked = 0
+        self._plan_reprompt_count = 0
         self._extra_grace = 0
         await self._save_state_to_file()
         await self.emit_task_update()
@@ -1420,6 +1463,35 @@ class HelixAgentEngine:
             tasks = []
         uv = self.user_valves
 
+        # --- STRICT VALIDATION ---
+        # Reject empty or completely missing task lists
+        if not tasks:
+            return json.dumps({
+                "action": "error",
+                "error": "CRITICAL: confirm_plan was called with no tasks. You MUST provide a concrete, non-empty list of actionable tasks. Plain text or empty plans are NOT accepted. Call confirm_plan again with a valid plan."
+            })
+
+        # Reject overly generic single-task plans
+        forbidden_terms = ["complete the user", "do the work", "handle the request", "process the request", "fulfill the request", "address the request", "finish the task", "do everything", "execute all", "perform all"]
+        all_text = " ".join(str(t).lower() for t in tasks)
+        if len(tasks) == 1 and any(term in all_text for term in forbidden_terms):
+            return json.dumps({
+                "action": "error",
+                "error": f"CRITICAL: Your task plan is too generic: '{tasks[0]}'. Break the work into specific, concrete steps. Call confirm_plan again with a detailed task list."
+            })
+
+        # Warn if any individual task is very vague (3 words or less and contains forbidden keywords)
+        vague_tasks = []
+        for t in tasks:
+            words = str(t).lower().split()
+            if len(words) <= 3 and any(term in str(t).lower() for term in forbidden_terms):
+                vague_tasks.append(str(t))
+        if vague_tasks:
+            return json.dumps({
+                "action": "error",
+                "error": f"CRITICAL: Task(s) are too vague: {vague_tasks}. Each task must be a specific, measurable action step. Call confirm_plan again with concrete tasks."
+            })
+
         # Validate and store task dependencies
         raw_deps = kwargs.get("task_dependencies")
         validated_deps = self._validate_task_dependencies(raw_deps, len(tasks))
@@ -1427,6 +1499,7 @@ class HelixAgentEngine:
             return json.dumps({"action": "error", "error": "Invalid task_dependencies: out-of-range indices, self-references, or cyclic dependencies detected."})
         self.task_dependencies = validated_deps
 
+        # Proceed with existing approval / auto-accept logic
         if uv and (getattr(uv, "YOLO_MODE", False) or not getattr(uv, "ENABLE_PLAN_APPROVAL", False)):
             return json.dumps({"action": "accept", "tasks": tasks})
 
@@ -1438,7 +1511,10 @@ class HelixAgentEngine:
 
         tasks_data = [{"task_id": f"T{i+1}", "description": str(t)} for i, t in enumerate(tasks)]
         if not tasks_data:
-            tasks_data = [{"task_id": "T1", "description": "Complete the user's request"}]
+            return json.dumps({
+                "action": "error",
+                "error": "CRITICAL: No valid tasks were generated for plan approval. Call confirm_plan again with a concrete task list."
+            })
 
         timeout_s = getattr(self.valves, "PLAN_APPROVAL_TIMEOUT", 600)
         js = self._build_plan_approval_js(tasks_data, timeout_s=timeout_s)
@@ -2255,62 +2331,57 @@ class HelixAgentEngine:
             except Exception:
                 pass
 
-    def _build_task_state(self):
+    def _build_past_tasks(self):
         lines = []
-        blocked = self._compute_blocked_tasks()
         failed_set = {i for i, task in enumerate(self.task_list) if any(f["task"] == task for f in self.failed_tasks)}
-        current_idx = self._get_current_task_index()
-
-        completed = []
-        current = None
-        future = []
-
         for i, task in enumerate(self.task_list):
             if task in self.completed_tasks:
-                completed.append((i, task))
+                lines.append(f"  [{i}] {task}")
             elif i in failed_set:
                 reason = next((f["reason"] for f in self.failed_tasks if f["task"] == task), "")
-                completed.append((i, task, reason))
-            elif i == current_idx:
-                current = (i, task)
-            else:
-                if i in blocked:
-                    deps = self.task_dependencies.get(i, [])
-                    dep_str = ", ".join(str(d) for d in deps)
-                    future.append((i, task, f"blocked: needs task(s) {dep_str}"))
+                lines.append(f"  [{i}] {task} [FAIL: {reason}]")
+        return "\n".join(lines) if lines else "(none)"
+
+    def _build_current_task(self):
+        current_idx = self._get_current_task_index()
+        if current_idx is not None and 0 <= current_idx < len(self.task_list):
+            return f"  [{current_idx}] {self.task_list[current_idx]}"
+        return "(none)"
+
+    def _build_future_tasks(self):
+        lines = []
+        completed_set = self.completed_tasks
+        failed_names = {f["task"] for f in self.failed_tasks}
+        for i, task in enumerate(self.task_list):
+            if task not in completed_set and task not in failed_names and i != self._get_current_task_index():
+                # Blocked check
+                deps = self.task_dependencies.get(i, [])
+                blocked = False
+                for dep in deps:
+                    if dep < len(self.task_list) and self.task_list[dep] not in completed_set:
+                        blocked = True
+                        break
+                if blocked:
+                    lines.append(f"  [{i}] {task} [blocked]")
                 else:
-                    future.append((i, task, None))
+                    lines.append(f"  [{i}] {task}")
+        return "\n".join(lines) if lines else "(none)"
 
-        if completed:
-            lines.append("Completed Tasks:")
-            for item in completed:
-                if len(item) == 3:
-                    i, task, reason = item
-                    lines.append(f"  [FAIL: {reason}] {i}: {task}")
-                else:
-                    i, task = item
-                    lines.append(f"  [done] {i}: {task}")
-            lines.append("")
+    def _build_task_state(self):
+        lines = []
+        past = self._build_past_tasks()
+        current = self._build_current_task()
+        future = self._build_future_tasks()
 
-        if current:
-            i, task = current
-            lines.append("Current Task (ACTIVE - work ONLY on this one):")
-            lines.append(f"  [ACTIVE] {i}: {task}")
-            lines.append("")
-
-        if future:
-            lines.append("Future Tasks (do NOT start these yet):")
-            for item in future:
-                i, task, extra = item
-                if extra:
-                    lines.append(f"  [{extra}] {i}: {task}")
-                else:
-                    lines.append(f"  [pending] {i}: {task}")
-            lines.append("")
-
-        if current_idx is None and not future:
-            lines.append("All unblocked tasks are complete.")
-
+        lines.append("COMPLETED / DONE:")
+        lines.append(past)
+        lines.append("")
+        lines.append("CURRENT:")
+        lines.append(current)
+        lines.append("")
+        lines.append("FUTURE:")
+        lines.append(future)
+        lines.append("")
         lines.append(f"Completed: {len(self.completed_tasks)}/{len(self.task_list)}")
         return "\n".join(lines)
 
@@ -2606,39 +2677,27 @@ class HelixAgentEngine:
         return result
 
     def _build_tool_catalog(self) -> str:
-        """Generate a human-readable summary of all non-internal (external) tools.
-        
-        Used in PLAN and REPLAN phases so the model knows what capabilities
-        will be available during EXECUTE without being able to call them now.
+        """Generate a plain list of all non-internal (external) tools.
+
+        Returns a simple bullet list — no headers, no intros.
         """
-        lines = []
         external_tools = {
             name: tool for name, tool in self.all_tools_dict.items()
             if name not in self.INTERNAL_TOOLS
         }
         if not external_tools:
-            return ""
-        
-        lines.append("=" * 60)
-        lines.append("Available tools during execution (for planning purposes only)")
-        lines.append("=" * 60)
-        lines.append("The following tools will be available in the EXECUTE and REVIEW phases.")
-        lines.append("You CANNOT call them now — use this list ONLY to inform your task planning.")
-        lines.append("")
-        
+            return "(none)"
+
+        lines = []
         for name in sorted(external_tools.keys()):
             tool = external_tools[name]
             spec = tool.get("spec", {})
             desc = spec.get("description", "No description")
-            # Clean up description: single line, max 200 chars
             desc = desc.replace("\n", " ").replace("\r", " ")
-            desc = " ".join(desc.split())  # Collapse whitespace
+            desc = " ".join(desc.split())
             if len(desc) > 200:
                 desc = desc[:197] + "..."
             lines.append(f"  • {name}: {desc}")
-        
-        lines.append("")
-        lines.append("=" * 60)
         return "\n".join(lines)
 
     def _build_system_prompt(self):
@@ -2678,9 +2737,14 @@ class HelixAgentEngine:
             if tool_catalog:
                 base = f"{tool_catalog}\n\n{base}"
         elif self.phase == self.PHASE_EXECUTE:
+            past_tasks = self._build_past_tasks()
+            current_task = self._build_current_task()
+            future_tasks = self._build_future_tasks()
             base = self._render_prompt(
                 self.valves.EXECUTE_PROMPT or DEFAULT_EXECUTE_PROMPT,
-                task_state=task_state,
+                past_tasks=past_tasks,
+                current_task=current_task,
+                future_tasks=future_tasks,
                 loop_info=loop_info,
             )
         elif self.phase == self.PHASE_REVIEW:
@@ -2770,7 +2834,6 @@ class HelixAgentEngine:
     def _transition_to(self, phase):
         """Transition to a new phase: update tools, system prompt, state."""
         self.phase = phase
-        self._consecutive_tool_misses.clear()
         if phase == self.PHASE_OUTPUT:
             self._output_turn = 0
             self._output_rendering_skipped = False
@@ -3282,10 +3345,11 @@ class HelixAgentEngine:
 
             max_replan_loops = getattr(self.valves, "MAX_REPLAN_LOOPS", 3)
             if self.phase == self.PHASE_REPLAN and self.loop_count >= max_replan_loops and not self._is_yolo_mode:
-                logger.warning("REPLAN reached %d loops; falling back to single-task EXECUTE.", max_replan_loops)
-                self.task_list = [user_msg]
-                self._transition_to(self.PHASE_EXECUTE)
-                await self.emit_task_update()
+                logger.warning("REPLAN reached %d loops; aborting with error.", max_replan_loops)
+                await self.emit_output(f"\n[ERROR] Replanning failed after {max_replan_loops} attempts. The agent could not generate a valid task plan. Please rephrase your request or check your instructions.\n")
+                await self.emit_task_update(finalize_tasks=True)
+                await self.emit_status("Planning failed", done=True)
+                return self._format_output()
 
             phase_name = {
                 self.PHASE_PLAN: "Plan",
@@ -3405,13 +3469,21 @@ class HelixAgentEngine:
                         "role": "assistant",
                         "content": content or "",
                     })
-                    urgency = ""
                     max_plan_loops = getattr(self.valves, "MAX_PLAN_LOOPS", 5)
+                    # Increment reprompt counter so we don't loop forever on stubborn models
+                    self._plan_reprompt_count = getattr(self, '_plan_reprompt_count', 0) + 1
+                    max_reprompts = getattr(self.valves, "MAX_PLAN_REPROMPTS", 2)
+                    if self._plan_reprompt_count > max_reprompts:
+                        await self.emit_output(f"\n[ERROR] The agent failed to produce a valid plan after multiple attempts.\n")
+                        await self.emit_task_update(finalize_tasks=True)
+                        await self.emit_status("Planning failed", done=True)
+                        return self._format_output()
+                    urgency = ""
                     if self.loop_count >= max_plan_loops - 1:
                         urgency = f" URGENT: You are at loop {self.loop_count} of {max_plan_loops}. You MUST call confirm_plan NOW with your best plan. Do NOT ask more questions or produce more text."
                     self.history.append({
-                        "role": "user",
-                        "content": f"SYSTEM: You produced text but did not call any tools. You MUST call the confirm_plan tool with the plan to proceed. Do NOT output the plan as text — call the tool.{urgency}",
+                        "role": "system",
+                        "content": f"CRITICAL REMINDER: You are in {self.phase.upper()} mode. You MUST call one of these tools ONLY: ask_user, terminate, or confirm_plan. Any other output is rejected.{urgency}",
                     })
                     await self.emit_output(f"\n[WARN] No tool call produced in {self.phase} phase. Re-prompting to enforce confirm_plan.\n")
                     continue
@@ -3424,13 +3496,17 @@ class HelixAgentEngine:
                         })
                         continue
                     if content:
-                        try:
-                            parsed = json.loads(content)
-                            summary = parsed.get("summary", "")
-                        except json.JSONDecodeError:
-                            summary = ""
-                        if summary:
-                            await self.emit_output(summary)
+                        parsed = self._parse_output_json(content)
+                        if parsed:
+                            rendered = self._render_output_markdown(parsed)
+                            if rendered:
+                                await self.emit_output(rendered)
+                            else:
+                                summary = parsed.get("summary", "")
+                                if summary:
+                                    await self.emit_output(summary)
+                                else:
+                                    await self.emit_output(content)
                         else:
                             await self.emit_output(content)
                     await self.emit_task_update(finalize_tasks=True)
@@ -3471,6 +3547,29 @@ class HelixAgentEngine:
                 "tool_calls": tool_calls_list,
             })
 
+            # ── EXECUTE phase: enforce one action per turn ──
+            # Allow run_tools_parallel (it counts as one tool call that executes multiple sub-calls internally).
+            # allow_multiple_tools is True only for that case or for internal state-transition tools (complete_task,
+            # fail_task, terminate, replan) which naturally should not coexist with external tools anyway.
+            if self.phase == self.PHASE_EXECUTE:
+                # collect names
+                names = [tc.get("function", {}).get("name", "") for tc in tool_calls_list]
+                # run_tools_parallel is allowed because it is a single orchestrated call
+                is_parallel = len(names) == 1 and names[0] == "run_tools_parallel"
+                if not is_parallel and len(tool_calls_list) > 1:
+                    # pick the first non-internal tool (or the first overall as fallback)
+                    chosen_idx = 0
+                    for i, n in enumerate(names):
+                        if n not in self.INTERNAL_TOOLS:
+                            chosen_idx = i
+                            break
+                    chosen_tc = tool_calls_list[chosen_idx]
+                    rejected_names = [n for j, n in enumerate(names) if j != chosen_idx]
+                    # Inject a system reminder so next turn the LLM knows why extra calls were dropped
+                    self.history.append({"role": "system", "content": f"SYSTEM: EXECUTE mode allows ONE external tool per turn. Only '{chosen_tc.get('function',{}).get('name')}' was executed. Rejected calls: {rejected_names}. Call complete_task before attempting another tool."})
+                    tool_calls_list = [chosen_tc]
+                    await self.emit_output(f"\n[WARN] EXECUTE: Only one tool per turn. Executed '{names[chosen_idx]}', dropped: {rejected_names}.\n")
+
             _pending_phase_transition = None
             for tc in tool_calls_list:
                 fn = tc.get("function", {})
@@ -3482,23 +3581,13 @@ class HelixAgentEngine:
                     args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
                     if not isinstance(args, dict):
                         args = {}
-                    self.consecutive_json_errors = 0
                 except json.JSONDecodeError:
-                    self.consecutive_json_errors += 1
-                    max_errors = self.valves.MAX_CONSECUTIVE_ERRORS
                     error_detail = (
                         f"Error: Invalid JSON in tool arguments for '{tool_name}'. "
-                        f"Attempt {self.consecutive_json_errors}/{max_errors}. "
                         f"The arguments provided were: {raw_args}. "
-                        f"Please ensure they are a valid JSON object with exactly the keys expected by this tool. "
-                        f"You MUST fix this immediately."
+                        f"Please ensure they are a valid JSON object with exactly the keys expected by this tool."
                     )
-                    if self.consecutive_json_errors >= max_errors:
-                        error_detail += (
-                            " CRITICAL: This is your final warning. The next failure will force termination. "
-                            "Please correct the JSON format NOW."
-                        )
-                    await self.emit_status(f"JSON parse error ({self.consecutive_json_errors}/{max_errors}): {tool_name}")
+                    await self.emit_status(f"JSON parse error: {tool_name}")
                     args = {}
                     self.history.append({
                         "role": "tool",
@@ -3525,7 +3614,6 @@ class HelixAgentEngine:
                     reason = args.get("reason", "Plan needs adjustment")
 
                     recent_calls = []
-                    self._consecutive_tool_misses.clear()
                     result_json = await self._tool_replan(reason=reason)
                     self.history.append({
                         "role": "tool",
@@ -3550,6 +3638,7 @@ class HelixAgentEngine:
                     })
                     if (len(self.completed_tasks) + len(self.failed_tasks)) >= len(self.task_list):
                         _pending_phase_transition = self.PHASE_REVIEW
+                        await self.emit_status("Moving to review phase...")
                     continue
 
                 if tool_name == "fail_task":
@@ -3565,6 +3654,7 @@ class HelixAgentEngine:
                     })
                     if self.failed_tasks and len(self.completed_tasks) + len(self.failed_tasks) >= len(self.task_list):
                         _pending_phase_transition = self.PHASE_REVIEW
+                        await self.emit_status("Moving to review phase...")
                     continue
 
                 if tool_name == "proceed_to_output":
@@ -3572,10 +3662,9 @@ class HelixAgentEngine:
                     result_data = json.loads(result_json)
                     if result_data.get("proceed_to_output"):
                         _pending_phase_transition = self.PHASE_OUTPUT
-                        await self.emit_output(f"\n[OUT] **Proceeding to output generation...**\n")
-                        await self.emit_status("[OUT] Moving to output phase...")
+                        await self.emit_status("Moving to output phase...")
                     else:
-                        await self.emit_status(f"[OUT] Output transition failed: {result_data.get('error', 'Unknown error')[:120]}")
+                        await self.emit_status(f"Output transition failed: {result_data.get('error', 'Unknown error')[:120]}")
                     self.history.append({
                         "role": "tool",
                         "content": result_json,
@@ -3648,7 +3737,15 @@ class HelixAgentEngine:
                     tasks = args.get("tasks", [])
                     if not isinstance(tasks, list):
                         tasks = []
-                    self.task_list = [str(t) for t in tasks] if tasks else ["Complete the user's request"]
+                    # Defensive fallback: if task_list ends up empty, abort planning
+                    if not tasks:
+                        self.history.append({
+                            "role": "user",
+                            "content": "SYSTEM: confirm_plan was called but produced an empty task list. You MUST provide a concrete, actionable list of tasks. Call confirm_plan again.",
+                        })
+                        await self.emit_status("Plan confirmation returned empty task list")
+                        continue
+                    self.task_list = [str(t) for t in tasks]
                     _pending_phase_transition = self.PHASE_EXECUTE
                     await self._save_state_to_file()
                     await self.emit_task_update()
@@ -3749,25 +3846,13 @@ class HelixAgentEngine:
                         self._total_tool_calls += 1
 
                         if "not found in current phase" in tool_result:
-                            self._consecutive_tool_misses[tool_name] = self._consecutive_tool_misses.get(tool_name, 0) + 1
-                            miss_count = self._consecutive_tool_misses[tool_name]
-                            max_errors = self.valves.MAX_CONSECUTIVE_ERRORS
                             available_tools = ", ".join(sorted(self.phase_tools_dict.keys())[:30])
-                            warning_msg = (
-                                f"[WARN] Tool '{tool_name}' is not available in the current phase ({self.phase}). "
-                                f"Attempt {miss_count}/{max_errors}. Available tools: {available_tools}. "
+                            tool_result = (
+                                f"Tool '{tool_name}' is not available in the current phase ({self.phase}). "
+                                f"Available tools for this phase: {available_tools}. "
                                 f"Please check the tool name and use only tools listed for this phase."
                             )
-                            if miss_count >= max_errors:
-                                warning_msg += (
-                                    " CRITICAL: This is your final warning for unavailable tools. "
-                                    "The next failure will force termination. Please use the correct tool name NOW."
-                                )
-                            await self.emit_status(f"Tool unavailable ({miss_count}/{max_errors}): {tool_name}")
-                            # Replace the generic error with a more informative one that the model will see in its next turn.
-                            tool_result = warning_msg
-                        else:
-                            self._consecutive_tool_misses.clear()
+                            await self.emit_status(f"Tool unavailable: {tool_name}")
 
                 self.history.append({
                     "role": "tool",
@@ -3842,14 +3927,6 @@ class Pipe:
             default=3,
             ge=0,
             description="Safety cap: after this many REPLAN loops the agent falls back to single-task EXECUTE.",
-        )
-        ENABLE_HARD_STOP_ON_ERRORS: bool = Field(
-            default=False,
-            description="If True, the agent will hard-stop (return final output) after MAX_CONSECUTIVE_ERRORS consecutive tool call failures (e.g., JSON parse errors, unavailable tools). If False, the model receives the error in its history and is free to self-correct."
-        )
-        MAX_CONSECUTIVE_ERRORS: int = Field(
-            default=3,
-            description="Number of consecutive errors that triggers a hard stop when ENABLE_HARD_STOP_ON_ERRORS is True."
         )
         LLM_RETRY_COUNT: int = Field(
             default=1,
@@ -3960,11 +4037,11 @@ class Pipe:
 
         PLAN_PROMPT: str = Field(
             default=DEFAULT_PLAN_PROMPT,
-            description="System prompt for PLAN phase. Available placeholders: {loop_info}."
+            description="System prompt for PLAN phase. Available placeholders: {tool_info}, {loop_info}."
         )
         EXECUTE_PROMPT: str = Field(
             default=DEFAULT_EXECUTE_PROMPT,
-            description="System prompt for EXECUTE phase. Available placeholders: {task_state}, {loop_info}."
+            description="System prompt for EXECUTE phase. Available placeholders: {tool_info}, {past_tasks}, {current_task}, {future_tasks}, {loop_info}."
         )
         REVIEW_PROMPT: str = Field(
             default=DEFAULT_REVIEW_PROMPT,
