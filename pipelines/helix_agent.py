@@ -1,7 +1,7 @@
 """
 title: Helix Agent
 author: Piggidragon
-    version: 0.27.2
+    version: 0.27.3
 description: >
   Helix Agent - OpenWebUI-native agent loop with modular per-phase tool control.
 
@@ -45,7 +45,6 @@ requirements: open-webui>=0.9.1
 
 import asyncio
 import hashlib
-import inspect
 import io
 import json
 import logging
@@ -73,7 +72,6 @@ try:
     from open_webui.utils.middleware import (
         get_citation_source_from_tool_result,
         terminal_event_handler,
-        apply_source_context_to_messages,
     )
     HAS_MIDDLEWARE_CITATIONS = True
 except Exception:
@@ -308,7 +306,6 @@ def _load_tool_status_hints(raw_json: str) -> dict:
     return hints
 
 
-@staticmethod
 def _extract_tool_preview(tool_name: str, args: dict, hints: dict) -> str | None:
     """Build a concise status preview for a tool call based on the hint map.
 
@@ -469,8 +466,8 @@ class HelixAgentEngine:
         # Token tracking state
         self._total_tool_calls = 0
         self._memory_context = ""
-        self._memory_injected = False
-        self._rag_sources: list = []
+
+
 
         # Throttling / debounce state
         self._last_state_save_ts: float = 0.0
@@ -2923,26 +2920,26 @@ class HelixAgentEngine:
     # memory, filter pipeline, RAG template) - best-effort, fails safe.
     # -----------------------------------------------------------------
 
-    async def _emit_terminal_event(self, tool_name: str, args: dict, result_str: str):
-        """Best-effort terminal event emission after file/command tools."""
-        if not self.event_emitter or not HAS_MIDDLEWARE_CITATIONS:
-            return
-        try:
-            await terminal_event_handler(tool_name, args, result_str, self.event_emitter)
-        except Exception as e:
-            logger.debug(f"terminal_event_handler failed for {tool_name}: {e}")
+    async def _emit_tool_event(self, tool_name: str, args: dict, result_str: str, event_type: str) -> None:
+        """Best-effort middleware event emission for a specific event type.
 
-    async def _emit_citation_source(self, tool_name: str, args: dict, result_str: str):
-        """Best-effort emission of source/citation events for search/fetch/kb tools."""
+        event_type: 'terminal' or 'citation'
+        """
         if not self.event_emitter or not HAS_MIDDLEWARE_CITATIONS:
             return
-        try:
-            sources = get_citation_source_from_tool_result(tool_name, args, result_str)
-            if sources:
-                for source in sources:
-                    await self.event_emitter({"type": "source", "data": source})
-        except Exception as e:
-            logger.debug(f"get_citation_source_from_tool_result failed for {tool_name}: {e}")
+        if event_type == "terminal":
+            try:
+                await terminal_event_handler(tool_name, args, result_str, self.event_emitter)
+            except Exception as e:
+                logger.debug(f"terminal_event_handler failed for {tool_name}: {e}")
+        elif event_type == "citation":
+            try:
+                sources = get_citation_source_from_tool_result(tool_name, args, result_str)
+                if sources:
+                    for source in sources:
+                        await self.event_emitter({"type": "source", "data": source})
+            except Exception as e:
+                logger.debug(f"get_citation_source_from_tool_result failed for {tool_name}: {e}")
 
     async def _inject_memory_context(self, user_msg: str) -> str:
         """Query user memories and return a short system-style injection string.
@@ -3360,7 +3357,6 @@ class HelixAgentEngine:
         # --- Memory injection (once, before first plan LLM call) ---
         self._memory_context = await self._inject_memory_context(user_msg)
         if self._memory_context:
-            self._memory_injected = True
             logger.info("Injected user memory context into system prompt.")
 
         max_size_mb = getattr(self.valves, "MAX_ATTACHMENT_SIZE_MB", 5)
@@ -3488,7 +3484,7 @@ class HelixAgentEngine:
             if self.loop_count >= effective_max and not self._is_yolo_mode:
                 await self.emit_status(f"Max iterations ({effective_max}) reached")
                 should_continue = False
-                if self.event_call and not (self.user_valves and getattr(self.user_valves, "YOLO_MODE", False)):
+                if self.event_call and not self._is_yolo_mode:
                     try:
                         timeout_s = getattr(self.valves, "ITERATION_LIMIT_TIMEOUT", 300)
                         js = self._build_limit_modal_js("iteration", self.loop_count, effective_max, timeout_s=timeout_s)
@@ -3510,7 +3506,7 @@ class HelixAgentEngine:
             if max_llm > 0 and self._llm_call_count >= max_llm + self._extra_llm_grace and not self._is_yolo_mode:
                 await self.emit_status(f"Max LLM calls ({max_llm + self._extra_llm_grace}) reached")
                 should_continue = False
-                if self.event_call and not (self.user_valves and getattr(self.user_valves, "YOLO_MODE", False)):
+                if self.event_call and not self._is_yolo_mode:
                     try:
                         timeout_s = getattr(self.valves, "ITERATION_LIMIT_TIMEOUT", 300)
                         js = self._build_limit_modal_js("llm_call", self._llm_call_count, max_llm + self._extra_llm_grace, timeout_s=timeout_s)
@@ -3659,8 +3655,8 @@ class HelixAgentEngine:
                     max_plan_loops = 5
                     # Increment reprompt counter so we don't loop forever on stubborn models
                     self._plan_reprompt_count = getattr(self, '_plan_reprompt_count', 0) + 1
-                    max_reprompts = getattr(self.valves, "MAX_PLAN_REPROMPTS", 2)
-                    if self._plan_reprompt_count > max_reprompts:
+                    MAX_PLAN_REPROMPTS = 2
+                    if self._plan_reprompt_count > MAX_PLAN_REPROMPTS:
                         await self.emit_output(f"\n[ERROR] The agent failed to produce a valid plan after multiple attempts.\n")
                         await self.emit_task_update(finalize_tasks=True)
                         await self.emit_status("Planning failed", done=True)
@@ -4021,22 +4017,13 @@ class HelixAgentEngine:
                         if tool_name in (
                             "display_file", "write_file", "replace_file_content", "run_command", "replace_note_content", "write_note"
                         ) and result_str:
-                            await self._emit_terminal_event(tool_name, args, result_str)
+                            await self._emit_tool_event(tool_name, args, result_str, "terminal")
 
                         # ── Citation / source events for search/fetch/kb tools ──
                         if tool_name in (
                             "search_web", "fetch_url", "query_knowledge_files", "view_knowledge_file", "query_knowledge_bases", "view_knowledge_bases"
                         ) and result_str:
-                            await self._emit_citation_source(tool_name, args, result_str)
-                            if getattr(self.valves, "ENABLE_RAG_TEMPLATE", False):
-                                try:
-                                    from open_webui.utils.middleware import get_source_context
-                                    src = get_source_context(tool_name, args, result_str)
-                                    if src:
-                                        self._rag_sources.append(src)
-                                except Exception:
-                                    pass
-
+                            await self._emit_tool_event(tool_name, args, result_str, "citation")
                         if "not found in current phase" in tool_result:
                             available_tools = ", ".join(sorted(self.phase_tools_dict.keys())[:30])
                             tool_result = (
@@ -4067,14 +4054,8 @@ class HelixAgentEngine:
             result = await self._run_impl(user_msg, last_user_msg_raw, model)
             await self._compress_goal_if_needed()
             return result
-        except GeneratorExit:
-            logger.info("Agent loop cancelled by user (GeneratorExit).")
-            await self._save_state_to_file(force=True)
-            await self.emit_task_update(finalize_tasks=True)
-            await self.emit_status("Cancelled", done=True)
-            raise
-        except asyncio.CancelledError:
-            logger.info("Agent loop cancelled (CancelledError).")
+        except (GeneratorExit, asyncio.CancelledError):
+            logger.info("Agent loop cancelled.")
             await self._save_state_to_file(force=True)
             await self.emit_task_update(finalize_tasks=True)
             await self.emit_status("Cancelled", done=True)
@@ -4276,10 +4257,6 @@ class Pipe:
             ),
         )
 
-        ENABLE_RAG_TEMPLATE: bool = Field(
-            default=False,
-            description="If True and the OpenWebUI RAG middleware is available, formats source context from tool results via apply_source_context_to_messages instead of plain-text injection."
-        )
         MEMORY_QUERY_K: int = Field(
             default=3,
             description="Number of top user memories to retrieve when memory injection is active."
