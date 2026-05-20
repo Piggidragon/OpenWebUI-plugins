@@ -1,7 +1,7 @@
 """
 title: Helix Agent
 author: Piggidragon
-    version: 0.26.3
+    version: 0.27.0
 description: >
   Helix Agent - OpenWebUI-native agent loop with modular per-phase tool control.
 
@@ -36,9 +36,9 @@ description: >
 
   Safety:
   - Session timeout: MAX_SESSION_SECONDS hard-caps overall agent runtime (default 20 min).
-  - Per-iteration timeout: MAX_ITERATION_SECONDS hard-caps a single loop iteration (default 5 min).
+  - Per-iteration timeout: MAX_ITERATION_SECONDS hard-caps a single loop iteration (default 15 min).
   - SSE chunk timeout: SSE_CHUNK_TIMEOUT_SECONDS aborts stalled streams if no chunk arrives (default 60 s).
-  - LLM call budget: MAX_LLM_CALLS stops the agent after N generate_chat_completion calls (default 50).
+  - LLM call budget: MAX_LLM_CALLS stops the agent after N generate_chat_completion calls (default 100, continue dialog).
   - All timeouts are zero-able via Valves; when any budget is exhausted the session is terminated cleanly.
 requirements: open-webui>=0.9.1
 """
@@ -67,6 +67,29 @@ from open_webui.utils.middleware import (
 from open_webui.models.skills import Skills
 
 logger = logging.getLogger(__name__)
+
+# --- OpenWebUI optional middleware imports (best-effort, tolerant to API changes) ---
+try:
+    from open_webui.utils.middleware import (
+        get_citation_source_from_tool_result,
+        terminal_event_handler,
+        apply_source_context_to_messages,
+    )
+    HAS_MIDDLEWARE_CITATIONS = True
+except Exception:
+    HAS_MIDDLEWARE_CITATIONS = False
+
+try:
+    from open_webui.utils.middleware import process_pipeline_inlet_filter
+    HAS_INLET_FILTER = True
+except Exception:
+    HAS_INLET_FILTER = False
+
+try:
+    from open_webui.routers.memories import query_memory, QueryMemoryForm
+    HAS_MEMORY = True
+except Exception:
+    HAS_MEMORY = False
 
 try:
     from open_webui.models.chats import Chats
@@ -139,10 +162,11 @@ You are in EXECUTE mode. Complete exactly ONE task, then mark it done.
 Core rules:
 1. Execute ONLY the Current Task. Do NOT call tools for any other task.
 2. Use run_tools_parallel for multiple INDEPENDENT calls within the SAME Current Task.
-3. When the Current Task is done, call complete_task(index) or fail_task(index, reason).
-4. Do NOT read or work ahead. Do NOT call multiple separate tools sequentially.
-5. Verify code with lint/compile/test before marking complete.
-6. If minor issues, prefer fix_plan over replan. Replan only if everything is completely wrong.
+3. If you need more than ONE external tool in this turn, they MUST be inside run_tools_parallel. Do NOT make separate tool calls in the same turn.
+4. When the Current Task is done, call complete_task(index) or fail_task(index, reason).
+5. Do NOT read or work ahead. Do NOT call multiple separate tools sequentially.
+6. Verify code with lint/compile/test before marking complete.
+7. If minor issues, prefer fix_plan over replan. Replan only if everything is completely wrong.
 
 File paths: `/home/[USER_HOME]/agent/<slug>/`. NEVER use `/root/`.
 
@@ -162,9 +186,10 @@ Task status markers: [done] = completed, [FAIL: reason] = failed, [    ] = not s
 
 Core rules:
 1. Only read what is STRICTLY NECESSARY for verification. Use grep/search, not full file reads. Use run_command for syntax or code run checks.
-2. Do NOT copy entire file contents into reasoning.
-3. Be honest — don't call proceed_to_output if something is missing.
-4. If minor issues, prefer fix_plan over replan. Replan only if everything is completely wrong.
+2. ALWAYS reread the written files. Do not just use what is in history context.
+3. Do NOT copy entire file contents into reasoning.
+4. Be honest — don't call proceed_to_output if something is missing.
+5. If minor issues, prefer fix_plan over replan. Replan only if everything is completely wrong.
 
 Actions:
 1. Verify work using read-only tools (read_file, grep_search, list_files, etc.).
@@ -249,6 +274,62 @@ OUTPUT_FINAL_JSON_SCHEMA = {
         }
     }
 }
+
+# Default hints for built-in OpenWebUI tools. Admin may override or extend
+# via the Valves.TOOL_STATUS_MAP JSON field. Each hint is {"label": str, "params": [str]}.
+# The first existing param from the list is shown as the preview value.
+_DEFAULT_TOOL_STATUS_HINTS = {
+    "run_command": {"label": "Run", "params": ["command"]},
+    "read_file": {"label": "Read", "params": ["file", "path", "file_path"]},
+    "write_file": {"label": "Write", "params": ["file", "path", "file_path"]},
+    "list_files": {"label": "List", "params": ["path", "dir", "directory"]},
+    "search_web": {"label": "Search", "params": ["query"]},
+    "replace_file_content": {"label": "Edit", "params": ["file", "path", "file_path"]},
+    "fetch_url": {"label": "Fetch", "params": ["url"]},
+    "glob_search": {"label": "Glob", "params": ["pattern"]},
+    "grep_search": {"label": "Grep", "params": ["pattern"]},
+    "display_file": {"label": "Show", "params": ["file", "path", "file_path"]},
+}
+
+
+def _load_tool_status_hints(raw_json: str) -> dict:
+    """Parse admin valve JSON and merge with defaults. Returns resolved hints dict."""
+    hints = dict(_DEFAULT_TOOL_STATUS_HINTS)
+    if not raw_json or not raw_json.strip():
+        return hints
+    try:
+        parsed = json.loads(raw_json)
+        if isinstance(parsed, dict):
+            for k, v in parsed.items():
+                if isinstance(v, dict) and "label" in v and isinstance(v.get("params"), list):
+                    hints[k] = v
+    except json.JSONDecodeError:
+        logger.warning("TOOL_STATUS_MAP is invalid JSON, using default hints only.")
+    return hints
+
+
+@staticmethod
+def _extract_tool_preview(tool_name: str, args: dict, hints: dict) -> str | None:
+    """Build a concise status preview for a tool call based on the hint map.
+
+    Returns None if the tool is not in hints or none of the looked-for params exist.
+    Example: >>> _extract_tool_preview("read_file", {"file": "/tmp/a.ts"}, hints)
+              'Read | /tmp/a.ts'
+    """
+    if not isinstance(args, dict) or not hints:
+        return None
+    hint = hints.get(tool_name)
+    if not hint:
+        return None
+    for param in hint["params"]:
+        value = args.get(param)
+        if value is not None:
+            preview = str(value).replace("\n", " / ").strip()
+            if len(preview) > 80:
+                preview = preview[:77] + "..."
+            return f"{hint['label']} | {preview}"
+    return None
+
 
 async def _parse_sse_payload(payload: str):
     """Parse a single SSE data payload and yield structured events."""
@@ -349,6 +430,11 @@ class HelixAgentEngine:
         self.valves = valves
         self.user_valves = user_valves
 
+        # Caches for dynamic UI helpers
+        self._tool_status_hints = _load_tool_status_hints(
+            getattr(self.valves, "TOOL_STATUS_MAP", "")
+        )
+
         self.pipe_metadata = metadata.get("__metadata__", metadata)
         self.chat_id = metadata.get("__chat_id__", "")
         self.message_id = metadata.get("__message_id__", "")
@@ -377,10 +463,14 @@ class HelixAgentEngine:
         self._plan_questions_asked = 0
         self._plan_reprompt_count = 0
         self._extra_grace = 0
+        self._extra_llm_grace = 0
         self._last_compression_loop = 0
 
         # Token tracking state
         self._total_tool_calls = 0
+        self._memory_context = ""
+        self._memory_injected = False
+        self._rag_sources: list = []
 
         # Throttling / debounce state
         self._last_state_save_ts: float = 0.0
@@ -511,12 +601,6 @@ class HelixAgentEngine:
 
     async def _stream_completion(self, body, max_retries: int = 1, iter_deadline: float = None):
         """Stream OWUI completion, yielding structured events. Retries on transient errors."""
-        # --- API budget guard ---
-        max_llm = getattr(self.valves, "MAX_LLM_CALLS", 50)
-        if max_llm > 0 and self._llm_call_count >= max_llm:
-            await self.emit_output(f"\n[ERROR] LLM call budget exhausted ({self._llm_call_count}/{max_llm}). Stopping.\n")
-            yield {"type": "error", "text": f"LLM call budget exhausted ({self._llm_call_count}/{max_llm})"}
-            return
 
         # --- Iteration deadline guard (fail fast before burning an API call) ---
         if iter_deadline and asyncio.get_event_loop().time() >= iter_deadline:
@@ -643,6 +727,7 @@ class HelixAgentEngine:
                 "phase": self.phase,
                 "loop_count": self.loop_count,
                 "extra_grace": self._extra_grace,
+                "extra_llm_grace": self._extra_llm_grace,
                 "history": self.history,
             }
             content = json.dumps(state_data, sort_keys=True, ensure_ascii=False).encode("utf-8")
@@ -775,16 +860,15 @@ class HelixAgentEngine:
             logger.warning(f"[Helix GC] Cleanup failed: {e}")
 
     def _check_session_timeouts(self) -> tuple[bool, str]:
-        """Return (should_stop, reason) if session or per-iteration timeout exceeded."""
+        """Return (should_stop, reason) if session timeout exceeded."""
+        if self._is_yolo_mode:
+            return False, ""
+
         max_session = getattr(self.valves, "MAX_SESSION_SECONDS", 1200)
         if max_session > 0:
             elapsed = asyncio.get_event_loop().time() - self._session_start_ts
             if elapsed >= max_session:
                 return True, f"Session timeout ({int(elapsed)}s / {max_session}s)"
-
-        max_llm = getattr(self.valves, "MAX_LLM_CALLS", 50)
-        if max_llm > 0 and self._llm_call_count >= max_llm:
-            return True, f"LLM call budget exhausted ({self._llm_call_count} / {max_llm})"
 
         return False, ""
 
@@ -881,6 +965,7 @@ class HelixAgentEngine:
             self.goal = data.get("goal") if "goal" in data else self.goal
             self.loop_count = data.get("loop_count", 0)
             self._extra_grace = data.get("extra_grace", 0)
+            self._extra_llm_grace = data.get("extra_llm_grace", 0)
             self.history = data.get("history", self.history)
             # Resynchronize compression loop counter to avoid immediate compression after recovery
             self._last_compression_loop = self.loop_count
@@ -2291,6 +2376,138 @@ class HelixAgentEngine:
     }})();"""
 
 
+    def _build_llm_call_limit_js(self, current_calls, max_calls, timeout_s: int = 300) -> str:
+        """Build a Continue/Cancel modal for LLM call limit reached."""
+        return f"""
+    return (function(){{
+      return new Promise((resolve)=>{{
+    {self._base_theme_js()}
+        const OVERLAY_ID = '__owui_helix_llm_limit__';
+        const existing = document.getElementById(OVERLAY_ID);
+        if (existing) existing.remove();
+
+        function cleanup(){{
+          panel.style.transform='scale(0.95)';
+          panel.style.opacity='0';
+          overlay.style.opacity='0';
+          setTimeout(()=>{{
+            overlay.remove();
+            document.removeEventListener('keydown',onKey);
+          }},180);
+        }}
+
+        const overlay = document.createElement('div');
+        overlay.id = OVERLAY_ID;
+        Object.assign(overlay.style, {{
+          position:'fixed',inset:'0',zIndex:'999999',
+          background:col.overlay,
+          backdropFilter:'blur(12px)',WebkitBackdropFilter:'blur(12px)',
+          display:'flex',alignItems:'center',justifyContent:'center',
+          fontFamily:"-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif",
+          opacity:'0',transition:'opacity 0.18s ease',
+        }});
+
+        const panel = document.createElement('div');
+        Object.assign(panel.style, {{
+          background:col.panel,border:'1px solid '+col.border,
+          borderRadius:'16px',padding:'26px 26px 20px',
+          maxWidth:'520px',width:'calc(100vw - 32px)',
+          maxHeight:'85vh',overflowY:'auto',
+          boxShadow:'0 28px 80px rgba(0,0,0,0.65)',
+          display:'flex',flexDirection:'column',gap:'14px',
+          transform:'scale(0.92)',opacity:'0',
+          transition:'transform 0.22s cubic-bezier(0.34,1.56,0.64,1), opacity 0.18s ease',
+        }});
+
+        const header = document.createElement('div');
+        Object.assign(header.style, {{ display:'flex',alignItems:'flex-start',gap:'12px' }});
+        const titleText = document.createElement('p');
+        Object.assign(titleText.style, {{
+          margin:'0',color:col.text,fontSize:'15px',
+          fontWeight:'600',lineHeight:'1.55',flex:'1',wordBreak:'break-word',
+        }});
+        titleText.textContent = 'LLM Call Limit Reached';
+        const badge = document.createElement('span');
+        Object.assign(badge.style, {{
+          flexShrink:'0',fontSize:'10px',fontWeight:'700',
+          letterSpacing:'0.07em',padding:'3px 9px',borderRadius:'99px',
+          background:col.btnPrimary+'26',color:col.btnPrimary,
+          marginTop:'2px',whiteSpace:'nowrap',
+        }});
+        badge.textContent = 'LIMIT';
+        header.appendChild(titleText); header.appendChild(badge);
+
+        const msg = document.createElement('p');
+        Object.assign(msg.style, {{
+          margin:'0',color:col.sub,fontSize:'14px',lineHeight:'1.55',wordBreak:'break-word',
+        }});
+        msg.textContent = `The agent has used {current_calls} of {max_calls} LLM calls. Continue for more?`;
+
+        const footer = document.createElement('div');
+        Object.assign(footer.style, {{ display:'flex',gap:'8px',justifyContent:'flex-end',marginTop:'2px' }});
+
+        function makeBtn(label,primary){{
+          const b = document.createElement('button');
+          b.textContent = label;
+          Object.assign(b.style, {{
+            padding:'10px 18px',borderRadius:'8px',
+            fontSize:'13px',fontWeight:'700',
+            cursor:'pointer',fontFamily:'inherit',boxSizing:'border-box',
+            border:'1.5px solid '+(primary?'transparent':col.btnBorder),
+            background:primary?col.btnPrimary:col.btn,
+            color:primary?col.btnPrimaryText:col.btnText,
+            transition:'opacity 0.12s, transform 0.1s, border-color 0.12s',
+          }});
+          b.addEventListener('mouseenter', ()=>{{ b.style.opacity='0.9'; b.style.transform='translateY(-1px)'; }});
+          b.addEventListener('mouseleave', ()=>{{ b.style.opacity='1'; b.style.transform=''; }});
+          return b;
+        }}
+
+        const continueBtn = makeBtn('Continue',true);
+        const stopBtn = makeBtn('Stop',false);
+        Object.assign(stopBtn.style, {{ background:col.btn,color:'#f38ba8',borderColor:'#f38ba8' }});
+        stopBtn.addEventListener('mouseenter', ()=>{{ stopBtn.style.opacity='0.85'; stopBtn.style.transform='translateY(-1px)'; }});
+        stopBtn.addEventListener('mouseleave', ()=>{{ stopBtn.style.opacity='1'; stopBtn.style.transform=''; }});
+
+        let _timer;
+        continueBtn.addEventListener('click', ()=>{{ clearTimeout(_timer); cleanup(); resolve(JSON.stringify({{action:'continue'}})); }});
+        stopBtn.addEventListener('click', ()=>{{ clearTimeout(_timer); cleanup(); resolve(JSON.stringify({{action:'stop'}})); }});
+
+        footer.appendChild(stopBtn); footer.appendChild(continueBtn);
+
+        const countdown = document.createElement('div');
+        countdown.textContent = '';
+        Object.assign(countdown.style, {{
+          fontSize:'11px',color:col.sub,textAlign:'center',minHeight:'16px',
+        }});
+
+        function onKey(e){{
+          if (e.key==='Escape'){{ stopBtn.click(); return; }}
+          if (e.key==='Enter' || e.key===' '){{ e.preventDefault(); continueBtn.click(); return; }}
+        }}
+        document.addEventListener('keydown',onKey);
+
+        panel.appendChild(header); panel.appendChild(msg); panel.appendChild(footer); panel.appendChild(countdown);
+        overlay.appendChild(panel); document.body.appendChild(overlay);
+
+        requestAnimationFrame(()=>{{
+          requestAnimationFrame(()=>{{
+            overlay.style.opacity='1';
+            panel.style.transform='scale(1)';
+            panel.style.opacity='1';
+          }});
+        }});
+
+        let remaining = {timeout_s};
+        function updateCountdown(){{
+            countdown.textContent = remaining>0 ? 'Auto-stopping in '+remaining+'s...' : '';
+            if (remaining<=0){{ cleanup(); resolve(JSON.stringify({{action:'stop'}})); }}
+        }}
+        updateCountdown();
+        _timer = setInterval(()=>{{ remaining--; updateCountdown(); }},1000);
+      }});
+    }})();"""
+
     async def emit_task_update(self, finalize_tasks=False):
         """Emit task progress via Open WebUI's native task list UI, debounced.
 
@@ -2621,6 +2838,10 @@ class HelixAgentEngine:
         if not callable_fn:
             return f"Tool '{tool_name}' has no executable handler.", []
 
+        preview = _extract_tool_preview(tool_name, filtered_args, self._tool_status_hints)
+        if preview:
+            await self.emit_status(f"▶ {preview}", done=False)
+
         files = []
         try:
             timeout = self.valves.TOOL_TIMEOUT if self.valves.TOOL_TIMEOUT > 0 else None
@@ -2713,7 +2934,7 @@ class HelixAgentEngine:
             self.PHASE_OUTPUT: "OUTPUT",
         }.get(self.phase, "LOOP")
 
-        max_loops = getattr(self.valves, "MAX_PLAN_LOOPS", 5)
+        max_loops = 5
         loop_info = f"[Agent State] Phase: {phase_name} | Loop: {self.loop_count}/{max_loops}"
 
         base = ""
@@ -2774,6 +2995,9 @@ class HelixAgentEngine:
 
         base = base.replace("[USER_HOME]", self._get_user_home())
 
+        if self._memory_context:
+            base = f"{self._memory_context}\n\n{base}"
+
         if self._skill_prompt:
             base = f"{self._skill_prompt}\n\n{base}"
         return base
@@ -2830,6 +3054,99 @@ class HelixAgentEngine:
 
         # 3. Last resort – whatever expanduser gives us.
         return os.path.expanduser("~")
+
+    # -----------------------------------------------------------------
+    # OpenWebUI middleware integration helpers (citations, terminal,
+    # memory, filter pipeline, RAG template) - best-effort, fails safe.
+    # -----------------------------------------------------------------
+
+    async def _emit_terminal_event(self, tool_name: str, args: dict, result_str: str):
+        """Best-effort terminal event emission after file/command tools."""
+        if not self.event_emitter or not HAS_MIDDLEWARE_CITATIONS:
+            return
+        try:
+            await terminal_event_handler(tool_name, args, result_str, self.event_emitter)
+        except Exception as e:
+            logger.debug(f"terminal_event_handler failed for {tool_name}: {e}")
+
+    async def _emit_citation_source(self, tool_name: str, args: dict, result_str: str):
+        """Best-effort emission of source/citation events for search/fetch/kb tools."""
+        if not self.event_emitter or not HAS_MIDDLEWARE_CITATIONS:
+            return
+        try:
+            sources = get_citation_source_from_tool_result(tool_name, args, result_str)
+            if sources:
+                for source in sources:
+                    await self.event_emitter({"type": "source", "data": source})
+        except Exception as e:
+            logger.debug(f"get_citation_source_from_tool_result failed for {tool_name}: {e}")
+
+    async def _inject_memory_context(self, user_msg: str) -> str:
+        """Query user memories and return a short system-style injection string.
+
+        Returns an empty string if memories are unavailable or the feature is off.
+        """
+        if not HAS_MEMORY or not self.request or not self.user:
+            return ""
+        try:
+            k = getattr(self.valves, "MEMORY_QUERY_K", 3)
+            form = QueryMemoryForm(content=user_msg, k=k)
+            mem_task = asyncio.create_task(
+                query_memory(self.request, form, self.user)
+            )
+            mem_result = await mem_task
+            if mem_result and isinstance(mem_result, dict):
+                memories = mem_result.get("memories", [])
+                if memories:
+                    lines = ["[User Memories - the following facts have been saved from previous conversations:]"]
+                    for m in memories:
+                        content = m.get("content", "") if isinstance(m, dict) else str(m)
+                        if content:
+                            lines.append(f"- {content}")
+                    return "\n".join(lines)
+            return ""
+        except Exception as e:
+            logger.debug(f"Memory injection failed: {e}")
+            return ""
+
+    async def _apply_filter_pipeline(self, messages: list, user_msg: str) -> list:
+        """Run OpenWebUI inlet filter on the message payload before LLM call.
+
+        Returns the potentially modified messages. Falls back to the originals on error.
+        """
+        if not HAS_INLET_FILTER or not self.request or not self.user:
+            return messages
+        try:
+            payload = {
+                **self.body,
+                "messages": messages,
+            }
+            filtered_payload = await process_pipeline_inlet_filter(
+                self.request, payload, self.user
+            )
+            if isinstance(filtered_payload, dict) and "messages" in filtered_payload:
+                return filtered_payload["messages"]
+        except Exception as e:
+            logger.debug(f"process_pipeline_inlet_filter failed: {e}")
+        return messages
+
+    async def _apply_rag_template(self, messages: list, sources: list, user_msg: str) -> list:
+        """Best-effort RAG template application with source context.
+
+        Only active when the middleware module exposes apply_source_context_to_messages.
+        Falls back to the original messages when unavailable.
+        """
+        if not HAS_MIDDLEWARE_CITATIONS or not self.request or not self.user:
+            return messages
+        try:
+            updated = await apply_source_context_to_messages(
+                self.request, messages, sources, user_msg
+            )
+            if isinstance(updated, list):
+                return updated
+        except Exception as e:
+            logger.debug(f"apply_source_context_to_messages failed: {e}")
+        return messages
 
     def _transition_to(self, phase):
         """Transition to a new phase: update tools, system prompt, state."""
@@ -2908,10 +3225,11 @@ class HelixAgentEngine:
             return ""
 
         # --- API budget + session timeout guards ---
-        max_llm = getattr(self.valves, "MAX_LLM_CALLS", 50)
-        if max_llm > 0 and self._llm_call_count >= max_llm:
-            logger.warning("Skipping compression: LLM call budget exhausted.")
-            return ""
+        if not self._is_yolo_mode:
+            max_llm = getattr(self.valves, "MAX_LLM_CALLS", 100)
+            if max_llm > 0 and self._llm_call_count >= max_llm + self._extra_llm_grace:
+                logger.warning("Skipping compression: LLM call budget exhausted.")
+                return ""
         if await self._check_timeouts_or_abort():
             return ""
 
@@ -3194,6 +3512,13 @@ class HelixAgentEngine:
 
         await self._recover_state_from_files(self.body if isinstance(self.body, dict) else {})
 
+        # --- Memory injection (once, before first plan LLM call) ---
+        if getattr(self.valves, "ENABLE_MEMORY_INJECTION", True) and not self._memory_injected:
+            self._memory_context = await self._inject_memory_context(user_msg)
+            if self._memory_context:
+                self._memory_injected = True
+                logger.info("Injected user memory context into system prompt.")
+
         max_size_mb = getattr(self.valves, "MAX_ATTACHMENT_SIZE_MB", 5)
         if max_size_mb > 0 and self.request:
             max_bytes = max_size_mb * 1024 * 1024
@@ -3340,6 +3665,32 @@ class HelixAgentEngine:
                 await self.emit_status("Max iterations", done=True)
                 return self._format_output()
 
+            # --- LLM call budget guard with continue dialog ---
+            max_llm = getattr(self.valves, "MAX_LLM_CALLS", 100)
+            if max_llm > 0 and self._llm_call_count >= max_llm + self._extra_llm_grace and not self._is_yolo_mode:
+                await self.emit_output(f"\n[WARN] Max LLM calls ({max_llm + self._extra_llm_grace}) reached.")
+                should_continue = False
+                if self.event_call and not (self.user_valves and getattr(self.user_valves, "YOLO_MODE", False)):
+                    try:
+                        timeout_s = getattr(self.valves, "ITERATION_LIMIT_TIMEOUT", 300)
+                        js = self._build_llm_call_limit_js(self._llm_call_count, max_llm + self._extra_llm_grace, timeout_s=timeout_s)
+                        raw = await self.event_call({"type": "execute", "data": {"code": js}})
+                        raw_str = raw if isinstance(raw, str) else (raw.get("result") or raw.get("value") or "{}") if raw else "{}"
+                        try:
+                            res = json.loads(raw_str) if isinstance(raw_str, str) and raw_str.startswith("{") else {}
+                        except (json.JSONDecodeError, AttributeError):
+                            res = {}
+                        should_continue = res.get("action") == "continue"
+                    except Exception as e:
+                        logger.warning(f"LLM call limit dialog failed: {e}")
+                if should_continue:
+                    self._extra_llm_grace += max_llm
+                    await self.emit_status("Continuing after LLM call limit...")
+                    continue
+                await self.emit_task_update(finalize_tasks=True)
+                await self.emit_status("Max LLM calls", done=True)
+                return self._format_output()
+
             self.loop_count += 1
             recent_calls = recent_calls[-30:]
 
@@ -3379,6 +3730,10 @@ class HelixAgentEngine:
 
             system_prompt = self._build_system_prompt()
             call_messages = [{"role": "system", "content": system_prompt}] + [m for m in self.history if m.get("role") != "system"]
+
+            # ── Filter pipeline (inlet) before LLM call ──
+            if getattr(self.valves, "ENABLE_FILTER_PIPELINE", True):
+                call_messages = await self._apply_filter_pipeline(call_messages, user_msg)
 
             completion_body = {
                 **self.body,
@@ -3469,7 +3824,7 @@ class HelixAgentEngine:
                         "role": "assistant",
                         "content": content or "",
                     })
-                    max_plan_loops = getattr(self.valves, "MAX_PLAN_LOOPS", 5)
+                    max_plan_loops = 5
                     # Increment reprompt counter so we don't loop forever on stubborn models
                     self._plan_reprompt_count = getattr(self, '_plan_reprompt_count', 0) + 1
                     max_reprompts = getattr(self.valves, "MAX_PLAN_REPROMPTS", 2)
@@ -3566,7 +3921,15 @@ class HelixAgentEngine:
                     chosen_tc = tool_calls_list[chosen_idx]
                     rejected_names = [n for j, n in enumerate(names) if j != chosen_idx]
                     # Inject a system reminder so next turn the LLM knows why extra calls were dropped
-                    self.history.append({"role": "system", "content": f"SYSTEM: EXECUTE mode allows ONE external tool per turn. Only '{chosen_tc.get('function',{}).get('name')}' was executed. Rejected calls: {rejected_names}. Call complete_task before attempting another tool."})
+                    rejected_tool_list = ", ".join(rejected_names)
+                    reminder = (
+                        f"SYSTEM: You attempted to call multiple independent tools in the same turn. "
+                        f"Only '{chosen_tc.get('function',{}).get('name')}' was executed. "
+                        f"You dropped: {rejected_tool_list}. "
+                        f"If you need {len(rejected_names) + 1} or more independent tools, use run_tools_parallel. "
+                        f"Do not make separate tool calls in a single turn."
+                    )
+                    self.history.append({"role": "system", "content": reminder})
                     tool_calls_list = [chosen_tc]
                     await self.emit_output(f"\n[WARN] EXECUTE: Only one tool per turn. Executed '{names[chosen_idx]}', dropped: {rejected_names}.\n")
 
@@ -3845,6 +4208,26 @@ class HelixAgentEngine:
                             )
                         self._total_tool_calls += 1
 
+                        # ── Terminal sync for file/command tools ──
+                        if getattr(self.valves, "ENABLE_TERMINAL_SYNC", True) and tool_name in (
+                            "display_file", "write_file", "replace_file_content", "run_command", "replace_note_content", "write_note"
+                        ) and result_str:
+                            await self._emit_terminal_event(tool_name, args, result_str)
+
+                        # ── Citation / source events for search/fetch/kb tools ──
+                        if getattr(self.valves, "ENABLE_CITATIONS", True) and tool_name in (
+                            "search_web", "fetch_url", "query_knowledge_files", "view_knowledge_file", "query_knowledge_bases", "view_knowledge_bases"
+                        ) and result_str:
+                            await self._emit_citation_source(tool_name, args, result_str)
+                            if getattr(self.valves, "ENABLE_RAG_TEMPLATE", False):
+                                try:
+                                    from open_webui.utils.middleware import get_source_context
+                                    src = get_source_context(tool_name, args, result_str)
+                                    if src:
+                                        self._rag_sources.append(src)
+                                except Exception:
+                                    pass
+
                         if "not found in current phase" in tool_result:
                             available_tools = ", ".join(sorted(self.phase_tools_dict.keys())[:30])
                             tool_result = (
@@ -3949,14 +4332,14 @@ class Pipe:
             description="Max seconds to wait for the next SSE chunk from the LLM stream. If no chunk arrives in this time, the stream is aborted. Default 60. Set to 0 to disable."
         )
         MAX_ITERATION_SECONDS: int = Field(
-            default=300,
+            default=900,
             ge=0,
-            description="Hard per-iteration timeout in seconds (one trip through the main loop). If exceeded, the agent shuts down immediately. Default 300 (5 min). Set to 0 to disable."
+            description="Hard per-iteration timeout in seconds (one trip through the main loop). If exceeded, the agent shuts down immediately. Default 900 (15 min). Set to 0 to disable."
         )
         MAX_LLM_CALLS: int = Field(
-            default=50,
+            default=100,
             ge=0,
-            description="Absolute maximum number of LLM API calls (generate_chat_completion) allowed per session. When reached, the agent aborts. Default 50. Set to 0 to disable."
+            description="Absolute maximum number of LLM API calls (generate_chat_completion) allowed per session. When reached, a continue dialog appears. Default 100. Set to 0 to disable."
         )
 
         CONTEXT_LENGTH: int = Field(
@@ -3983,12 +4366,6 @@ class Pipe:
             default=100,
             ge=10,
             description="Maximum total conversation messages retained in context. Older messages are dropped while keeping tool-call pairs intact.",
-        )
-
-        MAX_PLAN_LOOPS: int = Field(
-            default=5,
-            ge=1,
-            description="Soft loop limit for PLAN and REPLAN phases. Displayed in system prompts so the model self-regulates. Not a hard engine limit.",
         )
 
         EXECUTE_TOOLS: str = Field(
@@ -4079,11 +4456,46 @@ class Pipe:
             default=False,
             description="Enable debug mode. When on, messages 'show tools' return the available items directly without any LLM call.",
         )
+        TOOL_STATUS_MAP: str = Field(
+            default='{"run_command": {"label": "Run", "params": ["command"]}, "read_file": {"label": "Read", "params": ["file", "path", "file_path"]}, "write_file": {"label": "Write", "params": ["file", "path", "file_path"]}, "list_files": {"label": "List", "params": ["path", "dir", "directory"]}, "search_web": {"label": "Search", "params": ["query"]}, "replace_file_content": {"label": "Edit", "params": ["file", "path", "file_path"]}, "fetch_url": {"label": "Fetch", "params": ["url"]}, "glob_search": {"label": "Glob", "params": ["pattern"]}, "grep_search": {"label": "Grep", "params": ["pattern"]}, "display_file": {"label": "Show", "params": ["file", "path", "file_path"]}}',
+            description=(
+                "JSON object that maps tool names to status preview hints."
+                " This setting is only effective when set to a custom value."
+                " Format: {\"tool_name\": {\"label\": \"Run\", \"params\": [\"command\"]}}."
+                " 'params' is a priority list; the first found arg is shown."
+                " Non-listed tools produce no preview. Overrides/extends defaults."
+            ),
+        )
+
+        ENABLE_CITATIONS: bool = Field(
+            default=True,
+            description="If True, emits source/citation events after web_search, fetch_url, query_knowledge_files, and view_knowledge_file tool calls so users see clickable sources."
+        )
+        ENABLE_TERMINAL_SYNC: bool = Field(
+            default=True,
+            description="If True, emits terminal events after write_file, replace_file_content, display_file, and run_command so the OpenWebUI Terminal tab refreshes automatically."
+        )
+        ENABLE_MEMORY_INJECTION: bool = Field(
+            default=True,
+            description="If True and the OpenWebUI memory module is available, injects relevant user memories into the system prompt before the first plan."
+        )
+        ENABLE_FILTER_PIPELINE: bool = Field(
+            default=True,
+            description="If True and the OpenWebUI inlet filter is available, runs process_pipeline_inlet_filter on the chat payload before each LLM call so admin-configured security/compliance filters are honoured."
+        )
+        ENABLE_RAG_TEMPLATE: bool = Field(
+            default=False,
+            description="If True and the OpenWebUI RAG middleware is available, formats source context from tool results via apply_source_context_to_messages instead of plain-text injection."
+        )
+        MEMORY_QUERY_K: int = Field(
+            default=3,
+            description="Number of top user memories to retrieve when ENABLE_MEMORY_INJECTION is active."
+        )
 
     class UserValves(BaseModel):
         YOLO_MODE: bool = Field(
             default=False,
-            description="Skip all user confirmations. Auto-approve plans and ignore iteration limits.",
+            description="Skip all user confirmations and safety limits. Auto-approve plans, ignore session timeout, iteration limit, LLM call budget, plan reprompt and ask_user restrictions.",
         )
         ENABLE_PLAN_APPROVAL: bool = Field(
             default=True,
