@@ -1,7 +1,7 @@
 """
 title: Helix Agent
 author: Piggidragon
-    version: 0.27.0
+    version: 0.27.1
 description: >
   Helix Agent - OpenWebUI-native agent loop with modular per-phase tool control.
 
@@ -37,7 +37,7 @@ description: >
   Safety:
   - Session timeout: MAX_SESSION_SECONDS hard-caps overall agent runtime (default 20 min).
   - Per-iteration timeout: MAX_ITERATION_SECONDS hard-caps a single loop iteration (default 15 min).
-  - SSE chunk timeout: SSE_CHUNK_TIMEOUT_SECONDS aborts stalled streams if no chunk arrives (default 60 s).
+  - Stream stall timeout: STREAM_CHUNK_TIMEOUT_SECONDS aborts if the LLM produces no content for a configured duration (default 60 s).
   - LLM call budget: MAX_LLM_CALLS stops the agent after N generate_chat_completion calls (default 100, continue dialog).
   - All timeouts are zero-able via Valves; when any budget is exhausted the session is terminated cleanly.
 requirements: open-webui>=0.9.1
@@ -646,18 +646,21 @@ class HelixAgentEngine:
 
         if hasattr(response, "body_iterator"):
             sse_buffer = ""
-            chunk_timeout = getattr(self.valves, "SSE_CHUNK_TIMEOUT_SECONDS", 60)
+            chunk_timeout = getattr(self.valves, "STREAM_CHUNK_TIMEOUT_SECONDS", 60)
             iterator = response.body_iterator
             while True:
                 try:
-                    if chunk_timeout > 0:
+                    if self._is_yolo_mode:
+                        chunk = await iterator.__anext__()
+                    elif chunk_timeout > 0:
                         chunk = await asyncio.wait_for(iterator.__anext__(), timeout=chunk_timeout)
                     else:
                         chunk = await iterator.__anext__()
                 except asyncio.TimeoutError:
-                    # Chunk timeout – treat as retryable loop-level error
-                    logger.warning(f"SSE chunk timeout: no data for {chunk_timeout}s, treating as retryable")
-                    yield {"type": "error", "text": f"SSE chunk timeout: no data for {chunk_timeout}s (retryable)", "retryable": True}
+                    if self._is_yolo_mode:
+                        continue
+                    logger.warning(f"Stream stalled: no output for {chunk_timeout}s, treating as retryable")
+                    yield {"type": "error", "text": f"Stream stalled: no output for {chunk_timeout}s (retryable)", "retryable": True}
                     return
                 except StopAsyncIteration:
                     break
@@ -2840,7 +2843,7 @@ class HelixAgentEngine:
 
         preview = _extract_tool_preview(tool_name, filtered_args, self._tool_status_hints)
         if preview:
-            await self.emit_status(f"▶ {preview}", done=False)
+            await self.emit_status(f">> {preview}", done=False)
 
         files = []
         try:
@@ -2918,7 +2921,7 @@ class HelixAgentEngine:
             desc = " ".join(desc.split())
             if len(desc) > 200:
                 desc = desc[:197] + "..."
-            lines.append(f"  • {name}: {desc}")
+            lines.append(f"  - {name}: {desc}")
         return "\n".join(lines)
 
     def _build_system_prompt(self):
@@ -3807,9 +3810,6 @@ class HelixAgentEngine:
                             if "arguments" in tc.get("function", {}):
                                 tc_dict[idx]["function"]["arguments"] += tc["function"]["arguments"]
             except asyncio.CancelledError:
-                await self._save_state_to_file(force=True)
-                await self.emit_task_update(finalize_tasks=True)
-                await self.emit_status("Cancelled", done=True)
                 raise
 
             # Skip the rest of this iteration if a retryable error was handled above
@@ -4326,10 +4326,10 @@ class Pipe:
             ge=0,
             description="Hard session lifetime limit in seconds. If exceeded, the agent shuts down immediately regardless of state. Default 1200 (20 min). Set to 0 to disable."
         )
-        SSE_CHUNK_TIMEOUT_SECONDS: int = Field(
+        STREAM_CHUNK_TIMEOUT_SECONDS: int = Field(
             default=60,
             ge=0,
-            description="Max seconds to wait for the next SSE chunk from the LLM stream. If no chunk arrives in this time, the stream is aborted. Default 60. Set to 0 to disable."
+            description="Max seconds to wait for the next chunk from the LLM stream. If the model produces no output for this duration, the stream is aborted as retryable. Default 60. Set to 0 to disable.",
         )
         MAX_ITERATION_SECONDS: int = Field(
             default=900,
