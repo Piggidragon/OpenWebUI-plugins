@@ -978,10 +978,6 @@ class HelixAgentEngine:
         """Return True if YOLO mode is enabled (all safety limits ignored)."""
         return self.user_valves is not None and getattr(self.user_valves, "YOLO_MODE", False)
 
-    def _total_history_chars(self) -> int:
-        """Return total character count of all messages in self.history."""
-        return sum(len(str(m.get("content", ""))) for m in self.history)
-
     def _estimate_tokens(self, text: str) -> int:
         """Estimate token count from character count using configured chars-per-token ratio."""
         if not text:
@@ -1038,23 +1034,6 @@ class HelixAgentEngine:
             mfiles.append(file_info)
         else:
             self.metadata["__files__"] = [file_info]
-
-    def get_current_files(self) -> list:
-        """Return a deduplicated list of all known files (metadata + produced + DB canonical)."""
-        files_map = {}
-        # 1. Metadata files
-        for f in self.metadata.get("__files__", []):
-            if isinstance(f, dict):
-                fid = f.get("id") or f.get("file_id") or f.get("url")
-                if fid:
-                    files_map[fid] = f
-        # 2. Produced files from this turn
-        for f in self.produced_files:
-            if isinstance(f, dict):
-                fid = f.get("id") or f.get("file_id") or f.get("url")
-                if fid:
-                    files_map[fid] = f
-        return list(files_map.values()) if files_map else []
 
     async def resolve_tools(self):
         """Resolve ALL tools from the Pipe __tools__ parameter.
@@ -1599,14 +1578,26 @@ class HelixAgentEngine:
             logger.error(f"Plan approval event_call failed: {e}")
             return json.dumps({"action": "error", "error": f"Plan confirmation failed: {e}"})
 
-        raw_str = raw if isinstance(raw, str) else (raw.get("result") or raw.get("value") or "{}") if raw else "{}"
-        try:
-            res = json.loads(raw_str) if isinstance(raw_str, str) and raw_str.startswith("{") else {"action": "error", "error": "Malformed confirmation response."}
-        except (json.JSONDecodeError, AttributeError):
+        res = self._parse_event_response(raw)
+        if "action" not in res:
             res = {"action": "error", "error": "Malformed confirmation response."}
-
         res["tasks"] = tasks
         return json.dumps(res)
+
+    @staticmethod
+    def _parse_event_response(raw) -> dict:
+        """Unify boilerplate for parsing event_call / event_emitter JSON responses.
+
+        Handles: plain string, dict with 'result'/'value', or missing data.
+        Returns a dict (empty `{}` if the response is malformed or not JSON).
+        """
+        raw_str = raw if isinstance(raw, str) else (raw.get("result") or raw.get("value") or "{}") if raw else "{}"
+        if isinstance(raw_str, str) and raw_str.startswith("{"):
+            try:
+                return json.loads(raw_str)
+            except (json.JSONDecodeError, AttributeError):
+                return {}
+        return {}
 
     async def _tool_ask_user(self, question: str, options: list, allow_custom: bool = True, **kwargs):
         """Interactive user question tool. Only available during PLAN and REPLAN phases."""
@@ -1641,12 +1632,7 @@ class HelixAgentEngine:
             logger.error(f"ask_user event_call failed: {e}")
             return json.dumps({"type": "error", "response": f"Error getting user input: {e}", "skipped": True})
 
-        raw_str = raw if isinstance(raw, str) else (raw.get("result") or raw.get("value") or "{}") if raw else "{}"
-        try:
-            parsed = json.loads(raw_str) if isinstance(raw_str, str) and raw_str.startswith("{") else {}
-        except (json.JSONDecodeError, AttributeError):
-            parsed = {}
-
+        parsed = self._parse_event_response(raw)
         rtype = parsed.get("type")
         if rtype == "select":
             return json.dumps({"type": "select", "response": parsed.get("value", ""), "skipped": False})
@@ -1654,7 +1640,7 @@ class HelixAgentEngine:
             return json.dumps({"type": "custom", "response": parsed.get("value", ""), "skipped": False})
         elif rtype == "skip":
             return json.dumps({"type": "skip", "response": "User skipped the question.", "skipped": True})
-        return json.dumps({"type": "unknown", "response": f"User response: {raw_str}", "skipped": False})
+        return json.dumps({"type": "unknown", "response": f"User response: {json.dumps(raw)}", "skipped": False})
 
 
     def _normalize_parallel_calls(self, tool_calls: list) -> list:
@@ -1686,6 +1672,25 @@ class HelixAgentEngine:
             normalized.append({"name": name, "args": args})
         return normalized
 
+    async def _maybe_truncate_tool_result(self, tool_name: str, result_str: str) -> tuple:
+        """Truncate a tool result when it exceeds the configured limit and prepend a notice.
+
+        Returns (final_result_str, was_truncated).
+        """
+        truncation_limit = self._get_truncation_limit()
+        if truncation_limit and result_str and len(result_str) > truncation_limit:
+            await self.emit_status(
+                f"Truncated result for {tool_name} ({len(result_str)} -> {truncation_limit} chars)"
+            )
+            truncated = smart_truncate(result_str, truncation_limit)
+            final = (
+                f"[TRUNCATED] Tool '{tool_name}' result was cut from {len(result_str)} to {truncation_limit} chars. "
+                f"If you need the full output, refine your arguments or run a more targeted query.\n\n"
+                f"{truncated}"
+            )
+            return final, True
+        return result_str, False
+
     async def _execute_parallel_single(self, call_item: dict, call_id: str) -> dict:
         """Execute a single tool call for parallel batching."""
         tool_name = call_item["name"]
@@ -1698,34 +1703,21 @@ class HelixAgentEngine:
                 "type": "chat:message:files",
                 "data": {"files": new_files},
             })
-        truncation_limit = self._get_truncation_limit()
-        was_truncated = False
-        truncated_result = result_str
-        if truncation_limit and result_str and len(result_str) > truncation_limit:
-            was_truncated = True
-            await self.emit_status(
-                f"Truncated result for {tool_name} ({len(result_str)} -> {truncation_limit} chars)"
-            )
-            # Prepend a truncation notice so the model knows result is incomplete.
-            truncated_result = (
-                f"[TRUNCATED] Tool '{tool_name}' result was cut from {len(result_str)} to {truncation_limit} chars. "
-                f"If you need the full output, refine your arguments or run a more targeted query.\n\n"
-                + smart_truncate(result_str, truncation_limit)
-            )
+        truncated_result, was_truncated = await self._maybe_truncate_tool_result(tool_name, result_str)
         parsed_result = truncated_result
         if isinstance(truncated_result, str):
             try:
                 parsed_result = json.loads(truncated_result)
                 if was_truncated and isinstance(parsed_result, dict):
                     parsed_result["__truncated"] = True
-                    parsed_result["__truncated_reason"] = (
-                        f"Result truncated from {len(result_str)} to {truncation_limit} chars"
-                    )
-            except json.JSONDecodeError:
+            except (json.JSONDecodeError, TypeError):
                 pass
+        # Return compact format for parallel execution
         return {
             "tool_name": tool_name,
-            "result": parsed_result,
+            "tool_result": parsed_result,
+            "files": [f.get("file_id") or f.get("id") or f.get("url") for f in (result_files or []) if isinstance(f, dict)],
+            "was_truncated": was_truncated,
         }
 
     async def _tool_run_tools_parallel(self, tool_calls: list = None, **kwargs):
@@ -2233,13 +2225,27 @@ class HelixAgentEngine:
     }})();"""
 
 
-    def _build_iteration_limit_js(self, current_iter, max_iter, timeout_s: int = 300) -> str:
-        """Build a Continue/Cancel modal for iteration limit reached."""
+    def _build_limit_modal_js(self, kind: str, current: int, max_val: int, timeout_s: int = 300) -> str:
+        """Build a Continue/Cancel modal for budget limits (iterations or LLM calls)."""
+        if kind == "iteration":
+            title = "Iteration Limit Reached"
+            msg = f"The agent has used {current} of {max_val} iterations. Continue for more?"
+            action_continue = "continue"
+            action_stop = "stop"
+            auto_countdown = "Auto-stopping"
+        elif kind == "llm_call":
+            title = "LLM Call Limit Reached"
+            msg = f"The agent has used {current} of {max_val} LLM calls. Continue for more?"
+            action_continue = "continue"
+            action_stop = "stop"
+            auto_countdown = "Auto-stopping"
+        else:
+            raise ValueError(f"Unknown limit modal kind: {kind}")
         return f"""
     return (function(){{
       return new Promise((resolve)=>{{
     {self._base_theme_js()}
-        const OVERLAY_ID = '__owui_helix_limit__';
+        const OVERLAY_ID = '__owui_helix_limit_{kind}__';
         const existing = document.getElementById(OVERLAY_ID);
         if (existing) existing.remove();
 
@@ -2283,7 +2289,7 @@ class HelixAgentEngine:
           margin:'0',color:col.text,fontSize:'15px',
           fontWeight:'600',lineHeight:'1.55',flex:'1',wordBreak:'break-word',
         }});
-        titleText.textContent = 'Iteration Limit Reached';
+        titleText.textContent = '{title}';
         const badge = document.createElement('span');
         Object.assign(badge.style, {{
           flexShrink:'0',fontSize:'10px',fontWeight:'700',
@@ -2294,11 +2300,11 @@ class HelixAgentEngine:
         badge.textContent = 'LIMIT';
         header.appendChild(titleText); header.appendChild(badge);
 
-        const msg = document.createElement('p');
-        Object.assign(msg.style, {{
+        const msgEl = document.createElement('p');
+        Object.assign(msgEl.style, {{
           margin:'0',color:col.sub,fontSize:'14px',lineHeight:'1.55',wordBreak:'break-word',
         }});
-        msg.textContent = `The agent has used {current_iter} of {max_iter} iterations. Continue for more?`;
+        msgEl.textContent = `{msg}`;
 
         const footer = document.createElement('div');
         Object.assign(footer.style, {{ display:'flex',gap:'8px',justifyContent:'flex-end',marginTop:'2px' }});
@@ -2327,8 +2333,8 @@ class HelixAgentEngine:
         stopBtn.addEventListener('mouseleave', ()=>{{ stopBtn.style.opacity='1'; stopBtn.style.transform=''; }});
 
         let _timer;
-        continueBtn.addEventListener('click', ()=>{{ clearTimeout(_timer); cleanup(); resolve(JSON.stringify({{action:'continue'}})); }});
-        stopBtn.addEventListener('click', ()=>{{ clearTimeout(_timer); cleanup(); resolve(JSON.stringify({{action:'stop'}})); }});
+        continueBtn.addEventListener('click', ()=>{{ clearTimeout(_timer); cleanup(); resolve(JSON.stringify({{action:'{action_continue}'}})); }});
+        stopBtn.addEventListener('click', ()=>{{ clearTimeout(_timer); cleanup(); resolve(JSON.stringify({{action:'{action_stop}'}})); }});
 
         footer.appendChild(stopBtn); footer.appendChild(continueBtn);
 
@@ -2344,7 +2350,7 @@ class HelixAgentEngine:
         }}
         document.addEventListener('keydown',onKey);
 
-        panel.appendChild(header); panel.appendChild(msg); panel.appendChild(footer); panel.appendChild(countdown);
+        panel.appendChild(header); panel.appendChild(msgEl); panel.appendChild(footer); panel.appendChild(countdown);
         overlay.appendChild(panel); document.body.appendChild(overlay);
 
         requestAnimationFrame(()=>{{
@@ -2357,141 +2363,8 @@ class HelixAgentEngine:
 
         let remaining = {timeout_s};
         function updateCountdown(){{
-            countdown.textContent = remaining>0 ? 'Auto-stopping in '+remaining+'s...' : '';
-            if (remaining<=0){{ cleanup(); resolve(JSON.stringify({{action:'stop'}})); }}
-        }}
-        updateCountdown();
-        _timer = setInterval(()=>{{ remaining--; updateCountdown(); }},1000);
-      }});
-    }})();"""
-
-
-    def _build_llm_call_limit_js(self, current_calls, max_calls, timeout_s: int = 300) -> str:
-        """Build a Continue/Cancel modal for LLM call limit reached."""
-        return f"""
-    return (function(){{
-      return new Promise((resolve)=>{{
-    {self._base_theme_js()}
-        const OVERLAY_ID = '__owui_helix_llm_limit__';
-        const existing = document.getElementById(OVERLAY_ID);
-        if (existing) existing.remove();
-
-        function cleanup(){{
-          panel.style.transform='scale(0.95)';
-          panel.style.opacity='0';
-          overlay.style.opacity='0';
-          setTimeout(()=>{{
-            overlay.remove();
-            document.removeEventListener('keydown',onKey);
-          }},180);
-        }}
-
-        const overlay = document.createElement('div');
-        overlay.id = OVERLAY_ID;
-        Object.assign(overlay.style, {{
-          position:'fixed',inset:'0',zIndex:'999999',
-          background:col.overlay,
-          backdropFilter:'blur(12px)',WebkitBackdropFilter:'blur(12px)',
-          display:'flex',alignItems:'center',justifyContent:'center',
-          fontFamily:"-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,'Helvetica Neue',Arial,sans-serif",
-          opacity:'0',transition:'opacity 0.18s ease',
-        }});
-
-        const panel = document.createElement('div');
-        Object.assign(panel.style, {{
-          background:col.panel,border:'1px solid '+col.border,
-          borderRadius:'16px',padding:'26px 26px 20px',
-          maxWidth:'520px',width:'calc(100vw - 32px)',
-          maxHeight:'85vh',overflowY:'auto',
-          boxShadow:'0 28px 80px rgba(0,0,0,0.65)',
-          display:'flex',flexDirection:'column',gap:'14px',
-          transform:'scale(0.92)',opacity:'0',
-          transition:'transform 0.22s cubic-bezier(0.34,1.56,0.64,1), opacity 0.18s ease',
-        }});
-
-        const header = document.createElement('div');
-        Object.assign(header.style, {{ display:'flex',alignItems:'flex-start',gap:'12px' }});
-        const titleText = document.createElement('p');
-        Object.assign(titleText.style, {{
-          margin:'0',color:col.text,fontSize:'15px',
-          fontWeight:'600',lineHeight:'1.55',flex:'1',wordBreak:'break-word',
-        }});
-        titleText.textContent = 'LLM Call Limit Reached';
-        const badge = document.createElement('span');
-        Object.assign(badge.style, {{
-          flexShrink:'0',fontSize:'10px',fontWeight:'700',
-          letterSpacing:'0.07em',padding:'3px 9px',borderRadius:'99px',
-          background:col.btnPrimary+'26',color:col.btnPrimary,
-          marginTop:'2px',whiteSpace:'nowrap',
-        }});
-        badge.textContent = 'LIMIT';
-        header.appendChild(titleText); header.appendChild(badge);
-
-        const msg = document.createElement('p');
-        Object.assign(msg.style, {{
-          margin:'0',color:col.sub,fontSize:'14px',lineHeight:'1.55',wordBreak:'break-word',
-        }});
-        msg.textContent = `The agent has used {current_calls} of {max_calls} LLM calls. Continue for more?`;
-
-        const footer = document.createElement('div');
-        Object.assign(footer.style, {{ display:'flex',gap:'8px',justifyContent:'flex-end',marginTop:'2px' }});
-
-        function makeBtn(label,primary){{
-          const b = document.createElement('button');
-          b.textContent = label;
-          Object.assign(b.style, {{
-            padding:'10px 18px',borderRadius:'8px',
-            fontSize:'13px',fontWeight:'700',
-            cursor:'pointer',fontFamily:'inherit',boxSizing:'border-box',
-            border:'1.5px solid '+(primary?'transparent':col.btnBorder),
-            background:primary?col.btnPrimary:col.btn,
-            color:primary?col.btnPrimaryText:col.btnText,
-            transition:'opacity 0.12s, transform 0.1s, border-color 0.12s',
-          }});
-          b.addEventListener('mouseenter', ()=>{{ b.style.opacity='0.9'; b.style.transform='translateY(-1px)'; }});
-          b.addEventListener('mouseleave', ()=>{{ b.style.opacity='1'; b.style.transform=''; }});
-          return b;
-        }}
-
-        const continueBtn = makeBtn('Continue',true);
-        const stopBtn = makeBtn('Stop',false);
-        Object.assign(stopBtn.style, {{ background:col.btn,color:'#f38ba8',borderColor:'#f38ba8' }});
-        stopBtn.addEventListener('mouseenter', ()=>{{ stopBtn.style.opacity='0.85'; stopBtn.style.transform='translateY(-1px)'; }});
-        stopBtn.addEventListener('mouseleave', ()=>{{ stopBtn.style.opacity='1'; stopBtn.style.transform=''; }});
-
-        let _timer;
-        continueBtn.addEventListener('click', ()=>{{ clearTimeout(_timer); cleanup(); resolve(JSON.stringify({{action:'continue'}})); }});
-        stopBtn.addEventListener('click', ()=>{{ clearTimeout(_timer); cleanup(); resolve(JSON.stringify({{action:'stop'}})); }});
-
-        footer.appendChild(stopBtn); footer.appendChild(continueBtn);
-
-        const countdown = document.createElement('div');
-        countdown.textContent = '';
-        Object.assign(countdown.style, {{
-          fontSize:'11px',color:col.sub,textAlign:'center',minHeight:'16px',
-        }});
-
-        function onKey(e){{
-          if (e.key==='Escape'){{ stopBtn.click(); return; }}
-          if (e.key==='Enter' || e.key===' '){{ e.preventDefault(); continueBtn.click(); return; }}
-        }}
-        document.addEventListener('keydown',onKey);
-
-        panel.appendChild(header); panel.appendChild(msg); panel.appendChild(footer); panel.appendChild(countdown);
-        overlay.appendChild(panel); document.body.appendChild(overlay);
-
-        requestAnimationFrame(()=>{{
-          requestAnimationFrame(()=>{{
-            overlay.style.opacity='1';
-            panel.style.transform='scale(1)';
-            panel.style.opacity='1';
-          }});
-        }});
-
-        let remaining = {timeout_s};
-        function updateCountdown(){{
-            countdown.textContent = remaining>0 ? 'Auto-stopping in '+remaining+'s...' : '';
-            if (remaining<=0){{ cleanup(); resolve(JSON.stringify({{action:'stop'}})); }}
+            countdown.textContent = remaining>0 ? '{auto_countdown} in '+remaining+'s...' : '';
+            if (remaining<=0){{ cleanup(); resolve(JSON.stringify({{action:'{action_stop}'}})); }}
         }}
         updateCountdown();
         _timer = setInterval(()=>{{ remaining--; updateCountdown(); }},1000);
@@ -3120,24 +2993,6 @@ class HelixAgentEngine:
             logger.debug(f"process_pipeline_inlet_filter failed: {e}")
         return messages
 
-    async def _apply_rag_template(self, messages: list, sources: list, user_msg: str) -> list:
-        """Best-effort RAG template application with source context.
-
-        Only active when the middleware module exposes apply_source_context_to_messages.
-        Falls back to the original messages when unavailable.
-        """
-        if not HAS_MIDDLEWARE_CITATIONS or not self.request or not self.user:
-            return messages
-        try:
-            updated = await apply_source_context_to_messages(
-                self.request, messages, sources, user_msg
-            )
-            if isinstance(updated, list):
-                return updated
-        except Exception as e:
-            logger.debug(f"apply_source_context_to_messages failed: {e}")
-        return messages
-
     def _transition_to(self, phase):
         """Transition to a new phase: update tools, system prompt, state."""
         self.phase = phase
@@ -3636,13 +3491,9 @@ class HelixAgentEngine:
                 if self.event_call and not (self.user_valves and getattr(self.user_valves, "YOLO_MODE", False)):
                     try:
                         timeout_s = getattr(self.valves, "ITERATION_LIMIT_TIMEOUT", 300)
-                        js = self._build_iteration_limit_js(self.loop_count, effective_max, timeout_s=timeout_s)
+                        js = self._build_limit_modal_js("iteration", self.loop_count, effective_max, timeout_s=timeout_s)
                         raw = await self.event_call({"type": "execute", "data": {"code": js}})
-                        raw_str = raw if isinstance(raw, str) else (raw.get("result") or raw.get("value") or "{}") if raw else "{}"
-                        try:
-                            res = json.loads(raw_str) if isinstance(raw_str, str) and raw_str.startswith("{") else {}
-                        except (json.JSONDecodeError, AttributeError):
-                            res = {}
+                        res = self._parse_event_response(raw)
                         should_continue = res.get("action") == "continue"
                     except Exception as e:
                         logger.warning(f"Iteration limit dialog failed: {e}")
@@ -3662,13 +3513,9 @@ class HelixAgentEngine:
                 if self.event_call and not (self.user_valves and getattr(self.user_valves, "YOLO_MODE", False)):
                     try:
                         timeout_s = getattr(self.valves, "ITERATION_LIMIT_TIMEOUT", 300)
-                        js = self._build_llm_call_limit_js(self._llm_call_count, max_llm + self._extra_llm_grace, timeout_s=timeout_s)
+                        js = self._build_limit_modal_js("llm_call", self._llm_call_count, max_llm + self._extra_llm_grace, timeout_s=timeout_s)
                         raw = await self.event_call({"type": "execute", "data": {"code": js}})
-                        raw_str = raw if isinstance(raw, str) else (raw.get("result") or raw.get("value") or "{}") if raw else "{}"
-                        try:
-                            res = json.loads(raw_str) if isinstance(raw_str, str) and raw_str.startswith("{") else {}
-                        except (json.JSONDecodeError, AttributeError):
-                            res = {}
+                        res = self._parse_event_response(raw)
                         should_continue = res.get("action") == "continue"
                     except Exception as e:
                         logger.warning(f"LLM call limit dialog failed: {e}")
@@ -4167,24 +4014,7 @@ class HelixAgentEngine:
                                 "type": "chat:message:files",
                                 "data": {"files": new_files},
                             })
-                        truncation_limit = self._get_truncation_limit()
-                        was_truncated = False
-                        original_len = len(result_str) if result_str else 0
-                        if truncation_limit and result_str and len(result_str) > truncation_limit:
-                            was_truncated = True
-                            await self.emit_status(
-                                f"Truncated result for {tool_name} ({original_len} -> {truncation_limit} chars)"
-                            )
-                            tool_result = smart_truncate(result_str, truncation_limit)
-                        else:
-                            tool_result = result_str
-
-                        if was_truncated:
-                            tool_result = (
-                                f"[TRUNCATED] Tool '{tool_name}' result was cut from {original_len} to {truncation_limit} chars. "
-                                f"If you need the full output, refine your arguments or run a more targeted query.\n\n"
-                                f"{tool_result}"
-                            )
+                        tool_result, was_truncated = await self._maybe_truncate_tool_result(tool_name, result_str)
                         self._total_tool_calls += 1
 
                         # ── Terminal sync for file/command tools ──
@@ -4446,10 +4276,6 @@ class Pipe:
             ),
         )
 
-        ENABLE_RAG_TEMPLATE: bool = Field(
-            default=False,
-            description="If True and the OpenWebUI RAG middleware is available, formats source context from tool results via apply_source_context_to_messages instead of plain-text injection."
-        )
         ENABLE_RAG_TEMPLATE: bool = Field(
             default=False,
             description="If True and the OpenWebUI RAG middleware is available, formats source context from tool results via apply_source_context_to_messages instead of plain-text injection."
